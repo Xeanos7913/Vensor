@@ -1,6 +1,8 @@
 #pragma once
 
+// How embarrasing, i shouldn't have commited this failed little experiment
 
+/*
 #include <vulkan/vulkan_core.h>
 #include "VkBootstrap.h"
 #include <glm/glm.hpp>
@@ -117,4 +119,6 @@ public:
 private:
 	std::vector<std::string> extensions;
 	std::vector<Descriptor> descriptors;
+
 };
+*/
