@@ -1,3 +1,5 @@
+# This makefile is to build all the shaders in the "shaders" folder and output the .spv files in the "compiled_shaders" folder
+
 # Compiler
 CXX = g++
 
