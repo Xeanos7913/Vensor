@@ -11,7 +11,7 @@ Well, just about everything apart from the basic function. You can't even save a
 To have the ability to save and load model weights would be nice. And also to load pytorch models would be cool to have. I'd also like to have a better compute graph representation and implement residual connections.
 
 ## Bonus
-There's a tiny ~2k line graphics engine inside Vensor called VkCalcium.hpp. It's heavily flawed, and the whole file is commented out by default, but it does work.
+There's a tiny ~2k line graphics engine inside Vensor called VkCalcium.hpp. It's heavily flawed (backface culling and horizontal mouse is reversed for linux and windows), and the whole file is commented out by default, but it does work.
 
 ## Dependencies
 1. Standard Vulkan headers
