@@ -1,5 +1,8 @@
 #pragma once
 
+// Another failed little experiment
+
+/*
 #include <vulkan/vulkan_core.h>
 #include "VkBootstrap.h"  
 #include <iostream>
@@ -485,4 +488,7 @@ struct Projector{
 
     
 
+
 };
+
+*/
