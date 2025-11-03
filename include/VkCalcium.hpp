@@ -1,3 +1,7 @@
+/*
+This is a tiny graphics engine built using vulkan.
+*/
+
 #pragma once  
 /*#define GLM_FORCE_RADIANS  
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
@@ -2051,4 +2055,5 @@ struct Engine {
 bool Engine::cursorEnabled = true;
 float Engine::xoffset = 0.0f;
 float Engine::yoffset = 0.0f;
+
 Scene Engine::scene{};*/
