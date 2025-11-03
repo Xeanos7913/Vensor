@@ -1,8 +1,10 @@
 #pragma once
-
+/*
 // Returns a vector of std::variant containing all the registered types. Useful for scripting and building new components without having to manually write the 
 // enum or std::variant for the component / script container.
 // Will be indispensible for script metadata serialization in the future.
+
+// Made this thing when I was an idiot and didn't know that the aforementioned thing is actually impossible to do. so this is totally useless.
 
 #include <variant>
 #include <type_traits>
@@ -81,3 +83,4 @@ struct ForEach<TypeList<>> {
 // --- Access Final Registered Types ---
 using RegisteredComponentTypes = ComponentRegistry<__COUNTER__ - 1>::types;
 using ComponentVariant = VariantFromList<RegisteredComponentTypes>::type;
+*/
