@@ -1,3 +1,7 @@
+/*
+This main file contains some testing code (in the commented out parts) and an example MNIST handwritten digit recognision neural network training loop.
+*/
+
 #include <iostream>
 #include <fstream>
 //#define DEBUG
@@ -455,6 +459,7 @@ int main(void){
 }
 */
 
+// A handwritten digit recognision neural network
 struct Trainer {
 	
 	// Vulkan stuff:
@@ -603,4 +608,5 @@ int main(void){
 	delete allocator;
 	return 0;
 }
+
 */
