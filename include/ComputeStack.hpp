@@ -272,7 +272,7 @@ private:
 template<typename T>
 struct ComputeSequence;
 
-// The main power of the library. This is an element inside of the ComputeSequence, and it represents a Compute Shader
+// For multiple gpuTask's to work one after the other
 template<typename T>
 class SequentialgpuTask {
     friend struct ComputeSequence<T>;
@@ -981,4 +981,5 @@ struct ComputeSequenceBufferReference {
             allocator->init->disp.queueWaitIdle(queue);
         }
 	}
+
 };
