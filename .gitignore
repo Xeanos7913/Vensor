@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+out/
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.so
+*.exe
+
+# IDE metadata
+.vscode/
+.idea/
+*.user
+*.suo
+*.cache
