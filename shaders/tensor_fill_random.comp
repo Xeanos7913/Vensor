@@ -1,0 +1,106 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// --- Tensor buffer layouts ---
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data   { float data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_grad   { float grad[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_strides{ int  strides[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_shape  { int  dims[]; };
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct TensorFillContext {
+    TensorImpl tensor;
+    uint type;     // 0 = Gaussian, 1 = Uniform
+    uint m, n;
+    float min;
+    float max;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer {
+    TensorFillContext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint  kernel_type; // unused
+} push;
+
+// ---------------- RNG helpers ----------------
+const uint GPU_SEED = 0xA511E9B5u;
+
+uint finalizer32(uint x) {
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+uint make_seed(uint base, uint index, uvec3 gid) {
+    uint s = base ^ (index * 0x9E3779B9u);
+    s ^= gid.x * 0x6a09e667u;
+    s ^= gid.y * 0xbb67ae85u;
+    s ^= gid.z * 0x3c6ef372u;
+    return finalizer32(s);
+}
+
+float hash_to_float(uint h) {
+    uint top24 = (h >> 8u) & 0x00FFFFFFu;
+    return float(top24) / 16777216.0;
+}
+
+float random_uniform(uint seed) {
+    return hash_to_float(finalizer32(seed));
+}
+
+float random_gaussian(uint seed, float mean, float stddev) {
+    uint s1 = finalizer32(seed);
+    uint s2 = finalizer32(s1 + 0x9E3779B9u);
+    float u1 = max(hash_to_float(s1), 1e-7);
+    float u2 = hash_to_float(s2);
+    float z = sqrt(-2.0 * log(u1)) * cos(6.28318530718 * u2);
+    return mean + z * stddev;
+}
+
+// ---------------- Main ----------------
+void main() {
+    uvec3 gid = gl_WorkGroupID;
+    uint local_id = gl_LocalInvocationIndex;
+    uint global_id = gid.x * gl_WorkGroupSize.x + local_id;
+
+    TensorFillContext ctx = push.context.ctx;
+    TensorImpl tensor = ctx.tensor;
+    uint index = global_id;
+
+    if (index >= tensor.numel) return;
+
+    uint seed = make_seed(GPU_SEED, index, gid);
+    float val;
+
+    if (ctx.type == 0u) {
+        float mean = (ctx.min + ctx.max) * 0.5;
+        float stddev = (ctx.max - ctx.min) / 6.0;
+        val = clamp(random_gaussian(seed, mean, stddev), ctx.min, ctx.max);
+    } else {
+        val = ctx.min + random_uniform(seed) * (ctx.max - ctx.min);
+    }
+
+    tensor.data.data[index] = val;
+}

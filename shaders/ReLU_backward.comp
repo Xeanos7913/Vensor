@@ -1,0 +1,118 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+// Workgroup size (runtime specialization constants)
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct ReLUcontext {
+    TensorImpl input_tensor;
+    TensorImpl output_tensor;
+    uint M, N;
+    uint batch_size;         // Total batch size for gradient averaging
+    uint mode;              // 0 = in-place, 1 = out-of-place
+    uint accumulate_grad;   // 0: overwrite, 1: += for grads
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer {
+    ReLUcontext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;   // host must match std430 layout
+    uvec3 grid_size;         // number of workgroups dispatched (gl_NumWorkGroups)
+    uint  kernel_type;       // 0 = forward, 1 = backward (compute dInput)
+} push;
+
+// Compute linear index into a C-contiguous tensor from up to 3 indices using supplied strides.
+uint off2or3(const TensorImpl t, uint b, uint i, uint j)
+{
+    if (t.ndim == 2u) {
+        return i * t.strides.strides[0] + j * t.strides.strides[1];
+    } else {
+        return b * t.strides.strides[0] + i * t.strides.strides[1] + j * t.strides.strides[2];
+    }
+}
+
+void relu_backward() {
+    ReLUcontext c = push.context.ctx;
+    uint bx = gl_WorkGroupID.x;  
+    uint by = gl_WorkGroupID.y;  
+    uint bz = gl_WorkGroupID.z;  
+    uint lx = gl_LocalInvocationID.x;  
+    uint ly = gl_LocalInvocationID.y;  
+    uint b = bz;  
+    uint row = by * gl_WorkGroupSize.y + ly; // in [0..M)  
+    uint col = bx * gl_WorkGroupSize.x + lx; // in [0..N)  
+    uint M = c.M;
+    uint N = c.N;
+    uint B = max(c.batch_size, 1u); // Ensure batch_size is at least 1
+    
+    // Early exit for threads that are completely out of bounds  
+    if (row >= M || col >= N) {  
+        return;  
+    }
+    
+    // Precompute batch averaging factor
+    float batch_scale = 1.0 / float(B);
+    
+    uint inIdx = off2or3(c.input_tensor, b, row, col);
+    uint outIdx = off2or3(c.output_tensor, b, row, col);
+    
+    // Get input value to determine ReLU derivative
+    float inputValue = c.input_tensor.data.data[inIdx];
+    
+    // Get output gradient (gradient flowing back from next layer)
+    float outputGrad = 0.0;
+    if (c.output_tensor.requires_grad == 1u) {
+        outputGrad = c.output_tensor.grad.grad[outIdx];
+        c.output_tensor.grad.grad[outIdx] = 0.0f; // zero out upstream gradient after calculations
+    }
+    
+    // ReLU derivative: 1 if input > 0, 0 otherwise
+    // grad_input = grad_output * derivative
+    float relu_derivative = (inputValue > 0.0) ? 1.0 : 0.0;
+    float inputGrad = outputGrad * relu_derivative;
+    
+    // Store input gradient if required
+    if (c.input_tensor.requires_grad == 1u) {
+        if (c.accumulate_grad != 0u) {
+            c.input_tensor.grad.grad[inIdx] += inputGrad;
+        } else {
+            c.input_tensor.grad.grad[inIdx] = inputGrad;
+        }
+    }
+}
+
+void main() {
+    relu_backward();
+}

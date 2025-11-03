@@ -1,0 +1,2028 @@
+#pragma once  
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#define GLM_ENABLE_EXPERIMENTAL
+#define GLM_FORCE_LEFT_HANDED
+#define GLM_FORCE_DEFAULT_ALIGNED_GENTYPES
+
+#ifdef DEBUG
+#define DEBUG_PRINT(x) do { std::cout << x << "\n"; } while (0)
+#else
+#define DEBUG_PRINT(x)
+#endif
+
+#include <vector>  
+#include <unordered_map>  
+#include <initializer_list>  
+#include <stdexcept>  
+#include <iostream>  
+#include <thread>  
+#include <mutex>  
+#include <memory>  
+#include <random>
+#include "VkMemAlloc.hpp"  
+#include "ComputeStack.hpp"  
+#include <glm/glm.hpp>
+#include <numeric>
+
+std::vector<char> readShaderBytecode(const std::string& filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);  // Open file at the end in binary mode
+    
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open shader file: " + filename);
+    }
+
+    size_t fileSize = file.tellg();  // Get file size
+    std::vector<char> buffer(fileSize);
+
+    file.seekg(0);  // Go back to the beginning
+    file.read(buffer.data(), fileSize);  // Read file into buffer
+    file.close();
+    return buffer;
+}
+
+enum class Operation {
+    ADDITION,
+    MULTIPLICATION,
+    OTHER
+};
+
+static void broadcastShapes(const std::vector<uint32_t>& a,  
+   const std::vector<uint32_t>& b,  
+   Operation op = Operation::ADDITION) {  
+   if (a.empty() || b.empty()) {  
+       throw std::invalid_argument("Tensor shapes cannot be empty");  
+   }
+
+   if (op == Operation::ADDITION) {  
+       // Check for broadcasting compatibility
+       size_t max_dims = std::max(a.size(), b.size());
+       for (size_t i = 0; i < max_dims; ++i) {
+           uint32_t dim_a = (i < a.size()) ? a[a.size() - 1 - i] : 1;
+           uint32_t dim_b = (i < b.size()) ? b[b.size() - 1 - i] : 1;
+           if (dim_a != dim_b && dim_a != 1 && dim_b != 1) {
+               throw std::invalid_argument("Shapes are not compatible for broadcasting in addition");
+           }
+       }
+   } else if (op == Operation::MULTIPLICATION) {  
+       // Check for matrix multiplication compatibility
+       if (a.size() < 1 || b.size() < 1) {  
+           throw std::invalid_argument("Shapes must have at least 1 dimension for matrix-vector or matrix multiplication");  
+       }  
+
+       // Check batch dimensions for rank 2 or rank 3 tensors
+       if (a.size() >= 2 && b.size() >= 2) {
+           size_t min_dims = std::min(a.size(), b.size());
+           for (size_t i = 0; i < a.size() - min_dims; ++i) {  
+               if (a[i] != b[i] && a[i] != 1 && b[i] != 1) {  
+                   throw std::invalid_argument("Batch dimensions must match exactly or be 1 for matrix-vector or matrix multiplication");  
+               }  
+           }  
+       }
+
+       // Check matrix multiplication dimensions
+       uint32_t a_k = a[a.size() - 1];  
+       uint32_t b_k = b[b.size() - 2];  
+       if (a_k != b_k) {  
+           throw std::invalid_argument("Inner dimensions do not match for matrix-vector or matrix multiplication");  
+       }  
+   } else {
+       return; // No checks for OTHER operations
+   }  
+}
+
+// Helper function to print shapes for debugging
+std::string shapeToString(const std::vector<uint32_t>& shape) {
+    std::string result = "(";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i > 0) result += ", ";
+        result += std::to_string(shape[i]);
+    }
+    result += ")";
+    return result;
+}
+struct tensor_impl {
+    VkDeviceAddress data;
+    VkDeviceAddress grad;
+    VkDeviceAddress strides;
+    VkDeviceAddress shape;
+
+    uint32_t num_elements;          // Total number of elements
+    uint32_t num_dims;              // Number of dimensions
+    uint32_t requires_gradient = 1;     // Boolean: needs gradient computation
+    uint32_t is_leaf = 1;               // Boolean: leaf tensor in computation graph
+};
+
+struct tensor_push_const {
+    VkDeviceAddress uniformAddress;
+    glm::uvec3 grid_size;
+	uint32_t mode = 0; // 0 = forward, 1 = backward
+    uint64_t pad = 0;
+
+    static uint32_t getPushConstantRange() {
+        return sizeof(tensor_push_const);
+	}
+};
+
+struct tensor_cmp_context{
+    tensor_impl input_a;
+    tensor_impl input_b;
+    tensor_impl output_tensor;
+};
+
+struct matmul_context {
+    tensor_impl input_tensor;
+    tensor_impl weight_tensor;
+    tensor_impl output_tensor;
+    uint32_t mode;              // 0=forward, 1=backward
+    uint32_t batch_size;
+    uint32_t m, n, k;           // Matrix dimensions: A(m,k) @ B(k,n) = C(m,n)
+    uint32_t accumulate_grad = 1;   // Whether to accumulate or overwrite gradients
+};
+
+struct mean_context {
+    tensor_impl input_tensor;
+    tensor_impl output_tensor;
+};
+
+struct linear_context {
+    tensor_impl input_tensor;
+    tensor_impl weight_tensor;
+    tensor_impl bias_tensor;        // Optional, can be null
+    tensor_impl output_tensor;
+    uint32_t mode;                  // 0=tiling, 1=no tiling
+    uint32_t batch_size;
+    uint32_t m, n, k;
+	uint32_t accumulate_grad = 1;       // 0 = overwrite, 1 = accumulate
+	uint32_t use_bias;              // 0 = no bias, 1 = use bias
+};
+
+struct matadd_context {
+    tensor_impl input_a;
+    tensor_impl input_b;
+    tensor_impl output_tensor;
+    uint32_t mode;
+	uint32_t batch_size;
+    uint32_t m, n;
+	uint32_t accumulate_grad;   // Whether to accumulate or overwrite gradients
+};
+
+struct embedding_lookup_context {
+    tensor_impl embedding_tensor;
+    tensor_impl indices_tensor;
+    tensor_impl output_tensor;
+};
+
+struct tensor_relu_context {
+    tensor_impl input_tensor;
+    tensor_impl output_tensor;
+    uint32_t m, n;
+    uint32_t mode;
+};
+
+struct tensor_softmax_context {
+    tensor_impl input_tensor;
+    tensor_impl output_tensor;
+    uint32_t m, n;
+};
+
+struct tensor_cross_entropy_context {
+    tensor_impl logits_tensor;
+    tensor_impl target_tensor;
+    tensor_impl loss_tensor;
+	tensor_impl softmax_tensor; // Optional: store softmax output
+    uint32_t m, n;
+	uint32_t batch_size;
+	uint32_t compute_softmax;   //whether to write softmax output into softmax_tensor
+	uint32_t accumulate_grad = 1; // Whether to accumulate or overwrite gradients
+};
+
+// batchnorm 1D context
+struct tensor_batchnorm_context {
+    tensor_impl input_tensor;  // [B, M, N] - input feature vector
+    tensor_impl weight_tensor; // [M] - weight (gamma)
+    tensor_impl bias_tensor;   // [M] - bias (beta)
+    tensor_impl running_mean;  // [M] - running mean (for inference)
+    tensor_impl running_var;   // [M] - running variance (for inference)
+    tensor_impl out_tensor;    // [B, M, N] - output vector
+    tensor_impl save_mean;     // [M] - saved mean (for backward)
+    tensor_impl save_var;      // [M] - saved variance (for backward)
+    uint mode;                // 0 = train, 1 = eval
+    uint batch_size;
+    uint accumulate_grad;     // 0: overwrite, 1: += for grads
+    float momentum;         // momentum for running stats
+    float eps;              // epsilon for numerical stability
+};
+
+struct tensor_batchnorm2d_context {
+    tensor_impl input_tensor;    // [B, C, H, W]
+    tensor_impl weight_tensor;   // [C]
+    tensor_impl bias_tensor;     // [C]
+    tensor_impl running_mean;    // [C]
+    tensor_impl running_var;     // [C]
+    tensor_impl out_tensor;      // [B, C, H, W]
+    tensor_impl save_mean;       // [C]
+    tensor_impl save_var;        // [C]
+    uint32_t mode;
+    uint32_t batch_size;
+    uint32_t channels;
+    uint32_t height;
+    uint32_t width;
+    uint32_t accumulate_grad;
+    float momentum;
+    float eps;
+};
+
+struct tensor_layernorm1d_context {
+    tensor_impl input_tensor;    // [B, M, N]
+    tensor_impl weight_tensor;   // [N] - normalized shape
+    tensor_impl bias_tensor;     // [N] - normalized shape
+    tensor_impl out_tensor;      // [B, M, N]
+    tensor_impl save_mean;       // [B, M] - mean for each sample
+    tensor_impl save_rstd;       // [B, M] - reciprocal std for each sample
+    uint normalized_size;       // N - size of normalized dimension
+    uint batch_stride;          // M * N - elements per batch
+    uint accumulate_grad;
+    float eps;
+};
+
+struct tensor_conv2d_3x3_context {
+    tensor_impl input_tensor;  // [N, C_in, H_in, W_in]
+    tensor_impl weight_tensor; // [C_out, C_in, K_h, K_w]
+    tensor_impl bias_tensor;   // [C_out]
+    tensor_impl out_tensor;    // [N, C_out, H_out, W_out]
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+    uint dilation_h;
+    uint dilation_w;
+    uint groups;
+    uint accumulate_grad;
+};
+
+struct tensor_ops_uniform_address {
+    matmul_context context;
+};
+
+struct tensor_fill_uniform_address {
+    tensor_impl tensor;
+};
+
+template<typename T>
+struct tensor_fill_rand_uniform_address {
+	tensor_impl tensor;
+	uint32_t type; // 0 = float, 1 = int, 2 = uint
+    uint32_t m, n;
+	T min;
+    T max;
+};
+
+template<typename T>
+struct tensor_fill_range_uniform_address {
+	VkDeviceAddress tensor_data;
+	VkDeviceAddress tensor_stride;
+	T start;
+	T step;
+};
+
+template<typename T>
+struct TensorPool;
+
+template<typename T>  
+struct Tensor {  
+
+    // Pool
+    TensorPool<T>* pool = nullptr;
+
+   // cpu memory  
+   std::vector<uint32_t> shape;  
+   std::vector<uint32_t> strides;  
+   std::vector<uint32_t> effectiveStrides;
+
+   // gpu memory. We're using the StandaloneBuffer's persistent staging buffer as CPU backing memory.  
+   std::unique_ptr<StandaloneBuffer<T>> dataBuffer;
+   std::unique_ptr<StandaloneBuffer<T>> gradientBuffer;
+   std::unique_ptr<StandaloneBuffer<uint32_t>> stridesBuffer;
+   std::unique_ptr<StandaloneBuffer<uint32_t>> shapeBuffer;
+
+   Allocator* allocator = nullptr;
+
+   std::string name;
+
+   Tensor(std::initializer_list<uint32_t> dims, Allocator* allocator)
+       : shape(dims),
+       allocator(allocator),
+       dataBuffer(std::make_unique<StandaloneBuffer<T>>(1, allocator, VK_SHADER_STAGE_ALL)),
+       gradientBuffer(std::make_unique<StandaloneBuffer<T>>(1, allocator, VK_SHADER_STAGE_ALL)),
+       stridesBuffer(std::make_unique<StandaloneBuffer<uint32_t>>(1, allocator, VK_SHADER_STAGE_ALL)),
+       shapeBuffer(std::make_unique<StandaloneBuffer<uint32_t>>(1, allocator, VK_SHADER_STAGE_ALL))
+   {
+       // Total size
+       size_t total_size = 1;
+       for (auto dim : shape)
+           total_size *= dim;
+
+       dataBuffer->resize(total_size);
+       gradientBuffer->resize(total_size);
+       shapeBuffer->alloc(shape);
+
+       // --- Normal strides ---
+       strides.resize(shape.size());
+       strides.back() = 1;
+       for (int i = (int)shape.size() - 2; i >= 0; --i)
+           strides[i] = strides[i + 1] * shape[i + 1];
+
+       // --- Effective strides for matmul ---
+       effectiveStrides.resize(3);
+       effectiveStrides[0] = shape.size() >= 2 ? shape[shape.size() - 1] * shape[shape.size() - 2] : 1;
+       effectiveStrides[1] = shape.size() >= 2 ? shape[shape.size() - 1] : 1;
+       effectiveStrides[2] = 1;
+	   stridesBuffer->alloc(strides);
+   }
+
+    Tensor(std::vector<uint32_t> dims, Allocator* allocator)
+        : shape(dims),
+        allocator(allocator),
+        dataBuffer(std::make_unique<StandaloneBuffer<T>>(1, allocator, VK_SHADER_STAGE_ALL)),
+        gradientBuffer(std::make_unique<StandaloneBuffer<T>>(1, allocator, VK_SHADER_STAGE_ALL)),
+        stridesBuffer(std::make_unique<StandaloneBuffer<uint32_t>>(1, allocator, VK_SHADER_STAGE_ALL)),
+        shapeBuffer(std::make_unique<StandaloneBuffer<uint32_t>>(1, allocator, VK_SHADER_STAGE_ALL))
+    {
+        // Total size
+        size_t total_size = 1;
+        for (auto dim : shape)
+            total_size *= dim;
+
+        dataBuffer->resize(total_size);
+        gradientBuffer->resize(total_size);
+        shapeBuffer->alloc(shape);
+
+        // --- Normal strides ---
+        strides.resize(shape.size());
+        strides.back() = 1;
+        for (int i = (int)shape.size() - 2; i >= 0; --i)
+            strides[i] = strides[i + 1] * shape[i + 1];
+
+        // --- Effective strides for matmul ---
+        effectiveStrides.resize(3);
+        effectiveStrides[0] = shape.size() >= 2 ? shape[shape.size() - 1] * shape[shape.size() - 2] : 1;
+        effectiveStrides[1] = shape.size() >= 2 ? shape[shape.size() - 1] : 1;
+        effectiveStrides[2] = 1;
+        stridesBuffer->alloc(strides);
+    }
+
+
+    Tensor(const std::string& filename, Allocator* allocator)
+        : allocator(allocator),
+        dataBuffer(std::make_unique<StandaloneBuffer<T>>(1, allocator, VK_SHADER_STAGE_ALL)),
+        gradientBuffer(std::make_unique<StandaloneBuffer<T>>(1, allocator, VK_SHADER_STAGE_ALL)),
+        stridesBuffer(std::make_unique<StandaloneBuffer<uint32_t>>(1, allocator, VK_SHADER_STAGE_ALL)),
+        shapeBuffer(std::make_unique<StandaloneBuffer<uint32_t>>(1, allocator, VK_SHADER_STAGE_ALL))
+    {
+        load_from_file(filename);
+    }
+
+    uint32_t get_num_elements(){
+        return std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<uint32_t>());
+    }
+
+   Tensor(const std::vector<uint32_t>& dims) : shape(dims) {  
+       size_t total_size = 1;  
+       for (auto dim : dims) {  
+           total_size *= dim;  
+       }  
+       dataBuffer->resize(total_size);  
+
+       strides.resize(shape.size());  
+       strides.back() = 1;  
+       for (int i = shape.size() - 2; i >= 0; --i) {  
+           strides[i] = strides[i + 1] * shape[i + 1];  
+       }  
+    }  
+
+    void view(std::initializer_list<uint32_t> dims) {
+        std::vector<uint32_t> new_shape(dims);
+        if (new_shape == shape) return; // shapes equal -> no-op
+
+        size_t total_size = 1;
+        for (auto dim : new_shape) {
+            total_size *= dim;
+        }
+        if (total_size != dataBuffer->size()) {
+            throw std::invalid_argument("New shape must have the same number of elements");
+        }
+        shape = std::move(new_shape);
+
+        // --- Normal strides ---
+        strides.resize(shape.size());
+        strides.back() = 1;
+        for (int i = (int)shape.size() - 2; i >= 0; --i)
+            strides[i] = strides[i + 1] * shape[i + 1];
+
+        // --- Effective strides for matmul ---
+        effectiveStrides.resize(3);
+        effectiveStrides[0] = shape.size() >= 2 ? shape[shape.size() - 1] * shape[shape.size() - 2] : 1;
+        effectiveStrides[1] = shape.size() >= 2 ? shape[shape.size() - 1] : 1;
+        effectiveStrides[2] = 1;
+        stridesBuffer->alloc(strides);
+        shapeBuffer->alloc(shape);
+    }
+
+    void view(std::vector<uint32_t>& dims) {
+        if (dims == shape) return; // shapes equal -> no-op
+
+        size_t total_size = 1;
+        for (auto dim : dims) {
+            total_size *= dim;
+        }
+        if (total_size != dataBuffer->size()) {
+            throw std::invalid_argument("New shape must have the same number of elements");
+        }
+        shape = dims;
+
+        // --- Normal strides ---
+        strides.resize(shape.size());
+        strides.back() = 1;
+        for (int i = (int)shape.size() - 2; i >= 0; --i)
+            strides[i] = strides[i + 1] * shape[i + 1];
+
+        // --- Effective strides for matmul ---
+        effectiveStrides.resize(3);
+        effectiveStrides[0] = shape.size() >= 2 ? shape[shape.size() - 1] * shape[shape.size() - 2] : 1;
+        effectiveStrides[1] = shape.size() >= 2 ? shape[shape.size() - 1] : 1;
+        effectiveStrides[2] = 1;
+        stridesBuffer->alloc(strides);
+        shapeBuffer->alloc(shape);
+    }
+
+    // doesn't transpose the data. Just does a view
+    void transpose(){
+        if (shape.size() < 2) {
+            throw std::invalid_argument("Tensor must have at least 2 dimensions to transpose");
+        }
+        std::swap(shape[shape.size() - 1], shape[shape.size() - 2]);
+
+        // --- Normal strides ---
+        strides.resize(shape.size());
+        strides.back() = 1;
+        for (int i = (int)shape.size() - 2; i >= 0; --i)
+            strides[i] = strides[i + 1] * shape[i + 1];
+
+        // --- Effective strides for matmul ---
+        effectiveStrides.resize(3);
+        effectiveStrides[0] = shape.size() >= 2 ? shape[shape.size() - 1] * shape[shape.size() - 2] : 1;
+        effectiveStrides[1] = shape.size() >= 2 ? shape[shape.size() - 1] : 1;
+        effectiveStrides[2] = 1;
+        stridesBuffer->alloc(strides);
+        shapeBuffer->alloc(shape);
+    }
+
+    void save_to_file(const std::string& filename) const {
+        std::ofstream outFile(filename, std::ios::binary);
+        if (!outFile) {
+            throw std::runtime_error("Failed to open file for writing: " + filename);
+        }
+
+        // Write a magic number to identify tensor files
+        const uint32_t magicNumber = 0x544E5352; // "TNSR" in ASCII
+        outFile.write(reinterpret_cast<const char*>(&magicNumber), sizeof(magicNumber));
+
+        // Write the name
+        uint32_t nameLength = static_cast<uint32_t>(name.size());
+        outFile.write(reinterpret_cast<const char*>(&nameLength), sizeof(nameLength));
+        outFile.write(name.c_str(), nameLength);
+
+        // Write the shape
+        uint32_t shapeSize = static_cast<uint32_t>(shape.size());
+        outFile.write(reinterpret_cast<const char*>(&shapeSize), sizeof(shapeSize));
+        outFile.write(reinterpret_cast<const char*>(shape.data()), shapeSize * sizeof(uint32_t));
+
+        // Write the strides
+        uint32_t stridesSize = static_cast<uint32_t>(strides.size());
+        outFile.write(reinterpret_cast<const char*>(&stridesSize), sizeof(stridesSize));
+        outFile.write(reinterpret_cast<const char*>(strides.data()), stridesSize * sizeof(uint32_t));
+
+        // Write the data buffer
+        auto dataBuf = dataBuffer->downloadBuffer();
+        uint32_t dataSize = static_cast<uint32_t>(dataBuf.size());
+        outFile.write(reinterpret_cast<const char*>(&dataSize), sizeof(dataSize));
+        outFile.write(reinterpret_cast<const char*>(dataBuf.data()), dataSize * sizeof(T));
+
+        // Write the gradient buffer
+        auto gradBuf = gradientBuffer->downloadBuffer();
+        uint32_t gradSize = static_cast<uint32_t>(gradBuf.size());
+        outFile.write(reinterpret_cast<const char*>(&gradSize), sizeof(gradSize));
+        outFile.write(reinterpret_cast<const char*>(gradBuf.data()), gradSize * sizeof(T));
+
+        outFile.close();
+        std::cout << "Tensor saved to " << filename << "\n";
+    }
+
+    void load_from_file(const std::string& filename) {
+        std::ifstream inFile(filename, std::ios::binary);
+        if (!inFile) {
+            throw std::runtime_error("Failed to open file for reading: " + filename);
+        }
+        // Read and verify the magic number
+        uint32_t magicNumber;
+        inFile.read(reinterpret_cast<char*>(&magicNumber), sizeof(magicNumber));
+        if (magicNumber != 0x544E5352) { // "TNSR" in ASCII
+            throw std::runtime_error("Invalid tensor file: " + filename);
+        }
+        // Read the name
+        uint32_t nameLength;
+        inFile.read(reinterpret_cast<char*>(&nameLength), sizeof(nameLength));
+        name.resize(nameLength);
+        inFile.read(&name[0], nameLength);
+        std::cout << "Loading tensor: " << name << "\n";
+
+        // Read the shape
+        uint32_t shapeSize;
+        inFile.read(reinterpret_cast<char*>(&shapeSize), sizeof(shapeSize));
+        shape.resize(shapeSize);
+        inFile.read(reinterpret_cast<char*>(shape.data()), shapeSize * sizeof(uint32_t));
+        shapeBuffer->alloc(shape);
+        // Read the strides
+        uint32_t stridesSize;
+        inFile.read(reinterpret_cast<char*>(&stridesSize), sizeof(stridesSize));
+        strides.resize(stridesSize);
+        inFile.read(reinterpret_cast<char*>(strides.data()), stridesSize * sizeof(uint32_t));
+        stridesBuffer->alloc(strides);
+        // Read the data buffer
+        uint32_t dataSize;
+        inFile.read(reinterpret_cast<char*>(&dataSize), sizeof(dataSize));
+        dataBuffer->resize(dataSize);
+        std::vector<T> dataBuf(dataSize);
+        inFile.read(reinterpret_cast<char*>(dataBuf.data()), dataSize * sizeof(T));
+        dataBuffer->alloc(dataBuf);
+        // Read the gradient buffer
+        uint32_t gradSize;
+        inFile.read(reinterpret_cast<char*>(&gradSize), sizeof(gradSize));
+        gradientBuffer->resize(gradSize);
+        std::vector<T> gradBuf(gradSize);
+        inFile.read(reinterpret_cast<char*>(gradBuf.data()), gradSize * sizeof(T));
+        gradientBuffer->alloc(gradBuf);
+        inFile.close();
+        std::cout << "Tensor loaded from " << filename << "\n";
+    }
+
+   size_t getIndex(std::initializer_list<uint32_t> indices) const {  
+       if (indices.size() != shape.size()) {  
+           throw std::out_of_range("Number of indices must match the number of dimensions");  
+       }  
+       size_t index = 0;  
+       auto stride_it = strides.begin();  
+       for (auto idx : indices) {  
+           index += idx * (*stride_it);  
+           ++stride_it;  
+       }  
+       return index;  
+   }
+
+   tensor_impl getTensorImpl() const {
+       tensor_impl impl{};
+       impl.data = dataBuffer->getBufferAddress();
+       impl.grad = gradientBuffer->getBufferAddress();
+       impl.shape = shapeBuffer->getBufferAddress();
+       impl.strides = stridesBuffer->getBufferAddress();
+       impl.num_elements = dataBuffer->size();
+       impl.num_dims = shape.size();
+       impl.requires_gradient = gradientBuffer->size() > 0 ? 1 : 0;
+       impl.is_leaf = 1;
+       return impl;
+   }
+
+   void setElement(T element, std::initializer_list<uint32_t> indices) {
+	   dataBuffer->set(getIndex(indices), element);
+   }
+
+   const T& operator[](std::initializer_list<uint32_t> indices) const {  
+       return dataBuffer->get(getIndex(indices));  
+   }
+
+   void addElement(T element, std::initializer_list<uint32_t> indices) {  
+       dataBuffer->set(getIndex(indices), element);  
+   }  
+
+   void print() const {  
+       auto buf = dataBuffer->downloadBuffer();
+	   std::cout << "Tensor shape: " << shapeToString(shape) << "\n";
+	   std::cout << "Tensor data: ";
+	   for (size_t i = 0; i < buf.size(); ++i) {
+		   std::cout << buf[i] << " ";
+	   }
+	   std::cout << "\n";
+   }
+
+   void printGradient() const {
+       auto buf = gradientBuffer->downloadBuffer();
+       std::cout << "Tensor shape: " << shapeToString(shape) << "\n";
+       std::cout << "Tensor gradient: ";
+       for (size_t i = 0; i < buf.size(); ++i) {
+           std::cout << buf[i] << " ";
+       }
+       std::cout << "\n";
+   }
+};
+
+template<typename T>
+struct OpNode {
+    std::vector<Tensor<T>*> inputs;
+    std::vector<Tensor<T>*> outputs;
+    std::function<void()> backward;  // runs appropriate GPU kernel
+    uint32_t ref_count = 0;          // for topological execution cleanup
+};
+
+template <typename T>
+struct BiOpNode;
+
+template<typename T>
+struct TensorPool {
+    std::unordered_map<std::string, std::unique_ptr<Tensor<T>>> tensors;
+
+    Allocator* allocator = nullptr;
+    uint32_t tile_size[3] = { 16, 16, 1 };
+    TensorPool(Allocator* alloc)
+            : allocator(alloc),
+            multiplicationShader(
+                readShaderBytecode("compiled_shaders/tensor_multiply.comp.spv"), alloc, tile_size),
+            multiplicationShaderBackward(
+                readShaderBytecode("compiled_shaders/tensor_multiply_backward.comp.spv"), alloc, tile_size),
+            additionShader(
+                readShaderBytecode("compiled_shaders/tensor_addition.comp.spv"), alloc, tile_size),
+            additionShaderBackward(
+                readShaderBytecode("compiled_shaders/tensor_addition_backward.comp.spv"), alloc, tile_size),
+            batchnormShader(
+                readShaderBytecode("compiled_shaders/Batchnorm.comp.spv"), alloc, nullptr),
+            batchnormShaderBackward(
+                readShaderBytecode("compiled_shaders/Batchnorm_backward.comp.spv"), alloc, nullptr),
+            batchnorm2dShader(
+                readShaderBytecode("compiled_shaders/Batchnorm2d.comp.spv"), alloc, nullptr),
+            batchnorm2dShaderBackward(
+                readShaderBytecode("compiled_shaders/Batchnorm2d_backward.comp.spv"), alloc, nullptr),
+            layernorm1dShader(
+                readShaderBytecode("compiled_shaders/Layernorm1d.comp.spv"), alloc, nullptr),
+            layernorm1dShaderBackward(
+                readShaderBytecode("compiled_shaders/Layernorm1d_backward.comp.spv"), alloc, nullptr),
+            linearReLUShader(
+                readShaderBytecode("compiled_shaders/Linear.comp.spv"), alloc, nullptr),
+            linearReLUShaderBackward(
+                readShaderBytecode("compiled_shaders/Linear_backward.comp.spv"), alloc, nullptr),
+            linearShader(
+                readShaderBytecode("compiled_shaders/Linear_no_relu.comp.spv"), alloc, nullptr),
+            linearShaderBackward(
+                readShaderBytecode("compiled_shaders/Linear_no_relu_backward.comp.spv"), alloc, nullptr),
+            ReLUShader(
+                readShaderBytecode("compiled_shaders/ReLU.comp.spv"), alloc, tile_size),
+            ReLUShaderBackward(
+                readShaderBytecode("compiled_shaders/ReLU_backward.comp.spv"), alloc, tile_size),
+            fillRandomShader(
+                readShaderBytecode("compiled_shaders/tensor_fill_random.comp.spv"), alloc, nullptr),
+            crossEntropyShader(
+                readShaderBytecode("compiled_shaders/Fused_Cross_Entropy.comp.spv"), alloc, nullptr),
+            crossEntropyShaderBackward(
+                readShaderBytecode("compiled_shaders/Fused_Cross_Entropy_backward.comp.spv"), alloc, nullptr),
+            mean_shader(
+                readShaderBytecode("compiled_shaders/find_mean.comp.spv"), alloc, nullptr),
+            softmaxShader(
+                readShaderBytecode("compiled_shaders/Softmax.comp.spv"), alloc, nullptr),
+            embedLookupShader(
+                readShaderBytecode("compiled_shaders/Embedding_table.comp.spv"), alloc, nullptr),
+            embedLookupShaderBackward(
+                readShaderBytecode("compiled_shaders/Embedding_table_backward.comp.spv"), alloc, nullptr),
+            conv2dShader3x3(
+                readShaderBytecode("compiled_shaders/Conv2d3x3.comp.spv"), alloc, tile_size),
+            conv2dShader3x3Backward(
+                readShaderBytecode("compiled_shaders/Conv2d3x3_backward.comp.spv"), alloc, tile_size),
+            cmpShader(
+                readShaderBytecode("compiled_shaders/Is_tensor_equal.comp.spv"), alloc, nullptr)
+    {
+        DEBUG_PRINT("Initialized TensorPool");
+    }
+
+    TensorPool(){
+        // empty ctor
+        DEBUG_PRINT("Tensor pool needs Allocator for proper construction. e");
+    }
+
+    Tensor<T>& getTensor(const std::string& name, std::initializer_list<size_t> dims) {
+        if (tensors.find(name) == tensors.end()) {
+            tensors[name] = std::make_unique<Tensor<T>>(dims, allocator);
+        }
+        return *tensors[name];
+    }
+
+    Tensor<T>& getTensor(const std::string& name, const std::vector<size_t>& dims) {
+        if (tensors.find(name) == tensors.end()) {
+            throw std::runtime_error("Tensor with this name does not exist");
+        }
+        return *tensors[name];
+    }
+
+    Tensor<T>& createTensor(std::initializer_list<uint32_t> dims, const std::string& name) {
+        if (tensors.find(name) == tensors.end()) {
+            tensors[name] = std::make_unique<Tensor<T>>(dims, allocator);
+            tensors[name]->name = name;
+            tensors[name]->pool = this;
+            return *tensors[name];
+        }
+        else {
+            throw std::runtime_error("Tensor with this name already exists");
+        }
+    }
+
+    Tensor<T>& createTensor(std::vector<uint32_t> dims, const std::string& name) {
+        if (tensors.find(name) == tensors.end()) {
+            tensors[name] = std::make_unique<Tensor<T>>(dims, allocator);
+            tensors[name]->name = name;
+            tensors[name]->pool = this;
+            return *tensors[name];
+        }
+        else {
+            throw std::runtime_error("Tensor with this name already exists");
+        }
+    }
+
+    void destroy_tensor(const std::string& name) {
+        auto it = tensors.find(name);
+        if (it != tensors.end()) {
+            tensors.erase(it);
+        }
+        else {
+            throw std::runtime_error("Tensor with this name does not exist");
+        }
+    }
+    
+    void tensor_ReLU(const std::string& output_tensor, const std::string& input_tensor, uint32_t mode = 0) {
+        // Check if shapes match
+        try {
+            broadcastShapes(tensors[output_tensor]->shape, tensors[input_tensor]->shape, Operation::ADDITION);
+        }
+        catch (const std::invalid_argument& e) {
+            std::cerr << "Error in tensor_ReLU: " << e.what() << "\n";
+            throw;
+        }
+
+        tensor_relu_context uniform{};
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.mode = mode; // Forward pass (should be kernel_type in shader)
+
+        // Helpers
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return (uint32_t)p;
+            };
+
+        const auto& shape = tensors[input_tensor]->shape; // X[..., M, N]
+        if (shape.size() < 2)
+            throw std::invalid_argument("Rank must be >= 2");
+        uint32_t M = shape[shape.size() - 2];
+        uint32_t N = shape.back();
+        uniform.m = M;
+        uniform.n = N;
+        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+        DEBUG_PRINT("ReLU'ing tensor " << input_tensor << " of shape " << shapeToString(shape));
+
+        // Compute dispatch grid to cover the OUTPUT tensor C[B,M,N]
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        // Grid covers the output tensor dimensions C[M,N] per batch
+        uint32_t groupX = ceilDiv(M, tile_size[0]);  // Cover all N columns (output cols)
+        uint32_t groupY = ceilDiv(N, tile_size[1]);  // Cover all M rows (output rows)
+        uint32_t groupZ = batch_size;       // One group per batch element
+
+        DEBUG_PRINT("Dispatch: " << groupX << " x " << groupY << " x " << groupZ
+            << " (covering output " << M << "x" << N << " per batch)");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+        tensor_push_const pushConsts{};
+        
+        if(mode == 0){
+            pushConsts.mode = mode; // forward/backward pass
+            pushConsts.uniformAddress = ReLUShader.uniformBuffer->getBufferAddress();
+            pushConsts.grid_size = { groupX, groupY, groupZ };
+            ReLUShader.loadUniform(uniform, pushConsts);
+            ReLUShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.mode = mode; // forward/backward pass
+            pushConsts.uniformAddress = ReLUShaderBackward.uniformBuffer->getBufferAddress();
+            pushConsts.grid_size = { groupX, groupY, groupZ };
+            ReLUShaderBackward.loadUniform(uniform, pushConsts);
+            ReLUShaderBackward.execute(workgroup);
+        }
+    };
+
+    // output tensor = (B, token_count, embedding_dim)
+    // embedding tensor = (vocab_size, embedding_dim)
+    // indices tensor = (B, token_count)
+    void tensor_embed_lookup(const std::string& output_tensor, const std::string& embedding_tensor, const std::string& indices_tensor, uint32_t mode = 0) {
+        uint32_t local_size_x = 256;
+        size_t batch_size = tensors[indices_tensor]->shape[0];
+        size_t token_count = tensors[indices_tensor]->shape[1];
+        size_t embedding_dim = tensors[embedding_tensor]->shape[1];
+
+        size_t total_invocations = batch_size * token_count;
+        size_t group_count = (total_invocations + local_size_x - 1) / local_size_x;
+
+        embedding_lookup_context uniform{};
+        uniform.embedding_tensor = tensors[embedding_tensor]->getTensorImpl();
+        uniform.indices_tensor = tensors[indices_tensor]->getTensorImpl();
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+
+        DEBUG_PRINT("Embedding lookup tensor " << embedding_tensor << " with indices from " << indices_tensor << " into " << output_tensor);
+        uint32_t workgroup[3] = { (uint32_t)group_count, 1, 1 };
+        tensor_push_const pushConsts{};
+
+        if(mode == 0){
+            pushConsts.mode = mode; // forward pass
+            pushConsts.uniformAddress = embedLookupShader.uniformBuffer->getBufferAddress();
+            pushConsts.grid_size = { (uint32_t)group_count, 1, 1 };
+            embedLookupShader.loadUniform(uniform, pushConsts);
+            embedLookupShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.mode = mode; // backward pass
+            pushConsts.uniformAddress = embedLookupShaderBackward.uniformBuffer->getBufferAddress();
+            pushConsts.grid_size = { (uint32_t)group_count, 1, 1 };
+            embedLookupShaderBackward.loadUniform(uniform, pushConsts);
+            embedLookupShaderBackward.execute(workgroup);
+        }
+    };
+
+    // simple 3x3 convolution with padding 1, stride 1, dilation 1, groups 1
+    void tensor_conv2d_3x3(const std::string& output_tensor, const std::string& input_tensor, const std::string& weight_tensor, const std::string& bias_tensor, uint32_t mode = 0,
+        uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1, uint32_t groups = 1) {
+        tensor_conv2d_3x3_context uniform{};
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+        uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+        uniform.out_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.stride_h = stride_h;
+        uniform.stride_w = stride_w;
+        uniform.pad_h = pad_h;
+        uniform.pad_w = pad_w;
+        uniform.dilation_h = dilation_h;
+        uniform.dilation_w = dilation_w;
+        uniform.groups = groups;
+        uniform.accumulate_grad = 1; // accumulate gradients
+
+        DEBUG_PRINT("Conv2D 3x3 tensor " << input_tensor << " with weights from " << weight_tensor << " into " << output_tensor);
+        
+        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        
+        tensor_push_const pushConsts{};
+        if (mode == 0) {
+            uint32_t groupX = cielDiv(tensors[output_tensor]->shape[3], 16u); // W_out
+            uint32_t groupY = cielDiv(tensors[output_tensor]->shape[2], 16u); // H_out
+            uint32_t groupZ = tensors[output_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * Filters
+
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
+            pushConsts.mode = mode; // forward pass
+            pushConsts.uniformAddress = conv2dShader3x3.uniformBuffer->getBufferAddress();
+            pushConsts.grid_size = { groupX, groupY, groupZ };
+            conv2dShader3x3.loadUniform(uniform, pushConsts);
+            conv2dShader3x3.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.uniformAddress = conv2dShader3x3Backward.uniformBuffer->getBufferAddress();
+            
+            // Kernel 0: Compute gradient w.r.t. input
+            {
+                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
+                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
+                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[input_tensor]->shape[1]; // batch * C_in
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                
+                pushConsts.grid_size = { groupX, groupY, groupZ };
+                pushConsts.mode = 0; // input gradient
+                conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
+                conv2dShader3x3Backward.execute(workgroup);
+            }
+            
+            // Kernel 1: Compute gradient w.r.t. weights
+            {
+                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
+                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
+                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * F
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                
+                pushConsts.grid_size = { groupX, groupY, groupZ };
+                pushConsts.mode = 1; // weight gradient
+                conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
+                conv2dShader3x3Backward.execute(workgroup);
+            }
+            
+            // Kernel 2: Compute gradient w.r.t. bias
+            {
+                uint32_t groupX = tensors[weight_tensor]->shape[0]; // F (num filters)
+                uint32_t groupY = 1;
+                uint32_t groupZ = 1;
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                
+                pushConsts.grid_size = { groupX, groupY, groupZ };
+                pushConsts.mode = 2; // bias gradient
+                conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
+                conv2dShader3x3Backward.execute(workgroup);
+            }
+        }
+    };
+
+    void tensor_softmax(const std::string& output_tensor, const std::string& input_tensor, uint32_t mode = 0) {
+        // Check if shapes match
+        try {
+            broadcastShapes(tensors[output_tensor]->shape, tensors[input_tensor]->shape, Operation::ADDITION);
+        }
+        catch (const std::invalid_argument& e) {
+            std::cerr << "Error in tensor_softmax: " << e.what() << "\n";
+            throw;
+        }
+        tensor_softmax_context uniform{};
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+        // Helpers
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return (uint32_t)p;
+            };
+        const auto& shape = tensors[input_tensor]->shape; // X[..., M, N]
+        if (shape.size() < 2)
+            throw std::invalid_argument("Rank must be >= 2");
+        uint32_t M = shape[shape.size() - 2];
+        uint32_t N = shape.back();
+        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+        DEBUG_PRINT("Softmax'ing tensor " << input_tensor << " of shape " << shapeToString(shape));
+        uniform.m = M;
+        uniform.n = N;
+        // Compute dispatch grid to cover the OUTPUT tensor C[B,M,N]
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        // Grid covers the output tensor dimensions C[M,N] per batch
+        uint32_t groupX = ceilDiv(M, 256u);  // Cover all N columns
+        uint32_t groupY = 1;  // Single row (softmax over last dim)
+        uint32_t groupZ = batch_size;       // One group per batch element
+        DEBUG_PRINT("Dispatch: " << groupX << " � " << groupY << " � " << groupZ
+            << " (covering output " << M << "�" << N << " per batch)");
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+        tensor_push_const pushConsts{};
+        pushConsts.uniformAddress = softmaxShader.uniformBuffer->getBufferAddress();
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+        pushConsts.mode = mode; // Forward pass
+        softmaxShader.loadUniform(uniform, pushConsts);
+        softmaxShader.execute(workgroup);
+    };
+
+    void tensor_cross_entropy(const std::string& loss_tensor, const std::string& logits_tensor, const std::string& target_tensor, const std::string& softmax_tensor = "", uint32_t mode = 0) {
+        // Check if shapes match
+        try {
+            broadcastShapes(tensors[logits_tensor]->shape, tensors[target_tensor]->shape, Operation::ADDITION);
+            if (!softmax_tensor.empty()) {
+                broadcastShapes(tensors[logits_tensor]->shape, tensors[softmax_tensor]->shape, Operation::ADDITION);
+            }
+        }
+        catch (const std::invalid_argument& e) {
+            std::cerr << "Error in tensor_cross_entropy: " << e.what() << "\n";
+            throw;
+        }
+        tensor_cross_entropy_context uniform{};
+        uniform.logits_tensor = tensors[logits_tensor]->getTensorImpl();
+        uniform.target_tensor = tensors[target_tensor]->getTensorImpl();
+        uniform.loss_tensor = tensors[loss_tensor]->getTensorImpl();
+        if (!softmax_tensor.empty()) {
+            uniform.softmax_tensor = tensors[softmax_tensor]->getTensorImpl();
+        }
+        // Helpers
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return (uint32_t)p;
+            };
+        const auto& shape = tensors[logits_tensor]->shape; // X[..., M, N]
+        if (shape.size() < 2)
+            throw std::invalid_argument("Rank must be >= 2");
+        uint32_t M = shape[shape.size() - 2];
+        uint32_t N = shape.back();
+        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+        DEBUG_PRINT("Cross-entropy'ing tensor " << logits_tensor << " of shape " << shapeToString(shape));
+        uniform.m = M;
+        uniform.n = N;
+        uniform.batch_size = batch_size;
+        uniform.compute_softmax = softmax_tensor.empty() ? 0 : 1;
+        // Compute dispatch grid to cover the OUTPUT tensor C[B,M,N]
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        // Grid covers the output tensor dimensions C[M,N] per batch
+        uint32_t groupX = ceilDiv(N, 256u); // Cover all N columns
+        uint32_t groupY = M;                // cross entropy over all rows
+        uint32_t groupZ = batch_size;       // One group per batch element
+        DEBUG_PRINT("Dispatch: " << groupX << " � " << groupY << " � " << groupZ
+            << " (covering output " << M << "�" << N << " per batch)");
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+        if (mode == 0) {
+            pushConsts.mode = mode; // Forward pass
+            pushConsts.uniformAddress = crossEntropyShader.uniformBuffer->getBufferAddress();
+            crossEntropyShader.loadUniform(uniform, pushConsts);
+            crossEntropyShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.mode = mode; // Backward pass
+            pushConsts.uniformAddress = crossEntropyShaderBackward.uniformBuffer->getBufferAddress();
+            crossEntropyShaderBackward.loadUniform(uniform, pushConsts);
+            crossEntropyShaderBackward.execute(workgroup);
+        }
+    };
+
+    void tensor_batchnorm_1d(const std::string& input_tensor,
+                         const std::string& weight_tensor,
+                         const std::string& bias_tensor,
+                         const std::string& running_mean,
+                         const std::string& running_var,
+                         const std::string& out_tensor,
+                         const std::string& save_mean,
+                         const std::string& save_var,
+                         uint32_t mode = 0) // 0 = forward, 1 = backward
+    {
+        // Validate existence & shapes
+        try {
+            broadcastShapes(tensors[input_tensor]->shape, tensors[weight_tensor]->shape, Operation::OTHER);
+            broadcastShapes(tensors[input_tensor]->shape, tensors[bias_tensor]->shape, Operation::OTHER);
+            // We expect running_mean/var and save_mean/var to match the feature dims
+        }
+        catch (const std::invalid_argument& e) {
+            std::cerr << "Error in tensor_batchnorm_1d (broadcast): " << e.what() << "\n";
+            throw;
+        }
+
+        tensor_batchnorm_context uniform{};
+
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return (uint32_t)p;
+        }; 
+
+        const auto& inShape = tensors[input_tensor]->shape;
+        if (inShape.size() < 2)
+            throw std::invalid_argument("Input rank must be >= 2 for BatchNorm1D (need [B..., M, N])");
+
+        // last-2 dims are feature dims [M, N]
+        uint32_t M = inShape[inShape.size() - 2];
+        uint32_t N = inShape.back();
+        uint32_t batch_size = prod(inShape, 0, inShape.size() - 2);
+
+        // Fill uniform/context expected by shader (field names follow your GLSL Context)
+        uniform.input_tensor   = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor  = tensors[weight_tensor]->getTensorImpl();
+        uniform.bias_tensor    = tensors[bias_tensor]->getTensorImpl();
+        uniform.running_mean   = tensors[running_mean]->getTensorImpl();
+        uniform.running_var    = tensors[running_var]->getTensorImpl();
+        uniform.out_tensor     = tensors[out_tensor]->getTensorImpl();
+        uniform.save_mean      = tensors[save_mean]->getTensorImpl();
+        uniform.save_var       = tensors[save_var]->getTensorImpl();
+
+        uniform.batch_size     = batch_size;
+        uniform.mode           = mode; // kernel mode (0 forward, 1 backward)
+        uniform.accumulate_grad = 1;    // default; caller can change if needed
+        uniform.momentum = 0.1f;
+        uniform.eps = 1e-05;
+
+        // dispatch grid calculation
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        uint32_t dispatchM = M;
+        uint32_t dispatchN = N;
+
+        uint32_t groupX = M;
+        uint32_t groupY = N;
+        uint32_t groupZ = 1;
+
+        DEBUG_PRINT("BatchNorm dispatch: " << groupX << " x " << groupY << " x " << groupZ
+                << " (covering " << dispatchM << "x" << dispatchN << " per batch)");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+
+        // choose shader based on mode
+        if (mode == 0) {
+            pushConsts.mode = 0; // forward
+            pushConsts.uniformAddress = batchnormShader.uniformBuffer->getBufferAddress();
+            batchnormShader.loadUniform(uniform, pushConsts);
+            batchnormShader.execute(workgroup);
+        } else {
+            pushConsts.mode = 1; // backward
+            pushConsts.uniformAddress = batchnormShaderBackward.uniformBuffer->getBufferAddress();
+            batchnormShaderBackward.loadUniform(uniform, pushConsts);
+            batchnormShaderBackward.execute(workgroup);
+        }
+    }
+
+    void tensor_batchnorm_2d(const std::string& input_tensor,
+                          const std::string& weight_tensor,
+                          const std::string& bias_tensor,
+                          const std::string& running_mean,
+                          const std::string& running_var,
+                          const std::string& out_tensor,
+                          const std::string& save_mean,
+                          const std::string& save_var,
+                          uint32_t mode = 0, // 0 = forward, 1 = backward
+                          float momentum = 0.1f,
+                          float eps = 1e-05f)
+    {
+        // Validate tensor existence
+        if (tensors.find(input_tensor) == tensors.end() ||
+            tensors.find(weight_tensor) == tensors.end() ||
+            tensors.find(bias_tensor) == tensors.end() ||
+            tensors.find(running_mean) == tensors.end() ||
+            tensors.find(running_var) == tensors.end() ||
+            tensors.find(out_tensor) == tensors.end() ||
+            tensors.find(save_mean) == tensors.end() ||
+            tensors.find(save_var) == tensors.end()) {
+            throw std::invalid_argument("One or more tensors not found for BatchNorm2D");
+        }
+
+        const auto& inShape = tensors[input_tensor]->shape;
+        
+        // Validate input shape: expect [B, C, H, W] (rank 4)
+        if (inShape.size() != 4) {
+            throw std::invalid_argument("BatchNorm2D expects input shape [B, C, H, W] (rank 4), got rank " + 
+                                    std::to_string(inShape.size()));
+        }
+
+        uint32_t B = inShape[0]; // batch size
+        uint32_t C = inShape[1]; // channels
+        uint32_t H = inShape[2]; // height
+        uint32_t W = inShape[3]; // width
+
+        // Validate parameter shapes: weight, bias, running_mean, running_var should all be [C]
+        const auto& weightShape = tensors[weight_tensor]->shape;
+        const auto& biasShape = tensors[bias_tensor]->shape;
+        const auto& runningMeanShape = tensors[running_mean]->shape;
+        const auto& runningVarShape = tensors[running_var]->shape;
+
+        if (weightShape.size() != 1 || weightShape[0] != C) {
+            throw std::invalid_argument("Weight tensor must have shape [C=" + std::to_string(C) + "]");
+        }
+        if (biasShape.size() != 1 || biasShape[0] != C) {
+            throw std::invalid_argument("Bias tensor must have shape [C=" + std::to_string(C) + "]");
+        }
+        if (runningMeanShape.size() != 1 || runningMeanShape[0] != C) {
+            throw std::invalid_argument("Running mean tensor must have shape [C=" + std::to_string(C) + "]");
+        }
+        if (runningVarShape.size() != 1 || runningVarShape[0] != C) {
+            throw std::invalid_argument("Running var tensor must have shape [C=" + std::to_string(C) + "]");
+        }
+
+        // Validate output shape matches input
+        const auto& outShape = tensors[out_tensor]->shape;
+        if (outShape.size() != 4 || outShape[0] != B || outShape[1] != C || 
+            outShape[2] != H || outShape[3] != W) {
+            throw std::invalid_argument("Output tensor shape must match input [B, C, H, W]");
+        }
+
+        // Fill context structure
+        tensor_batchnorm2d_context uniform{};
+        
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+        uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+        uniform.running_mean = tensors[running_mean]->getTensorImpl();
+        uniform.running_var = tensors[running_var]->getTensorImpl();
+        uniform.out_tensor = tensors[out_tensor]->getTensorImpl();
+        uniform.save_mean = tensors[save_mean]->getTensorImpl();
+        uniform.save_var = tensors[save_var]->getTensorImpl();
+        
+        uniform.batch_size = B;
+        uniform.channels = C;
+        uniform.height = H;
+        uniform.width = W;
+        uniform.mode = mode; // 0 = training (forward), 1 = evaluation (forward), or backward
+        uniform.accumulate_grad = 1; // default; can be set by caller if needed
+        uniform.momentum = momentum;
+        uniform.eps = eps;
+
+        // Dispatch grid: one workgroup per channel
+        // Each workgroup has 256 threads that cooperate to process all B*H*W elements for one channel
+        uint32_t groupX = C; // One workgroup per channel
+        uint32_t groupY = 1;
+        uint32_t groupZ = 1;
+
+        DEBUG_PRINT("BatchNorm2D dispatch: " << groupX << " x " << groupY << " x " << groupZ
+                    << " (B=" << B << ", C=" << C << ", H=" << H << ", W=" << W 
+                    << ", spatial_size=" << (H * W) << ", mode=" << mode << ")");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+        
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+
+        // Choose shader based on mode
+        if (mode == 0) {
+            // Forward pass
+            pushConsts.mode = 0; // forward
+            pushConsts.uniformAddress = batchnorm2dShader.uniformBuffer->getBufferAddress();
+            batchnorm2dShader.loadUniform(uniform, pushConsts);
+            batchnorm2dShader.execute(workgroup);
+        } else {
+            // Backward pass
+            pushConsts.mode = 1; // backward
+            pushConsts.uniformAddress = batchnorm2dShaderBackward.uniformBuffer->getBufferAddress();
+            batchnorm2dShaderBackward.loadUniform(uniform, pushConsts);
+            batchnorm2dShaderBackward.execute(workgroup);
+        }
+    }
+
+    void tensor_layernorm_1d(const std::string& input_tensor,
+                         const std::string& weight_tensor,
+                         const std::string& bias_tensor,
+                         const std::string& out_tensor,
+                         const std::string& save_mean,
+                         const std::string& save_rstd,
+                         uint32_t mode = 0) // 0 = forward, 1 = backward
+    {
+        // Validate existence & get shapes
+        try {
+            // LayerNorm: weight and bias should broadcast with last dimension
+            const auto& inShape = tensors[input_tensor]->shape;
+            const auto& wShape = tensors[weight_tensor]->shape;
+            const auto& bShape = tensors[bias_tensor]->shape;
+            
+            if (inShape.empty()) {
+                throw std::invalid_argument("Input tensor cannot be empty");
+            }
+        }
+        catch (const std::invalid_argument& e) {
+            std::cerr << "Error in tensor_layernorm_1d: " << e.what() << "\n";
+            throw;
+        }
+
+        tensor_layernorm1d_context uniform{};
+
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; 
+            for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Product too large");
+            return (uint32_t)p;
+        }; 
+
+        const auto& inShape = tensors[input_tensor]->shape;
+        if (inShape.size() < 2) {
+            throw std::invalid_argument("Input rank must be >= 2 for LayerNorm1D (need [..., M, N])");
+        }
+
+        // LayerNorm normalizes over the last dimension N
+        // Shape: [B, M, N] -> normalize over N for each (B, M) sample
+        uint32_t N = inShape.back(); // normalized_size
+        uint32_t M = inShape[inShape.size() - 2];
+        uint32_t batch_size = prod(inShape, 0, inShape.size() - 2); // All dims before M
+        
+        uint32_t batch_stride = M * N; // elements per batch
+        uint32_t num_samples = batch_size * M; // total number of [N] sequences to normalize
+
+        // Validate weight/bias shapes are [N] (normalized shape)
+        auto expectNormShape = [&](const std::string& name) {
+            const auto& s = tensors[name]->shape;
+            if (s.size() != 1 || s[0] != N) {
+                throw std::invalid_argument(name + " must be shape [N=" + std::to_string(N) + 
+                                        "] matching input's last dimension");
+            }
+        };
+        expectNormShape(weight_tensor);
+        expectNormShape(bias_tensor);
+
+        // Validate save_mean and save_rstd shapes are [B, M] (one per sample)
+        auto expectStatsShape = [&](const std::string& name) {
+            const auto& s = tensors[name]->shape;
+            // Should be [batch_size, M] or flattened [batch_size * M]
+            uint32_t expected_size = batch_size * M;
+            uint32_t actual_size = prod(s, 0, s.size());
+            if (actual_size != expected_size) {
+                throw std::invalid_argument(name + " must have " + std::to_string(expected_size) + 
+                                        " elements for [B=" + std::to_string(batch_size) + 
+                                        ", M=" + std::to_string(M) + "]");
+            }
+        };
+        expectStatsShape(save_mean);
+        expectStatsShape(save_rstd);
+
+        // Fill uniform/context expected by shader
+        uniform.input_tensor   = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor  = tensors[weight_tensor]->getTensorImpl();
+        uniform.bias_tensor    = tensors[bias_tensor]->getTensorImpl();
+        uniform.out_tensor     = tensors[out_tensor]->getTensorImpl();
+        uniform.save_mean      = tensors[save_mean]->getTensorImpl();
+        uniform.save_rstd      = tensors[save_rstd]->getTensorImpl();
+
+        uniform.normalized_size = N;           // Size of normalized dimension
+        uniform.batch_stride    = batch_stride; // M * N
+        uniform.accumulate_grad = 1;           // default; caller can change if needed
+        uniform.eps = 1e-05f;
+
+        // Dispatch grid calculation
+        // Each workgroup processes one [N] sequence
+        // Total workgroups = batch_size * M
+        uint32_t groupX = num_samples; // batch_size * M
+        uint32_t groupY = 1;
+        uint32_t groupZ = 1;
+
+        DEBUG_PRINT("LayerNorm dispatch: " << groupX << " x " << groupY << " x " << groupZ
+                << " (normalizing " << num_samples << " sequences of size " << N << ")");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+
+        // Choose shader based on mode
+        if (mode == 0) {
+            pushConsts.mode = 0; // forward
+            pushConsts.uniformAddress = layernorm1dShader.uniformBuffer->getBufferAddress();
+            layernorm1dShader.loadUniform(uniform, pushConsts);
+            layernorm1dShader.execute(workgroup);
+        } else {
+            pushConsts.mode = 1; // backward
+            pushConsts.uniformAddress = layernorm1dShaderBackward.uniformBuffer->getBufferAddress();
+            layernorm1dShaderBackward.loadUniform(uniform, pushConsts);
+            layernorm1dShaderBackward.execute(workgroup);
+        }
+    }
+
+    void tensor_mult(const std::string& output_tensor, const std::string& input_tensor, const std::string& weight_tensor, uint32_t mode = 0) {
+
+        try {
+            broadcastShapes(tensors[input_tensor]->shape, tensors[weight_tensor]->shape, Operation::MULTIPLICATION);
+        }
+        catch (const std::invalid_argument& e) {
+            std::cerr << "Error in tensor_mult: " << e.what() << "\n";
+            throw;
+        }
+
+        matmul_context uniform{};
+
+        // Helpers
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1;
+            for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return static_cast<uint32_t>(p);
+        };
+
+        // Input shape X[..., M, K]
+        const auto& shape = tensors[input_tensor]->shape;
+        if (shape.size() < 2)
+            throw std::invalid_argument("Rank must be >= 2");
+        uint32_t M = shape[shape.size() - 2];
+        uint32_t K = shape.back();
+
+        // Weight shape W[..., N, K] (transposed)
+        const auto& weight_shape = tensors[weight_tensor]->shape;
+        if (weight_shape.size() < 2)
+            throw std::invalid_argument("Weight rank must be >= 2");
+        uint32_t KB = weight_shape.back();
+        uint32_t N = weight_shape[weight_shape.size() - 2];
+        if (KB != K)
+            throw std::invalid_argument("Inner dims mismatch: X[...,M,K] @ W[...,N,K] (transposed)");
+
+        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+
+        DEBUG_PRINT("Multiplying tensor " << input_tensor << " of shape "
+            << shapeToString(shape) << " with transposed weights " << weight_tensor
+            << " of shape " << shapeToString(weight_shape));
+
+        // --- Warp-tiling parameters (must match shader) ---
+        constexpr uint32_t BM = 128;  // Block tile size M
+        constexpr uint32_t BN = 128;  // Block tile size N
+        constexpr uint32_t BK = 8;    // Block tile size K
+        constexpr uint32_t NUM_THREADS = 256;  // Threads per workgroup
+
+        // --- Compute dispatch grid based on mode ---
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        // uniforms
+        uniform.m = M;
+        uniform.n = N;
+        uniform.k = K;
+        uniform.batch_size = batch_size;
+        uniform.accumulate_grad = 1; // add
+
+        uint32_t dispatchM, dispatchN, dispatchBatch;
+
+        if (mode == 0) {
+            // Mode 0: Use output tensor dimensions
+            const auto& output_shape = tensors[output_tensor]->shape;
+            if (output_shape.size() < 2)
+                throw std::invalid_argument("Output rank must be >= 2");
+
+            dispatchM = output_shape[output_shape.size() - 2];
+            dispatchN = output_shape[output_shape.size() - 1];
+            dispatchBatch = prod(output_shape, 0, output_shape.size() - 2);
+
+            DEBUG_PRINT("Dispatch (output dims): ");
+        }
+        else {
+            // Mode 1: Use max dimensions of all tensors
+            auto maxDim = [](const std::vector<uint32_t>& a,
+                const std::vector<uint32_t>& b) {
+                    size_t L = std::max(a.size(), b.size());
+                    std::vector<uint32_t> res(L, 1);
+                    for (size_t i = 0; i < L; i++) {
+                        uint32_t av = (i < a.size() ? a[i] : 1);
+                        uint32_t bv = (i < b.size() ? b[i] : 1);
+                        res[i] = std::max(av, bv);
+                    }
+                    return res;
+                };
+
+            std::vector<uint32_t> maxShape = tensors[input_tensor]->shape;
+            auto transposedWeightShape = tensors[weight_tensor]->shape;
+            if (transposedWeightShape.size() >= 2) {
+                std::swap(transposedWeightShape[transposedWeightShape.size() - 1], 
+                         transposedWeightShape[transposedWeightShape.size() - 2]);
+            }
+            maxShape = maxDim(maxShape, transposedWeightShape);
+            
+            if (maxShape.size() < 2)
+                throw std::invalid_argument("Max rank must be >= 2");
+
+            dispatchM = maxShape[maxShape.size() - 2];
+            dispatchN = maxShape[maxShape.size() - 1];
+            dispatchBatch = prod(maxShape, 0, maxShape.size() - 2);
+
+            DEBUG_PRINT("Dispatch (max dims): ");
+        }
+
+        // Calculate workgroup dimensions based on warp-tiling parameters
+        // Each workgroup processes a BM x BN tile with NUM_THREADS threads
+        uint32_t groupX = ceilDiv(dispatchN, BN);
+        uint32_t groupY = ceilDiv(dispatchM, BM);
+        uint32_t groupZ = dispatchBatch;
+
+        DEBUG_PRINT(groupX << " × " << groupY
+            << " × " << groupZ << " workgroups (covering " << dispatchM << "×"
+            << dispatchN << " per batch)");
+        DEBUG_PRINT("Workgroup size: " << NUM_THREADS << " threads (" 
+            << BM << "×" << BN << " tile)");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+
+        if (mode == 0) {
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = multiplicationShader.uniformBuffer->getBufferAddress();
+            multiplicationShader.loadUniform(uniform, pushConsts);
+            multiplicationShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = multiplicationShaderBackward.uniformBuffer->getBufferAddress();
+            multiplicationShaderBackward.loadUniform(uniform, pushConsts);
+            multiplicationShaderBackward.execute(workgroup);
+        }
+    }
+
+    void tensor_add(const std::string& output_tensor, const std::string& tensor_a, const std::string& tensor_b, uint32_t mode = 0) {
+        try {
+            broadcastShapes(tensors[tensor_a]->shape, tensors[tensor_b]->shape, Operation::ADDITION);
+        }
+        catch (const std::invalid_argument& e) {
+            throw std::invalid_argument("Rank must be >= 2");
+        }
+        matadd_context uniform{};
+        // Helpers
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return (uint32_t)p;
+            };
+        auto leading_equal = [](const std::vector<uint32_t>& a,
+            const std::vector<uint32_t>& b)->bool {
+                if (a.size() != b.size()) return false;
+                for (size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) return false;
+                return true;
+            };
+        const auto& shapeA = tensors[tensor_a]->shape; // X[..., M, N]
+        const auto& shapeB = tensors[tensor_b]->shape; // Y[..., M, N]
+        if (shapeA.size() < 1 || shapeB.size() < 1)
+            throw std::invalid_argument("Rank must be >= 1");
+        if (!leading_equal(shapeA, shapeB))
+            throw std::invalid_argument("Shapes must match exactly for addition");
+        // last-2 dims
+        uint32_t M = shapeA.size() >= 2 ? shapeA[shapeA.size() - 2] : 1;
+        uint32_t N = shapeA.back();
+        // flatten all leading dims -> B
+        uint32_t batch_size = prod(shapeA, 0, shapeA.size() - 2);
+        // uniforms
+        uniform.input_a = tensors[tensor_a]->getTensorImpl();
+        uniform.input_b = tensors[tensor_b]->getTensorImpl();
+		uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.mode = mode; // forward
+        uniform.batch_size = batch_size;
+        uniform.m = M;
+        uniform.n = N;
+        uniform.accumulate_grad = 0;
+        // Compute dispatch grid
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t dispatchM, dispatchN, dispatchBatch;
+        // Use output tensor dimensions
+        const auto& output_shape = tensors[output_tensor]->shape;
+        if (output_shape.size() < 1)
+            throw std::invalid_argument("Output rank must be >= 1");
+        dispatchM = output_shape.size() >= 2 ? output_shape[output_shape.size() - 2] : 1;
+        dispatchN = output_shape.back();
+        dispatchBatch = prod(output_shape, 0, output_shape.size() - 2);
+        DEBUG_PRINT("Dispatch : ");
+        
+        uint32_t groupX = ceilDiv(dispatchN, tile_size[0]);
+        uint32_t groupY = ceilDiv(dispatchM, tile_size[1]);
+        uint32_t groupZ = dispatchBatch;
+        DEBUG_PRINT(groupX << " � " << groupY
+            << " � " << groupZ << " (covering " << dispatchM << "�"
+            << dispatchN << " per batch)");
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+        if (mode == 0) {
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = additionShader.uniformBuffer->getBufferAddress();
+            additionShader.loadUniform(uniform, pushConsts);
+            additionShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = additionShaderBackward.uniformBuffer->getBufferAddress();
+            additionShaderBackward.loadUniform(uniform, pushConsts);
+            additionShaderBackward.execute(workgroup);
+        }
+	}
+
+    void tensor_linear_ReLU(const std::string& output_tensor,
+        const std::string& input_tensor,
+        const std::string& weight_tensor,
+        const std::string& bias_tensor = "",
+        uint32_t mode = 0) {
+
+        linear_context uniform{};
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+        if (!bias_tensor.empty()) {
+            uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+            uniform.use_bias = 1;
+        } else {
+            uniform.use_bias = 0;
+        }
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.mode = 0; // Tiling mode
+
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1;
+            for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return static_cast<uint32_t>(p);
+        };
+
+        // Input shape X[..., M, K]
+        const auto& shape = tensors[input_tensor]->shape;
+        if (shape.size() < 2)
+            throw std::invalid_argument("Rank must be >= 2");
+        uint32_t M = shape[shape.size() - 2];
+        uint32_t K = shape.back();
+
+        // Weight shape W[..., N, K] (transposed)
+        const auto& weight_shape = tensors[weight_tensor]->shape;
+        if (weight_shape.size() < 2)
+            throw std::invalid_argument("Weight rank must be >= 2");
+        uint32_t KB = weight_shape.back();
+        uint32_t N = weight_shape[weight_shape.size() - 2];
+        if (KB != K)
+            throw std::invalid_argument("Inner dims mismatch: X[...,M,K] @ W[...,N,K] (transposed)");
+
+        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+
+        DEBUG_PRINT("Linear'ing tensor " << input_tensor << " of shape "
+            << shapeToString(shape) << " with transposed weights " << weight_tensor
+            << " of shape " << shapeToString(weight_shape));
+
+        uniform.m = M;
+        uniform.n = N;
+        uniform.k = K;
+        uniform.batch_size = batch_size;
+        uniform.accumulate_grad = 1; // add
+
+        // --- Warp-tiling parameters (must match shader) ---
+        constexpr uint32_t BM = 128;  // Block tile size M
+        constexpr uint32_t BN = 128;  // Block tile size N
+        constexpr uint32_t BK = 8;    // Block tile size K
+        constexpr uint32_t NUM_THREADS = 256;  // Threads per workgroup
+
+        // --- Compute dispatch grid based on mode ---
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        uint32_t dispatchM, dispatchN, dispatchBatch;
+
+        if (mode == 0) {
+            // Mode 0: Use output tensor dimensions
+            const auto& output_shape = tensors[output_tensor]->shape;
+            if (output_shape.size() < 2)
+                throw std::invalid_argument("Output rank must be >= 2");
+
+            dispatchM = output_shape[output_shape.size() - 2];
+            dispatchN = output_shape[output_shape.size() - 1];
+            dispatchBatch = prod(output_shape, 0, output_shape.size() - 2);
+
+            DEBUG_PRINT("Dispatch (output dims): ");
+        }
+        else {
+            // Mode 1: Use max dimensions of all tensors
+            auto maxDim = [](const std::vector<uint32_t>& a,
+                const std::vector<uint32_t>& b) {
+                    size_t L = std::max(a.size(), b.size());
+                    std::vector<uint32_t> res(L, 1);
+                    for (size_t i = 0; i < L; i++) {
+                        uint32_t av = (i < a.size() ? a[i] : 1);
+                        uint32_t bv = (i < b.size() ? b[i] : 1);
+                        res[i] = std::max(av, bv);
+                    }
+                    return res;
+                };
+
+            std::vector<uint32_t> maxShape = tensors[input_tensor]->shape;
+            auto transposedWeightShape = tensors[weight_tensor]->shape;
+            if (transposedWeightShape.size() >= 2) {
+                std::swap(transposedWeightShape[transposedWeightShape.size() - 1], 
+                         transposedWeightShape[transposedWeightShape.size() - 2]);
+            }
+            maxShape = maxDim(maxShape, transposedWeightShape);
+            if (!bias_tensor.empty())
+                maxShape = maxDim(maxShape, tensors[bias_tensor]->shape);
+            maxShape = maxDim(maxShape, tensors[output_tensor]->shape);
+
+            if (maxShape.size() < 2)
+                throw std::invalid_argument("Max rank must be >= 2");
+
+            dispatchM = maxShape[maxShape.size() - 2];
+            dispatchN = maxShape[maxShape.size() - 1];
+            dispatchBatch = prod(maxShape, 0, maxShape.size() - 2);
+
+            DEBUG_PRINT("Dispatch (max dims): ");
+        }
+
+        // Calculate workgroup dimensions based on warp-tiling parameters
+        // Each workgroup processes a BM x BN tile with NUM_THREADS threads
+        uint32_t groupX = ceilDiv(dispatchN, BN);
+        uint32_t groupY = ceilDiv(dispatchM, BM);
+        uint32_t groupZ = dispatchBatch;
+
+        DEBUG_PRINT(groupX << " × " << groupY
+            << " × " << groupZ << " workgroups (covering " << dispatchM << "×"
+            << dispatchN << " per batch)" << "Workgroup size: " << NUM_THREADS << " threads (" 
+            << BM << "×" << BN << " tile)");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+
+        if (mode == 0) {
+            pushConsts.mode = mode;
+            uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+            pushConsts.uniformAddress = linearReLUShader.uniformBuffer->getBufferAddress();
+            linearReLUShader.loadUniform(uniform, pushConsts);
+            linearReLUShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = linearReLUShaderBackward.uniformBuffer->getBufferAddress();
+            linearReLUShaderBackward.loadUniform(uniform, pushConsts);
+            linearReLUShaderBackward.execute(workgroup);
+        }
+    }
+
+    void tensor_linear(const std::string& output_tensor,
+        const std::string& input_tensor,
+        const std::string& weight_tensor,
+        const std::string& bias_tensor = "",
+        uint32_t mode = 0) {
+        linear_context uniform{};
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+        if (!bias_tensor.empty()) {
+            uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+            uniform.use_bias = 1;
+        } else {
+            uniform.use_bias = 0;
+        }
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.mode = 0; // Tiling mode
+
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1;
+            for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return static_cast<uint32_t>(p);
+        };
+
+        // Input shape X[..., M, K]
+        const auto& shape = tensors[input_tensor]->shape;
+        if (shape.size() < 2)
+            throw std::invalid_argument("Rank must be >= 2");
+        uint32_t M = shape[shape.size() - 2];
+        uint32_t K = shape.back();
+
+        // Weight shape W[..., N, K] (transposed)
+        const auto& weight_shape = tensors[weight_tensor]->shape;
+        if (weight_shape.size() < 2)
+            throw std::invalid_argument("Weight rank must be >= 2");
+        uint32_t KB = weight_shape.back();
+        uint32_t N = weight_shape[weight_shape.size() - 2];
+        if (KB != K)
+            throw std::invalid_argument("Inner dims mismatch: X[...,M,K] @ W[...,N,K] (transposed)");
+
+        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+
+        DEBUG_PRINT("Linear'ing tensor " << input_tensor << " of shape "
+            << shapeToString(shape) << " with transposed weights " << weight_tensor
+            << " of shape " << shapeToString(weight_shape));
+
+        uniform.m = M;
+        uniform.n = N;
+        uniform.k = K;
+        uniform.batch_size = batch_size;
+        uniform.accumulate_grad = 1; // add
+
+        // --- Warp-tiling parameters (must match shader) ---
+        constexpr uint32_t BM = 128;  // Block tile size M
+        constexpr uint32_t BN = 128;  // Block tile size N
+        constexpr uint32_t BK = 8;    // Block tile size K
+        constexpr uint32_t NUM_THREADS = 256;  // Threads per workgroup
+
+        // --- Compute dispatch grid based on mode ---
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        uint32_t dispatchM, dispatchN, dispatchBatch;
+
+        if (mode == 0) {
+            // Mode 0: Use output tensor dimensions
+            const auto& output_shape = tensors[output_tensor]->shape;
+            if (output_shape.size() < 2)
+                throw std::invalid_argument("Output rank must be >= 2");
+
+            dispatchM = output_shape[output_shape.size() - 2];
+            dispatchN = output_shape[output_shape.size() - 1];
+            dispatchBatch = prod(output_shape, 0, output_shape.size() - 2);
+
+            DEBUG_PRINT("Dispatch (output dims): ");
+        }
+        else {
+            // Mode 1: Use max dimensions of all tensors
+            auto maxDim = [](const std::vector<uint32_t>& a,
+                const std::vector<uint32_t>& b) {
+                    size_t L = std::max(a.size(), b.size());
+                    std::vector<uint32_t> res(L, 1);
+                    for (size_t i = 0; i < L; i++) {
+                        uint32_t av = (i < a.size() ? a[i] : 1);
+                        uint32_t bv = (i < b.size() ? b[i] : 1);
+                        res[i] = std::max(av, bv);
+                    }
+                    return res;
+                };
+
+            std::vector<uint32_t> maxShape = tensors[input_tensor]->shape;
+            auto transposedWeightShape = tensors[weight_tensor]->shape;
+            if (transposedWeightShape.size() >= 2) {
+                std::swap(transposedWeightShape[transposedWeightShape.size() - 1], 
+                         transposedWeightShape[transposedWeightShape.size() - 2]);
+            }
+            maxShape = maxDim(maxShape, transposedWeightShape);
+            if (!bias_tensor.empty())
+                maxShape = maxDim(maxShape, tensors[bias_tensor]->shape);
+            maxShape = maxDim(maxShape, tensors[output_tensor]->shape);
+
+            if (maxShape.size() < 2)
+                throw std::invalid_argument("Max rank must be >= 2");
+
+            dispatchM = maxShape[maxShape.size() - 2];
+            dispatchN = maxShape[maxShape.size() - 1];
+            dispatchBatch = prod(maxShape, 0, maxShape.size() - 2);
+
+            DEBUG_PRINT("Dispatch (max dims): ");
+        }
+
+        // Calculate workgroup dimensions based on warp-tiling parameters
+        // Each workgroup processes a BM x BN tile with NUM_THREADS threads
+        uint32_t groupX = ceilDiv(dispatchN, BN);
+        uint32_t groupY = ceilDiv(dispatchM, BM);
+        uint32_t groupZ = dispatchBatch;
+
+        DEBUG_PRINT(groupX << " × " << groupY
+            << " × " << groupZ << " workgroups (covering " << dispatchM << "×"
+            << dispatchN << " per batch)" << "Workgroup size: " << NUM_THREADS << " threads (" 
+            << BM << "×" << BN << " tile)");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+
+        if (mode == 0) {
+            pushConsts.mode = mode;
+            uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+            pushConsts.uniformAddress = linearShader.uniformBuffer->getBufferAddress();
+            linearShader.loadUniform(uniform, pushConsts);
+            linearShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = linearShaderBackward.uniformBuffer->getBufferAddress();
+            linearShaderBackward.loadUniform(uniform, pushConsts);
+            linearShaderBackward.execute(workgroup);
+        }
+    }
+
+    void tensor_fill_random(const std::string& tensor, T min, T max) {
+        tensor_fill_rand_uniform_address<T> uniform{};
+
+		uniform.tensor = tensors[tensor]->getTensorImpl();
+		uniform.type = std::is_floating_point<T>::value ? 0 : (std::is_integral<T>::value ? 1 : 2); // 0 = float, 1 = int, 2 = uint
+        if (uniform.type == 0) {
+            // For floating point types, we can use the min and max directly
+            uniform.min = min;
+            uniform.max = max;
+        } else if (uniform.type == 1) {
+            // For integral types, we need to cast min and max to T
+            uniform.min = static_cast<T>(min);
+            uniform.max = static_cast<T>(max);
+        } else {
+            // For unsigned types, we also cast
+            uniform.min = static_cast<T>(min);
+            uniform.max = static_cast<T>(max);
+		}
+
+        uniform.max = max;
+        uniform.min = min;
+        tensor_push_const p;
+        p.uniformAddress = fillRandomShader.uniformBuffer->getBufferAddress();
+
+        uint32_t total_elements = std::accumulate(tensors[tensor]->shape.begin(), tensors[tensor]->shape.end(), 1, std::multiplies<uint32_t>());
+		
+        // Compute dispatch grid to cover the OUTPUT tensor C[B,M,N]
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        // Grid covers the output tensor's data buffer.
+        uint32_t groupX = ceilDiv(total_elements, 256u);
+        uint32_t groupY = 1u;
+        uint32_t groupZ = 1u;
+        
+        p.grid_size = glm::uvec3(groupX, groupY, groupZ);
+        fillRandomShader.loadUniform(uniform, p);
+        std::array<uint32_t, 3> workgroup = { groupX, groupY, groupZ };
+
+		DEBUG_PRINT("workgroup: " << workgroup[0] << " " << workgroup[1] << " " << workgroup[2] << "for tensor: " << tensor);
+
+        fillRandomShader.execute(workgroup.data());
+    }
+
+    bool are_tensors_equal(const std::string& tensor_a, const std::string& tensor_b){
+        auto &local_tensor = createTensor({1}, "temp_compare");
+        tensor_cmp_context uniform{};
+        uniform.input_a = tensors[tensor_a]->getTensorImpl();
+        uniform.input_b = tensors[tensor_b]->getTensorImpl();
+        uniform.output_tensor = local_tensor.getTensorImpl();
+
+        uint32_t num_elements_a = tensors[tensor_a]->get_num_elements();
+        uint32_t num_elements_b = tensors[tensor_b]->get_num_elements();
+
+        uint32_t max_elements = std::max(num_elements_a, num_elements_b);
+        
+        tensor_push_const uniformPush{};
+        uniformPush.grid_size = {1,1,1};
+        uniformPush.mode = 0;
+        uniformPush.uniformAddress = cmpShader.uniformBuffer->getBufferAddress();
+
+        cmpShader.loadUniform(uniform, uniformPush);
+
+        auto cieldiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t groupX = cieldiv(max_elements, 256u);
+        uint32_t grp[3] = {groupX, 1, 1};
+        cmpShader.execute(grp);
+        auto data = local_tensor.dataBuffer->downloadBuffer();
+        if (data[0] == 0) {
+            destroy_tensor(local_tensor.name);
+            return true;
+        }
+        else {
+            destroy_tensor(local_tensor.name);
+            return false;
+        }
+    }
+
+    T find_mean_of_tensor(const std::string& tensor){
+        auto& local_tensor = createTensor({1}, "temp_find_mean");
+        mean_context uniform;
+        uniform.input_tensor = tensors[tensor]->getTensorImpl();
+        uniform.output_tensor = local_tensor.getTensorImpl();
+        uint32_t num_elem = tensors[tensor]->get_num_elements();
+        DEBUG_PRINT("finding mean of tensor: " << tensor << " of shape: " << shapeToString(tensors[tensor]->shape));
+        auto cieldiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t grpX = cieldiv(num_elem, 256u);
+        uint32_t grp[3] = {grpX, 1, 1};
+        tensor_push_const push;
+        push.uniformAddress = mean_shader.uniformBuffer->getBufferAddress();
+        push.grid_size = glm::uvec3(1, 1, 1);
+        mean_shader.loadUniform(uniform, push);
+        mean_shader.execute(grp);
+        auto data = local_tensor.dataBuffer->downloadBuffer();
+        destroy_tensor(local_tensor.name);
+        return data[0]; // the first element will contain the mean value
+    }
+
+    void zero_out_all_grads() {
+        for (auto& [name, tensor] : tensors){
+            tensor->gradientBuffer->fill_buffer(0u);
+        }
+    }
+
+    void save_tensor_to_file(const std::string& tensor_name, const std::string& filename) {
+        if (tensors.find(tensor_name) == tensors.end()) {
+            throw std::invalid_argument("Tensor " + tensor_name + " does not exist.");
+        }
+        tensors[tensor_name]->save_to_file(filename);
+    }
+
+    void save_all_tensors_to_files(const std::string& directory) {
+        for (const auto& [name, tensor] : tensors) {
+            std::string filename = directory + "/" + name + ".tnsr";
+            tensor->save_to_file(filename);
+        }
+    }
+
+    void createTensor(const std::string& file_name){
+        auto tensor = std::make_unique<Tensor<T>>(file_name, allocator);
+        tensors[tensor->name] = std::move(tensor);
+    }
+
+    void clear() {
+        tensors.clear();
+    };
+
+private:
+    // tensor operation shaders
+    gpuTaskNoDesc<T, tensor_push_const, matmul_context> multiplicationShader; // computes C = A @ B
+    gpuTaskNoDesc<T, tensor_push_const, matmul_context> multiplicationShaderBackward;
+	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShader; // computes C = A + B
+	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShaderBackward;
+	gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShader; // computes ReLU
+    gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShaderBackward;
+	gpuTaskNoDesc<T, tensor_push_const, tensor_softmax_context> softmaxShader;  // computes softmax
+	gpuTaskNoDesc<T, tensor_push_const, tensor_cross_entropy_context> crossEntropyShader; // computes softmax + cross-entropy loss
+    gpuTaskNoDesc<T, tensor_push_const, tensor_cross_entropy_context> crossEntropyShaderBackward; // computes softmax + cross-entropy loss
+	gpuTaskNoDesc<T, tensor_push_const, linear_context> linearShader; // computes linear layer
+    gpuTaskNoDesc<T, tensor_push_const, linear_context> linearShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, linear_context> linearReLUShader; // computes linear layer + ReLU
+    gpuTaskNoDesc<T, tensor_push_const, linear_context> linearReLUShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, tensor_batchnorm_context> batchnormShader; // computes batchnorm
+    gpuTaskNoDesc<T, tensor_push_const, tensor_batchnorm_context> batchnormShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, tensor_batchnorm2d_context> batchnorm2dShader;
+    gpuTaskNoDesc<T, tensor_push_const, tensor_batchnorm2d_context> batchnorm2dShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, tensor_layernorm1d_context> layernorm1dShader;
+    gpuTaskNoDesc<T, tensor_push_const, tensor_layernorm1d_context> layernorm1dShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShader; // computes embedding lookup
+    gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, tensor_cmp_context> cmpShader; // compares two tensors for equality
+    gpuTaskNoDesc<T, tensor_push_const, mean_context> mean_shader; // compute the mean of a tensor
+    gpuTaskNoDesc<T, tensor_push_const, tensor_fill_rand_uniform_address<T>> fillRandomShader; // fills tensor with random values
+    gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3; // computes 2D convolution with 3x3 kernel
+    gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3Backward; // computes 2D convolution with 3x3 kernel backward pass
+};
+
+template<typename T>
+struct BiOpNode {
+
+    TensorPool<T>* tensorPool;
+    Tensor<T>* right;
+    Tensor<T>* left;
+    Tensor<T>* output;
+    Operation operationType;
+
+    BiOpNode(Tensor<T>* left, Tensor<T>* right, Tensor<T>* output, Operation operationType)
+        : left(left), right(right), output(output), operationType(operationType) {
+    }
+    void execute() {
+        switch (operationType) {
+        case Operation::ADDITION:
+            std::cout << "not implemented yet" << "\n";
+            break;
+        case Operation::MULTIPLICATION:
+			tensorPool->tensor_mult(output->name, left->name, right->name);
+            break;
+        default:
+            throw std::invalid_argument("Unsupported operation type");
+        }
+    }
+};

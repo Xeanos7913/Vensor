@@ -1,0 +1,188 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+#define MAX_WG 256u
+#define WARP_SIZE 32u
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct BatchNorm1DContext {
+    TensorImpl input_tensor;    // [B, M, N]
+    TensorImpl weight_tensor;   // [M, N]
+    TensorImpl bias_tensor;     // [M, N]
+    TensorImpl running_mean;    // [M, N]
+    TensorImpl running_var;     // [M, N]
+    TensorImpl out_tensor;      // [B, M, N]
+    TensorImpl save_mean;       // [M, N]
+    TensorImpl save_var;        // [M, N]
+    uint mode;                  // 0 = train, 1 = eval
+    uint batch_size;
+    uint accumulate_grad;
+    float momentum;
+    float eps;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    BatchNorm1DContext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;
+} push;
+
+// Shared memory for reduction
+shared float shmem[MAX_WG];
+shared float shmem2[MAX_WG];
+
+// Two-value block reduction (for mean and variance / sums)
+void blockReduceSum2(float val1, float val2, out float result1, out float result2) {
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane_id = tid % WARP_SIZE;
+    
+    // Warp-level reduction
+    val1 = subgroupAdd(val1);
+    val2 = subgroupAdd(val2);
+    
+    // First thread in each warp writes to shared memory
+    if (lane_id == 0) {
+        shmem[warp_id] = val1;
+        shmem2[warp_id] = val2;
+    }
+    
+    barrier();
+    
+    // First warp reduces the partial sums
+    if (warp_id == 0) {
+        val1 = (tid < (MAX_WG / WARP_SIZE)) ? shmem[lane_id] : 0.0;
+        val2 = (tid < (MAX_WG / WARP_SIZE)) ? shmem2[lane_id] : 0.0;
+        val1 = subgroupAdd(val1);
+        val2 = subgroupAdd(val2);
+    }
+    
+    result1 = val1;
+    result2 = val2;
+}
+
+void backward_kernel() {
+    BatchNorm1DContext ctx = push.context.ctx;
+    
+    uint tid = gl_LocalInvocationID.x;
+    uint B = ctx.batch_size;
+    
+    uint M = ctx.input_tensor.shape.dims[1];
+    uint N = ctx.input_tensor.shape.dims[2];
+    
+    // Each workgroup handles one (channel, feature) pair
+    uint channel_idx = gl_WorkGroupID.x; // [0, M)
+    uint feature_idx = gl_WorkGroupID.y; // [0, N)
+    
+    if (channel_idx >= M || feature_idx >= N) return;
+    
+    // Index for parameters [M, N]
+    uint param_idx = channel_idx * N + feature_idx;
+    
+    // Load per-position saved statistics and params
+    float mean = ctx.save_mean.data.data[param_idx];
+    float var = ctx.save_var.data.data[param_idx];
+    float inv_std = 1.0 / sqrt(var + ctx.eps);
+    float weight = ctx.weight_tensor.data.data[param_idx];
+    
+    // Each thread accumulates over a subset of B elements (batch dimension only)
+    float grad_out_sum = 0.0;      // sum of dout
+    float grad_norm_sum = 0.0;     // sum of dout * normalized
+    
+    for (uint b = tid; b < B; b += MAX_WG) {
+        uint idx = b * (M * N) + channel_idx * N + feature_idx;
+        float dout = ctx.out_tensor.grad.grad[idx];
+        float x = ctx.input_tensor.data.data[idx];
+        float normalized = (x - mean) * inv_std;
+        grad_out_sum += dout;
+        grad_norm_sum += dout * normalized;
+    }
+    
+    // Reduce across workgroup to get scalar sums per (channel, feature) position
+    float grad_out_reduced, grad_norm_reduced;
+    blockReduceSum2(grad_out_sum, grad_norm_sum, grad_out_reduced, grad_norm_reduced);
+    
+    barrier();
+    
+    // Compute grads for weight (gamma) and bias (beta)
+    float inv_batch = 1.0f / float(B);
+    if (tid == 0) {
+        float grad_weight = grad_norm_reduced; // sum over B
+        float grad_bias = grad_out_reduced;    // sum over B
+        if (ctx.accumulate_grad == 1) {
+            atomicAdd(ctx.weight_tensor.grad.grad[param_idx], grad_weight * inv_batch);
+            atomicAdd(ctx.bias_tensor.grad.grad[param_idx], grad_bias * inv_batch);
+        } else {
+            ctx.weight_tensor.grad.grad[param_idx] = grad_weight * inv_batch;
+            ctx.bias_tensor.grad.grad[param_idx] = grad_bias * inv_batch;
+        }
+        
+        // Store means for other threads
+        shmem[0] = grad_out_reduced;
+        shmem[1] = grad_norm_reduced;
+    }
+    
+    barrier();
+    
+    // Compute mean values (averaged over batch dimension only)
+    float S = float(B);
+    float grad_out_mean = shmem[0] / S;    // mean(dout) over batch
+    float grad_norm_mean = shmem[1] / S;   // mean(dout * normalized) over batch
+    
+    // Now compute input gradients
+    for (uint b = tid; b < B; b += MAX_WG) {
+        uint idx = b * (M * N) + channel_idx * N + feature_idx;
+        float dout = ctx.out_tensor.grad.grad[idx];
+        float x = ctx.input_tensor.data.data[idx];
+        float normalized = (x - mean) * inv_std;
+        
+        
+        // dx = gamma * inv_std * (dout - mean(dout) - normalized * mean(dout*normalized))
+        float dx = weight * inv_std * (dout - grad_out_mean - normalized * grad_norm_mean);
+        
+        if (ctx.accumulate_grad == 1) {
+            atomicAdd(ctx.input_tensor.grad.grad[idx], dx);
+            ctx.out_tensor.grad.grad[idx] = 0.0f;
+        } else {
+            ctx.input_tensor.grad.grad[idx] = dx;
+            ctx.out_tensor.grad.grad[idx] = 0.0f;
+        }
+    }
+}
+
+void main() {
+    backward_kernel();
+}

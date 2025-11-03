@@ -1,0 +1,148 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+// dispatch = [cielDiv(total_elements_in_inp_tensor, 256u), 1, 1]
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct Context {
+    TensorImpl inp; // [any shape]
+    TensorImpl ou; // [1]
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer {
+    Context ctx;
+    uvec3 garbage; // to please the api
+    uint trash;     // to please the api
+};
+
+layout(push_constant) uniform PushConstants{
+    ContextBuffer ctx;
+} push;
+
+shared float shared_subgroup_max[8];
+shared float shared_subgroup_sum[8];
+
+float subgroup_reduce_max(float val) {
+    return subgroupMax(val);
+}
+float subgroup_reduce_sum(float val) {
+    return subgroupAdd(val);
+}
+
+float workgroup_reduce_max(float val) {
+    uint subgroup_id = gl_SubgroupID;
+    uint num_subgroups = gl_NumSubgroups;
+
+    float subgroup_max = subgroup_reduce_max(val);
+
+    if (subgroupElect()) {
+        shared_subgroup_max[subgroup_id] = subgroup_max;
+    }
+    barrier();
+
+    float final_max = subgroup_max;
+    if (subgroup_id == 0) {
+        float my_val = (gl_SubgroupInvocationID < num_subgroups) ?
+                       shared_subgroup_max[gl_SubgroupInvocationID] : -3.402823466e+38F;
+        final_max = subgroup_reduce_max(my_val);
+        if (gl_SubgroupInvocationID == 0) {
+            shared_subgroup_max[0] = final_max;
+        }
+    }
+    barrier();
+    return shared_subgroup_max[0];
+}
+
+float workgroup_reduce_sum(float val) {
+    uint subgroup_id = gl_SubgroupID;
+    uint num_subgroups = gl_NumSubgroups;
+
+    float subgroup_sum = subgroup_reduce_sum(val);
+
+    if (subgroupElect()) {
+        shared_subgroup_sum[subgroup_id] = subgroup_sum;
+    }
+    barrier();
+
+    float final_sum = subgroup_sum;
+    if (subgroup_id == 0) {
+        float my_val = (gl_SubgroupInvocationID < num_subgroups) ?
+                       shared_subgroup_sum[gl_SubgroupInvocationID] : 0.0;
+        final_sum = subgroup_reduce_sum(my_val);
+        if (gl_SubgroupInvocationID == 0) {
+            shared_subgroup_sum[0] = final_sum;
+        }
+    }
+    barrier();
+    return shared_subgroup_sum[0];
+}
+
+void main(){
+    Context ctx = push.ctx.ctx;
+    uint global_id = gl_GlobalInvocationID.x;
+    uint total_elements = ctx.inp.numel;
+    
+    // Initialize ou to zero on first thread
+    if (global_id == 0) {
+        ctx.ou.data.data[0] = 0.0;
+    }
+    
+    barrier();
+    memoryBarrierBuffer();
+    
+    // Step 1: Each thread accumulates its portion
+    float local_sum = 0.0;
+    for (uint idx = global_id; idx < total_elements; idx += gl_NumWorkGroups.x * 256) {
+        local_sum += ctx.inp.data.data[idx];
+    }
+    
+    // Step 2: Reduce within workgroup
+    float workgroup_sum = workgroup_reduce_sum(local_sum);
+    
+    // Step 3: Each workgroup accumulates to ou
+    if (gl_LocalInvocationID.x == 0) {
+        atomicAdd(ctx.ou.data.data[0], workgroup_sum);
+    }
+    
+    // Step 4: Final division by total elements
+    barrier();
+    memoryBarrierBuffer();
+    
+    if (global_id == 0) {
+        ctx.ou.data.data[0] = ctx.ou.data.data[0] / float(total_elements);
+    }
+}

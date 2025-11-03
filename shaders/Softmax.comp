@@ -1,0 +1,204 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+// Workgroup size (runtime specialization constants)
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct SoftmaxContext {
+    TensorImpl input_tensor;  // going to be a vector tensor shaped (B, 1, N)
+    TensorImpl output_tensor; // same dims as the input tensor
+    uint M, N; // for 2D, M = rows, N = cols; for 3D, M = first dim, N = second dim
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer {
+    SoftmaxContext ctx;
+};
+
+layout(push_constant) uniform PushConstants{
+    ContextBuffer ctx;
+    uvec3 grid_size;
+    uint mode; // 0 = forward; 1 = backward;
+} push;
+
+// Shared memory for tiled computation
+shared float shared_data[256];
+shared float shared_max[256];
+shared float shared_sum[256];
+
+uint off2or3(const TensorImpl t, uint b, uint i, uint j)
+{
+    if (t.ndim == 2u) {
+        return i * t.strides.strides[0] + j * t.strides.strides[1];
+    } else {
+        return b * t.strides.strides[0] + i * t.strides.strides[1] + j * t.strides.strides[2];
+    }
+}
+
+// Workgroup reduction for maximum value
+float workgroup_reduce_max(float val) {
+    uint tid = gl_LocalInvocationID.x;
+    shared_max[tid] = val;
+    barrier();
+    
+    // Reduction tree
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < gl_WorkGroupSize.x) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        barrier();
+    }
+    
+    return shared_max[0];
+}
+
+// Workgroup reduction for sum
+float workgroup_reduce_sum(float val) {
+    uint tid = gl_LocalInvocationID.x;
+    shared_sum[tid] = val;
+    barrier();
+    
+    // Reduction tree
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride && tid + stride < gl_WorkGroupSize.x) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        barrier();
+    }
+    
+    return shared_sum[0];
+}
+
+void softmax_forward() {
+    
+    SoftmaxContext ctx = push.ctx.ctx;
+
+    uint batch_idx = gl_WorkGroupID.z;
+    uint row_idx = 0; // Always 0 since M=1 for our constraint (B, 1, N)
+    uint global_tid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint local_tid = gl_LocalInvocationID.x;
+    uint workgroup_size = gl_WorkGroupSize.x;
+    
+    uint N = ctx.N;
+    
+    // Early exit for redundant threads beyond the problem size
+    if (gl_WorkGroupID.x * workgroup_size >= N) {
+        return;
+    }
+    
+    // Phase 1: Find global maximum across the entire vector
+    float local_max = -3.402823466e+38F; // -FLT_MAX
+    
+    // Each thread processes one element if within bounds
+    if (global_tid < N) {
+        uint offset = off2or3(ctx.input_tensor, batch_idx, row_idx, global_tid);
+        local_max = ctx.input_tensor.data.data[offset];
+    }
+    
+    float global_max = workgroup_reduce_max(local_max);
+    
+    // Phase 2: Compute sum of exponentials
+    float local_sum = 0.0;
+    float exp_val = 0.0;
+    
+    if (global_tid < N) {
+        uint offset = off2or3(ctx.input_tensor, batch_idx, row_idx, global_tid);
+        float val = ctx.input_tensor.data.data[offset];
+        exp_val = exp(val - global_max);
+        local_sum = exp_val;
+        
+        // Store intermediate exponential value in shared memory for later use
+        shared_data[local_tid] = exp_val;
+    } else {
+        shared_data[local_tid] = 0.0;
+    }
+    
+    float global_sum = workgroup_reduce_sum(local_sum);
+    
+    // Phase 3: Normalize by dividing by sum
+    if (global_tid < N) {
+        uint out_offset = off2or3(ctx.output_tensor, batch_idx, row_idx, global_tid);
+        ctx.output_tensor.data.data[out_offset] = shared_data[local_tid] / global_sum;
+    }
+}
+
+void softmax_backward() {
+    uint batch_idx = gl_WorkGroupID.z;
+    uint row_idx = 0; // Always 0 since M=1 for our constraint (B, 1, N)
+    uint global_tid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint local_tid = gl_LocalInvocationID.x;
+    uint workgroup_size = gl_WorkGroupSize.x;
+    
+    SoftmaxContext ctx = push.ctx.ctx;
+
+    uint N = ctx.N;
+    
+    // Early exit for redundant threads beyond the problem size
+    if (gl_WorkGroupID.x * workgroup_size >= N) {
+        return;
+    }
+    
+    // Phase 1: Compute dot product sum for softmax Jacobian
+    // sum_j(grad_output[j] * output[j])
+    float local_dot_sum = 0.0;
+    
+    if (global_tid < N) {
+        uint offset = off2or3(ctx.output_tensor, batch_idx, row_idx, global_tid);
+        float output_val = ctx.output_tensor.data.data[offset];
+        float grad_output_val = ctx.output_tensor.grad.grad[offset];
+        local_dot_sum = grad_output_val * output_val;
+    }
+    
+    float global_dot_sum = workgroup_reduce_sum(local_dot_sum);
+    
+    // Phase 2: Compute input gradients
+    // grad_input[i] = output[i] * (grad_output[i] - global_dot_sum)
+    if (global_tid < N) {
+        uint offset = off2or3(ctx.output_tensor, batch_idx, row_idx, global_tid);
+        uint input_offset = off2or3(ctx.input_tensor, batch_idx, row_idx, global_tid);
+        
+        float output_val = ctx.output_tensor.data.data[offset];
+        float grad_output_val = ctx.output_tensor.grad.grad[offset];
+        
+        float grad_input_val = output_val * (grad_output_val - global_dot_sum);
+        ctx.input_tensor.grad.grad[input_offset] = grad_input_val;
+        ctx.out_tensor.grad.grad[offset] = 0.0f; // Clean up gradient after done using it
+    }
+}
+
+void main() {
+    if (push.mode == 0u) {
+        softmax_forward();
+    } else if (push.mode == 1u) {
+        softmax_backward();
+    }
+}

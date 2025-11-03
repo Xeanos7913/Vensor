@@ -1,0 +1,65 @@
+#version 450  
+#extension GL_ARB_separate_shader_objects : enable  
+#extension GL_EXT_buffer_reference : enable  
+#extension GL_EXT_buffer_reference_uvec2 : enable  
+#extension GL_EXT_scalar_block_layout : enable  
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;  
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {  
+    float data[];  
+};  
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {  
+    float grad[];  
+};  
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {  
+    int strides[];  
+};  
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {  
+    int dims[];  
+};  
+
+struct TensorImpl {  
+    tensor_data    data;  
+    tensor_grad    grad;  
+    tensor_strides strides;  
+    tensor_shape   shape;  
+    uint numel, ndim, requires_grad, is_leaf;  
+};  
+
+struct Context {
+    TensorImpl tensor_a;
+    TensorImpl tensor_b;
+    TensorImpl outp;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    Context context;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+} pc;
+
+void main() {
+    // Get the global index of the current thread
+    uint idx = gl_GlobalInvocationID.x;
+
+    // Ensure we don't go out of bounds
+    if (idx >= pc.context.context.tensor_a.numel) {
+        return;
+    }
+
+    // Access the data of tensor_a and tensor_b
+    float value_a = pc.context.context.tensor_a.data.data[idx];
+    float value_b = pc.context.context.tensor_b.data.data[idx];
+
+    // Compare the values and update the output tensor
+    if (value_a != value_b) {
+        atomicAdd(pc.context.context.outp.data.data[0], 1.0);
+    }
+}

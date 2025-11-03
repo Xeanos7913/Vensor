@@ -1,0 +1,85 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data { float data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_grad { float grad[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_strides { int strides[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_shape { int dims[]; };
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct EmbeddingTableContext {
+    TensorImpl embedding_tensor;   // (vocab_size, embed_dim)
+    TensorImpl token_indices;      // (B, token_count)
+    TensorImpl output_tensor;      // (B, token_count, embed_dim)
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { EmbeddingTableContext ctx; };
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer ctx;
+    uvec3 grid_size;
+    uint kernel_type;
+} push;
+
+// helper: works for 2D or 3D tensors (matches your earlier helper)
+uint off2or3(const TensorImpl t, uint b, uint i, uint j) {
+    if (t.ndim == 2u)
+        return i * uint(t.strides.strides[0]) + j * uint(t.strides.strides[1]);
+    else
+        return b * uint(t.strides.strides[0]) + i * uint(t.strides.strides[1]) + j * uint(t.strides.strides[2]);
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    EmbeddingTableContext ctx = push.ctx.ctx;
+
+    // shapes
+    uint B = uint(ctx.token_indices.shape.dims[0]);
+    uint token_count = uint(ctx.token_indices.shape.dims[1]);
+    uint embed_dim = uint(ctx.embedding_tensor.shape.dims[1]);
+    uint vocab_size = uint(ctx.embedding_tensor.shape.dims[0]);
+
+    uint total = B * token_count * embed_dim;
+    if (gid >= total) return;
+
+    // decode indices
+    uint b = gid / (token_count * embed_dim);
+    uint t = (gid / embed_dim) % token_count;
+    uint e = gid % embed_dim;
+
+    // read token index
+    uint token_index_off = off2or3(ctx.token_indices, b, t, 0u); // token_indices is 2D: i=t, j=0 will be ignored - but safe
+    // use off2or3 with (0,i,j) so it uses i,j path for ndim==2
+    token_index_off = off2or3(ctx.token_indices, 0u, b, t); // ensures correct calculation for 2D (i=b, j=t)
+    int token_idx_i = int(ctx.token_indices.data.data[token_index_off]);
+    if (token_idx_i < 0) return; // guard negative
+    uint token_idx = uint(token_idx_i);
+    if (token_idx >= vocab_size) return; // guard OOB
+
+    // read upstream gradient
+    uint out_grad_off = off2or3(ctx.output_tensor, b, t, e);
+    float g = ctx.output_tensor.grad.grad[out_grad_off];
+
+    // compute embedding grad offset and atomically add
+    // for embedding (vocab_size, embed_dim) we want: i = token_idx, j = e
+    uint emb_off = off2or3(ctx.embedding_tensor, 0u, token_idx, e);
+    // atomicAdd the gradient
+    atomicAdd(ctx.embedding_tensor.grad.grad[emb_off], g);
+    ctx.output_tensor.grad.grad[out_grad_off] = 0.0f; // zero out upstream gradient after calculation
+}

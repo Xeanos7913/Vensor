@@ -1,0 +1,203 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct CrossEntropyContext {
+    TensorImpl logits_tensor;      // (B, M, N)
+    TensorImpl target_tensor;      // one-hot (B, M, N)
+    TensorImpl loss_tensor;        // scalar per-batch (B, M)
+    TensorImpl softmax_tensor;     // optional (B, M, N)
+    uint M, N;
+    uint batch_size;
+    uint compute_softmax;
+    uint accumulate_grad;          // 0: overwrite, 1: +=
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer {
+    CrossEntropyContext ctx;
+};
+
+layout(push_constant) uniform PushConstants{
+    ContextBuffer ctx;
+    uvec3 grid_size;
+} push;
+
+// Shared memory (256 == local_size_x)
+shared float shared_subgroup_max[8];
+shared float shared_subgroup_sum[8];
+shared float shared_exp[256];
+
+uint off2or3(const TensorImpl t, uint b, uint i, uint j) {
+    if (t.ndim == 2u) {
+        return i * t.strides.strides[0] + j * t.strides.strides[1];
+    } else {
+        return b * t.strides.strides[0] + i * t.strides.strides[1] + j * t.strides.strides[2];
+    }
+}
+
+float subgroup_reduce_max(float val) {
+    return subgroupMax(val);
+}
+float subgroup_reduce_sum(float val) {
+    return subgroupAdd(val);
+}
+
+float workgroup_reduce_max(float val) {
+    uint subgroup_id = gl_SubgroupID;
+    uint num_subgroups = gl_NumSubgroups;
+
+    float subgroup_max = subgroup_reduce_max(val);
+
+    if (subgroupElect()) {
+        shared_subgroup_max[subgroup_id] = subgroup_max;
+    }
+    barrier();
+
+    float final_max = subgroup_max;
+    if (subgroup_id == 0) {
+        float my_val = (gl_SubgroupInvocationID < num_subgroups) ?
+                       shared_subgroup_max[gl_SubgroupInvocationID] : -3.402823466e+38F;
+        final_max = subgroup_reduce_max(my_val);
+        if (gl_SubgroupInvocationID == 0) {
+            shared_subgroup_max[0] = final_max;
+        }
+    }
+    barrier();
+    return shared_subgroup_max[0];
+}
+
+float workgroup_reduce_sum(float val) {
+    uint subgroup_id = gl_SubgroupID;
+    uint num_subgroups = gl_NumSubgroups;
+
+    float subgroup_sum = subgroup_reduce_sum(val);
+
+    if (subgroupElect()) {
+        shared_subgroup_sum[subgroup_id] = subgroup_sum;
+    }
+    barrier();
+
+    float final_sum = subgroup_sum;
+    if (subgroup_id == 0) {
+        float my_val = (gl_SubgroupInvocationID < num_subgroups) ?
+                       shared_subgroup_sum[gl_SubgroupInvocationID] : 0.0;
+        final_sum = subgroup_reduce_sum(my_val);
+        if (gl_SubgroupInvocationID == 0) {
+            shared_subgroup_sum[0] = final_sum;
+        }
+    }
+    barrier();
+    return shared_subgroup_sum[0];
+}
+
+void cross_entropy_backward() {
+    uint batch_idx = gl_WorkGroupID.z;
+    uint row_idx = gl_WorkGroupID.y;
+    uint global_tid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint local_tid = gl_LocalInvocationID.x;
+    uint workgroup_size = gl_WorkGroupSize.x;
+
+    CrossEntropyContext ctx = push.ctx.ctx;
+    uint N = ctx.N;
+
+    if (gl_WorkGroupID.x * workgroup_size >= N) {
+        return;
+    }
+
+    float softmax_i;
+    if (ctx.compute_softmax == 1u) {
+        // Use pre-computed softmax
+        if (global_tid < N) {
+            uint soft_off = off2or3(ctx.softmax_tensor, batch_idx, row_idx, global_tid);
+            softmax_i = ctx.softmax_tensor.data.data[soft_off];
+        }
+    } else {
+        // Compute softmax here
+        // Phase A: compute max for numerical stability
+        float local_max = -3.402823466e+38F;
+        if (global_tid < N) {
+            uint off = off2or3(ctx.logits_tensor, batch_idx, row_idx, global_tid);
+            local_max = ctx.logits_tensor.data.data[off];
+        }
+        float global_max = workgroup_reduce_max(local_max);
+
+        // Phase B: compute exp(x - max) and sum
+        float exp_val = 0.0;
+        if (global_tid < N) {
+            uint off = off2or3(ctx.logits_tensor, batch_idx, row_idx, global_tid);
+            float x = ctx.logits_tensor.data.data[off];
+            exp_val = exp(x - global_max);
+            shared_exp[local_tid] = exp_val;
+        } else {
+            shared_exp[local_tid] = 0.0;
+        }
+        float global_sum = workgroup_reduce_sum(exp_val);
+
+        if (global_tid < N) {
+            softmax_i = shared_exp[local_tid] / global_sum;
+        }
+    }
+
+    // Upstream gradient (scalar per-batch)
+    float upstream = 1.0f; // use 1.0f for simple cross entropy for now.
+
+    // Phase C: compute gradient per-logit: (softmax - target) * upstream
+    if (global_tid < N) {
+        uint logit_off = off2or3(ctx.logits_tensor, batch_idx, row_idx, global_tid);
+        uint target_off = off2or3(ctx.target_tensor, batch_idx, row_idx, global_tid);
+
+        float t = ctx.target_tensor.data.data[target_off]; // expected 0.0 or 1.0 (one-hot)
+        float grad = (softmax_i - t) * upstream;
+
+        if (ctx.accumulate_grad == 1u) {
+            atomicAdd(ctx.logits_tensor.grad.grad[logit_off], grad);
+        } else {
+            ctx.logits_tensor.grad.grad[logit_off] = grad;
+        }
+
+        // Store softmax if needed and not already stored
+        if (ctx.compute_softmax == 0u) {
+            uint soft_off = off2or3(ctx.softmax_tensor, batch_idx, row_idx, global_tid);
+            ctx.softmax_tensor.data.data[soft_off] = softmax_i;
+        }
+    }
+}
+
+void main() {
+    cross_entropy_backward();
+}

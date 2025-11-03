@@ -1,0 +1,173 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+#define MAX_WG 256u
+#define WARP_SIZE 32u
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct BatchNorm1DContext {
+    TensorImpl input_tensor;    // [B, M, N]
+    TensorImpl weight_tensor;   // [M, N]
+    TensorImpl bias_tensor;     // [M, N]
+    TensorImpl running_mean;    // [M, N]
+    TensorImpl running_var;     // [M, N]
+    TensorImpl out_tensor;      // [B, M, N]
+    TensorImpl save_mean;       // [M, N]
+    TensorImpl save_var;        // [M, N]
+    uint mode;                  // 0 = train, 1 = eval
+    uint batch_size;
+    uint accumulate_grad;
+    float momentum;
+    float eps;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    BatchNorm1DContext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;
+} push;
+
+// Shared memory for reduction
+shared float shmem[MAX_WG];
+shared float shmem2[MAX_WG];
+
+// Block-level reduction for two values
+void blockReduceSum2(float val1, float val2, out float result1, out float result2) {
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane_id = tid % WARP_SIZE;
+    
+    // Warp-level reduction
+    val1 = subgroupAdd(val1);
+    val2 = subgroupAdd(val2);
+    
+    // First thread in each warp writes to shared memory
+    if (lane_id == 0) {
+        shmem[warp_id] = val1;
+        shmem2[warp_id] = val2;
+    }
+    
+    barrier();
+    
+    // First warp reduces the partial sums
+    if (warp_id == 0) {
+        val1 = (tid < (MAX_WG / WARP_SIZE)) ? shmem[lane_id] : 0.0;
+        val2 = (tid < (MAX_WG / WARP_SIZE)) ? shmem2[lane_id] : 0.0;
+        val1 = subgroupAdd(val1);
+        val2 = subgroupAdd(val2);
+    }
+    
+    result1 = val1;
+    result2 = val2;
+}
+
+void forward_kernel() {
+    BatchNorm1DContext ctx = push.context.ctx;
+    
+    uint tid = gl_LocalInvocationID.x;
+    uint B = ctx.batch_size;
+    
+    uint M = ctx.input_tensor.shape.dims[1];
+    uint N = ctx.input_tensor.shape.dims[2];
+    
+    // Each workgroup handles one (channel, feature) pair
+    uint channel_idx = gl_WorkGroupID.x; // [0, M)
+    uint feature_idx = gl_WorkGroupID.y; // [0, N)
+    
+    if (channel_idx >= M || feature_idx >= N) return;
+    
+    // Index for parameters [M, N]
+    uint param_idx = channel_idx * N + feature_idx;
+
+    float sum = 0.0;
+    float sum_sq = 0.0;
+
+    // Accumulate across batch dimension only
+    for (uint b = tid; b < B; b += MAX_WG) {
+        uint idx = b * (M * N) + channel_idx * N + feature_idx;
+        float val = ctx.input_tensor.data.data[idx];
+        sum += val;
+        sum_sq += val * val;
+    }
+
+    float mean, var;
+    blockReduceSum2(sum, sum_sq, mean, var);
+    barrier();
+
+    if (tid == 0) {
+        float denom = float(B);
+        mean = mean / denom;
+        var = (var / denom) - mean * mean;
+
+        if (ctx.mode == 0) {
+            // Training mode: save statistics and update running stats
+            ctx.save_mean.data.data[param_idx] = mean;
+            ctx.save_var.data.data[param_idx] = var;
+            
+            float old_mean = ctx.running_mean.data.data[param_idx];
+            float old_var = ctx.running_var.data.data[param_idx];
+            ctx.running_mean.data.data[param_idx] = (1.0 - ctx.momentum) * old_mean + ctx.momentum * mean;
+            ctx.running_var.data.data[param_idx] = (1.0 - ctx.momentum) * old_var + ctx.momentum * var;
+        } else {
+            // Evaluation mode: use running statistics
+            mean = ctx.running_mean.data.data[param_idx];
+            var = ctx.running_var.data.data[param_idx];
+        }
+
+        shmem[0] = mean;
+        shmem[1] = var;
+    }
+
+    barrier();
+
+    float mean_val = shmem[0];
+    float var_val = shmem[1];
+    float inv_std = 1.0 / sqrt(var_val + ctx.eps);
+    float weight = ctx.weight_tensor.data.data[param_idx];
+    float bias = ctx.bias_tensor.data.data[param_idx];
+
+    // Normalize and apply affine transform
+    for (uint b = tid; b < B; b += MAX_WG) {
+        uint idx = b * (M * N) + channel_idx * N + feature_idx;
+        float val = ctx.input_tensor.data.data[idx];
+        float normed = (val - mean_val) * inv_std;
+        ctx.out_tensor.data.data[idx] = normed * weight + bias;
+    }
+}
+
+void main() {
+    forward_kernel();
+}

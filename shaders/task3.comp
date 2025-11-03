@@ -1,0 +1,17 @@
+#version 460
+
+#define numInputs 1
+#define numOutputs 1
+
+layout(set = 0, binding = 2) readonly buffer Input {
+    float a[];
+};
+
+layout(set = 0, binding = 3) writeonly buffer Output {
+    float result[];
+};
+
+void main() {
+    int index = int(gl_GlobalInvocationID.x);
+    result[index] = a[index] * a[index];
+}

@@ -1,0 +1,110 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct MataddContext {
+    TensorImpl input_a;   // [B?, M, N]
+    TensorImpl input_b;   // [B?, M, N]
+    TensorImpl out_tensor;// [B?, M, N] ; out_tensor.grad holds dC
+    uint mode;            // 0 = tiled, 1 = simple
+    uint batch_size;
+    uint m, n;
+    uint accumulate_grad; // 0: overwrite, 1: += for grads
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    MataddContext ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+} push;
+
+// Convert multi-dimensional index to linear index
+uint compute_linear_index(uvec3 coords, TensorImpl tensor) {
+    uint linear_idx = 0;
+    uint batch_idx = coords.z;
+    uint row_idx = coords.y;
+    uint col_idx = coords.x;
+    
+    if (tensor.ndim == 2) {
+        // 2D tensor: [M, N]
+        linear_idx = row_idx * uint(tensor.strides.strides[0]) + col_idx * uint(tensor.strides.strides[1]);
+    } else if (tensor.ndim == 3) {
+        // 3D tensor: [B, M, N]
+        linear_idx = batch_idx * uint(tensor.strides.strides[0]) + 
+                     row_idx * uint(tensor.strides.strides[1]) + 
+                     col_idx * uint(tensor.strides.strides[2]);
+    }
+    
+    return linear_idx;
+}
+
+void main() {
+    MataddContext ctx = push.context.ctx;
+    
+    uvec3 global_id = gl_GlobalInvocationID;
+    uint col = global_id.x;
+    uint row = global_id.y;
+    uint batch = global_id.z;
+    
+    // Check bounds
+    if (col >= ctx.n || row >= ctx.m || batch >= ctx.batch_size) {
+        return;
+    }
+    
+    uvec3 coords = uvec3(col, row, batch);
+    
+    // Backward pass: dA = dC, dB = dC
+    uint idx_c = compute_linear_index(coords, ctx.out_tensor);
+    float dc = ctx.out_tensor.grad.grad[idx_c];
+    
+    // Compute gradients for input_a if it requires gradients
+    if (ctx.input_a.requires_grad != 0) {
+        uint idx_a = compute_linear_index(coords, ctx.input_a);
+        
+        if (ctx.accumulate_grad == 0) {
+            ctx.input_a.grad.grad[idx_a] += dc;
+        } else {
+            ctx.input_a.grad.grad[idx_a] = dc;
+        }
+    }
+    
+    // Compute gradients for input_b if it requires gradients
+    if (ctx.input_b.requires_grad != 0) {
+        uint idx_b = compute_linear_index(coords, ctx.input_b);
+        
+        if (ctx.accumulate_grad != 0) {
+            ctx.input_b.grad.grad[idx_b] += dc;
+        } else {
+            ctx.input_b.grad.grad[idx_b] = dc;
+        }
+    }
+    ctx.out_tensor.grad.grad[idx_c] = 0.0f; // zero out the upstream gradient after use
+}

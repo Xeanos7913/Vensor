@@ -1,0 +1,189 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+#define MAX_WG 256u
+#define WARP_SIZE 32u
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct BatchNorm2DContext {
+    TensorImpl input_tensor;    // [B, C, H, W]
+    TensorImpl weight_tensor;   // [C]
+    TensorImpl bias_tensor;     // [C]
+    TensorImpl running_mean;    // [C]
+    TensorImpl running_var;     // [C]
+    TensorImpl out_tensor;      // [B, C, H, W]
+    TensorImpl save_mean;       // [C]
+    TensorImpl save_var;        // [C]
+    uint mode;                  // 0 = train, 1 = eval
+    uint batch_size;
+    uint channels;
+    uint height;
+    uint width;
+    uint accumulate_grad;
+    float momentum;
+    float eps;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    BatchNorm2DContext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;
+} push;
+
+// Shared memory for reduction
+shared float shmem[MAX_WG];
+shared float shmem2[MAX_WG];
+
+// Two-value block reduction (for mean and variance)
+void blockReduceSum2(float val1, float val2, out float result1, out float result2) {
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane_id = tid % WARP_SIZE;
+    
+    // Warp-level reduction
+    val1 = subgroupAdd(val1);
+    val2 = subgroupAdd(val2);
+    
+    // First thread in each warp writes to shared memory
+    if (lane_id == 0) {
+        shmem[warp_id] = val1;
+        shmem2[warp_id] = val2;
+    }
+    
+    barrier();
+    
+    // First warp reduces the partial sums
+    if (warp_id == 0) {
+        val1 = (tid < (MAX_WG / WARP_SIZE)) ? shmem[lane_id] : 0.0;
+        val2 = (tid < (MAX_WG / WARP_SIZE)) ? shmem2[lane_id] : 0.0;
+        val1 = subgroupAdd(val1);
+        val2 = subgroupAdd(val2);
+    }
+    
+    result1 = val1;
+    result2 = val2;
+}
+
+void forward_kernel() {
+    BatchNorm2DContext ctx = push.context.ctx;
+    
+    uint channel_idx = gl_WorkGroupID.x; // Channel index [0, C)
+    uint tid = gl_LocalInvocationID.x;
+    
+    uint B = ctx.batch_size;
+    uint C = ctx.channels;
+    uint H = ctx.height;
+    uint W = ctx.width;
+    uint spatial_size = H * W;
+    uint total_elements = B * spatial_size; // Total elements per channel
+    
+    if (channel_idx >= C) return;
+    
+    float sum = 0.0;
+    float sum_sq = 0.0;
+    
+    // Each thread processes multiple elements across batch and spatial dimensions
+    // Layout: [B, C, H, W] - elements for this channel are strided by C
+    for (uint elem_idx = tid; elem_idx < total_elements; elem_idx += MAX_WG) {
+        uint batch_idx = elem_idx / spatial_size;
+        uint spatial_idx = elem_idx % spatial_size;
+        
+        // Calculate linear index: b * C * H * W + c * H * W + h * W + w
+        uint idx = batch_idx * (C * spatial_size) + channel_idx * spatial_size + spatial_idx;
+        
+        float val = ctx.input_tensor.data.data[idx];
+        sum += val;
+        sum_sq += val * val;
+    }
+    
+    // Reduce across block
+    float mean, var;
+    blockReduceSum2(sum, sum_sq, mean, var);
+    
+    barrier();
+    
+    // Finalize statistics (only thread 0)
+    if (tid == 0) {
+        mean = mean / float(total_elements);
+        var = (var / float(total_elements)) - (mean * mean);
+        
+        if (ctx.mode == 0) { // Training
+            // Save for backward pass
+            ctx.save_mean.data.data[channel_idx] = mean;
+            ctx.save_var.data.data[channel_idx] = var;
+            
+            // Update running statistics with momentum
+            float old_mean = ctx.running_mean.data.data[channel_idx];
+            float old_var = ctx.running_var.data.data[channel_idx];
+            ctx.running_mean.data.data[channel_idx] = (1.0 - ctx.momentum) * old_mean + ctx.momentum * mean;
+            ctx.running_var.data.data[channel_idx] = (1.0 - ctx.momentum) * old_var + ctx.momentum * var;
+        } else { // Evaluation
+            mean = ctx.running_mean.data.data[channel_idx];
+            var = ctx.running_var.data.data[channel_idx];
+        }
+        
+        // Store in shared memory for other threads
+        shmem[0] = mean;
+        shmem[1] = var;
+    }
+    
+    barrier();
+    
+    // All threads read the computed statistics
+    float mean_val = shmem[0];
+    float var_val = shmem[1];
+    float inv_std = 1.0 / sqrt(var_val + ctx.eps);
+    
+    // Get weight and bias for this channel
+    float weight = ctx.weight_tensor.data.data[channel_idx];
+    float bias = ctx.bias_tensor.data.data[channel_idx];
+    
+    // Normalize and apply affine transformation
+    for (uint elem_idx = tid; elem_idx < total_elements; elem_idx += MAX_WG) {
+        uint batch_idx = elem_idx / spatial_size;
+        uint spatial_idx = elem_idx % spatial_size;
+        
+        uint idx = batch_idx * (C * spatial_size) + channel_idx * spatial_size + spatial_idx;
+        
+        float val = ctx.input_tensor.data.data[idx];
+        float normalized = (val - mean_val) * inv_std;
+        ctx.out_tensor.data.data[idx] = normalized * weight + bias;
+    }
+}
+
+void main() {
+    forward_kernel();
+}

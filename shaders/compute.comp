@@ -1,0 +1,21 @@
+#version 450
+
+// Define input and output buffers
+layout(set = 0, binding = 0) readonly buffer InputA {
+    int a[3];
+};
+
+layout(set = 0, binding = 1) readonly buffer InputB {
+    int b[3];
+};
+
+layout(set = 0, binding = 2) writeonly buffer Output {
+    int result[3];
+};
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index < 3) {  // Ensure within bounds
+        result[index] = a[index] * a[index] + b[index] * b[index];
+    }
+}

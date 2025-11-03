@@ -1,0 +1,241 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+// Workgroup size (runtime specialization constants)
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct CrossEntropyContext {
+    TensorImpl logits_tensor;      // input logits tensor shaped (B, M, N)
+    TensorImpl target_tensor;      // one-hot ground truth tensor shaped (B, M, N)
+    TensorImpl loss_tensor;        // scalar loss output tensor shaped (B, M)
+    TensorImpl softmax_tensor;     // optional softmax probabilities output (B, M, N)
+    uint M, N;                     // M = rows, N = cols per row
+    uint batch_size;               // Total batch size (B)
+    uint compute_softmax;          // 1 if we should also output softmax probabilities, 0 otherwise
+    uint accumulate_grad;          // 0: overwrite, 1: += for grads
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer {
+    CrossEntropyContext ctx;
+};
+
+layout(push_constant) uniform PushConstants{
+    ContextBuffer ctx;
+    uvec3 grid_size;
+    uint kernel_type;              // 0 = forward; 1 = backward;
+} push;
+
+// Shared memory for inter-subgroup reductions and exp values
+shared float shared_subgroup_max[8];   // Up to 8 subgroups (256/32)
+shared float shared_subgroup_sum[8];
+shared float shared_exp[256];
+
+uint off2or3(const TensorImpl t, uint b, uint i, uint j) {
+    if (t.ndim == 2u) {
+        return i * t.strides.strides[0] + j * t.strides.strides[1];
+    } else {
+        return b * t.strides.strides[0] + i * t.strides.strides[1] + j * t.strides.strides[2];
+    }
+}
+
+// Subgroup reduction for maximum using shuffle intrinsics
+float subgroup_reduce_max(float val) {
+    // Use built-in subgroup reduction
+    return subgroupMax(val);
+}
+
+// Subgroup reduction for sum using shuffle intrinsics
+float subgroup_reduce_sum(float val) {
+    // Use built-in subgroup reduction
+    return subgroupAdd(val);
+}
+
+// Workgroup reduction for maximum using subgroup primitives
+float workgroup_reduce_max(float val) {
+    uint local_tid = gl_LocalInvocationID.x;
+    uint subgroup_id = gl_SubgroupID;
+    uint num_subgroups = gl_NumSubgroups;
+    
+    // Step 1: Reduce within each subgroup
+    float subgroup_max = subgroup_reduce_max(val);
+    
+    // Step 2: First thread in each subgroup writes to shared memory
+    if (subgroupElect()) {
+        shared_subgroup_max[subgroup_id] = subgroup_max;
+    }
+    barrier();
+    
+    // Step 3: First subgroup reduces across all subgroup results
+    float final_max = subgroup_max;
+    if (subgroup_id == 0) {
+        float my_val = (gl_SubgroupInvocationID < num_subgroups) ? 
+                       shared_subgroup_max[gl_SubgroupInvocationID] : -3.402823466e+38F;
+        final_max = subgroup_reduce_max(my_val);
+        
+        // First thread broadcasts result
+        if (gl_SubgroupInvocationID == 0) {
+            shared_subgroup_max[0] = final_max;
+        }
+    }
+    barrier();
+    
+    return shared_subgroup_max[0];
+}
+
+// Workgroup reduction for sum using subgroup primitives
+float workgroup_reduce_sum(float val) {
+    uint local_tid = gl_LocalInvocationID.x;
+    uint subgroup_id = gl_SubgroupID;
+    uint num_subgroups = gl_NumSubgroups;
+    
+    // Step 1: Reduce within each subgroup
+    float subgroup_sum = subgroup_reduce_sum(val);
+    
+    // Step 2: First thread in each subgroup writes to shared memory
+    if (subgroupElect()) {
+        shared_subgroup_sum[subgroup_id] = subgroup_sum;
+    }
+    barrier();
+    
+    // Step 3: First subgroup reduces across all subgroup results
+    float final_sum = subgroup_sum;
+    if (subgroup_id == 0) {
+        float my_val = (gl_SubgroupInvocationID < num_subgroups) ? 
+                       shared_subgroup_sum[gl_SubgroupInvocationID] : 0.0;
+        final_sum = subgroup_reduce_sum(my_val);
+        
+        // First thread broadcasts result
+        if (gl_SubgroupInvocationID == 0) {
+            shared_subgroup_sum[0] = final_sum;
+        }
+    }
+    barrier();
+    
+    return shared_subgroup_sum[0];
+}
+
+void cross_entropy_forward() {
+    // Grid is dispatched as: (ceil(N / workgroup_size), M, B)
+    // Each workgroup processes one row of one batch element
+    uint batch_idx = gl_WorkGroupID.z;
+    uint row_idx = gl_WorkGroupID.y;
+    uint global_tid = gl_WorkGroupID.x * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint local_tid = gl_LocalInvocationID.x;
+    uint workgroup_size = gl_WorkGroupSize.x;
+    
+    CrossEntropyContext ctx = push.ctx.ctx;
+    uint N = ctx.N;
+    
+    // Early exit for redundant threads beyond the problem size
+    if (gl_WorkGroupID.x * workgroup_size >= N) {
+        return;
+    }
+    
+    // Phase 1: Find global maximum across the entire logits vector for numerical stability
+    float local_max = -3.402823466e+38F; // -FLT_MAX
+    if (global_tid < N) {
+        uint offset = off2or3(ctx.logits_tensor, batch_idx, row_idx, global_tid);
+        local_max = ctx.logits_tensor.data.data[offset];
+    }
+    float global_max = workgroup_reduce_max(local_max);
+    
+    // Phase 2: Compute sum of exponentials
+    float local_sum = 0.0;
+    float exp_val = 0.0;
+    
+    if (global_tid < N) {
+        uint logit_offset = off2or3(ctx.logits_tensor, batch_idx, row_idx, global_tid);
+        float logit_val = ctx.logits_tensor.data.data[logit_offset];
+        
+        exp_val = exp(logit_val - global_max);
+        local_sum = exp_val;
+        
+        // Store exponential value for optional softmax output
+        shared_exp[local_tid] = exp_val;
+    } else {
+        shared_exp[local_tid] = 0.0;
+    }
+    
+    float global_sum = workgroup_reduce_sum(local_sum);
+    
+    // Phase 3: Compute cross-entropy loss for this row using log-softmax
+    if (local_tid == 0) {
+        // Find target logit for this row
+        float target_logit = -3.402823466e+38F;
+        bool found_target = false;
+        
+        // Search across all workgroups for this row
+        for (uint wg = 0; wg <= gl_WorkGroupID.x; wg++) {
+            uint start_idx = wg * workgroup_size;
+            uint end_idx = min(start_idx + workgroup_size, N);
+            
+            for (uint i = start_idx; i < end_idx; i++) {
+                uint target_offset = off2or3(ctx.target_tensor, batch_idx, row_idx, i);
+                if (ctx.target_tensor.data.data[target_offset] > 0.5) {
+                    uint logit_offset = off2or3(ctx.logits_tensor, batch_idx, row_idx, i);
+                    target_logit = ctx.logits_tensor.data.data[logit_offset];
+                    found_target = true;
+                    break;
+                }
+            }
+            if (found_target) break;
+        }
+        
+        // Compute cross-entropy loss: -log_softmax(target_class)
+        // log_softmax(x_i) = x_i - max - log(sum_exp)
+        if (found_target && gl_WorkGroupID.x == 0) {
+            float log_sum_exp = log(global_sum);
+            float log_softmax_target = target_logit - global_max - log_sum_exp;
+            float row_loss = -log_softmax_target;
+            
+            // Store loss for this batch,row combination
+            uint loss_offset = off2or3(ctx.loss_tensor, batch_idx, row_idx, 0);
+            ctx.loss_tensor.data.data[loss_offset] = row_loss;
+        }
+    }
+    
+    // Phase 4: Optionally compute and store softmax probabilities
+    if (ctx.compute_softmax == 1u && global_tid < N) {
+        barrier(); // Ensure exp values are written to shared memory
+        uint softmax_offset = off2or3(ctx.softmax_tensor, batch_idx, row_idx, global_tid);
+        ctx.softmax_tensor.data.data[softmax_offset] = shared_exp[local_tid] / global_sum;
+    }
+}
+
+void main() {
+    cross_entropy_forward();
+}

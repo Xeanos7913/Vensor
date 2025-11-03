@@ -1,0 +1,214 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+#define MAX_WG 256u
+#define WARP_SIZE 32u
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct LayerNorm1DContext {
+    TensorImpl input_tensor;    // [B, M, N]
+    TensorImpl weight_tensor;   // [N] - normalized shape
+    TensorImpl bias_tensor;     // [N] - normalized shape
+    TensorImpl out_tensor;      // [B, M, N]
+    TensorImpl save_mean;       // [B, M] - mean for each sample
+    TensorImpl save_rstd;       // [B, M] - reciprocal std for each sample
+    uint normalized_size;       // N - size of normalized dimension
+    uint batch_stride;          // M * N - elements per batch
+    uint accumulate_grad;
+    float eps;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    LayerNorm1DContext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;
+} push;
+
+// Shared memory for reduction
+shared float shmem[MAX_WG];
+shared float shmem2[MAX_WG];
+
+// Two-value block reduction (for gradient sums)
+void blockReduceSum2(float val1, float val2, out float result1, out float result2) {
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane_id = tid % WARP_SIZE;
+    
+    // Warp-level reduction
+    val1 = subgroupAdd(val1);
+    val2 = subgroupAdd(val2);
+    
+    // First thread in each warp writes to shared memory
+    if (lane_id == 0) {
+        shmem[warp_id] = val1;
+        shmem2[warp_id] = val2;
+    }
+    
+    barrier();
+    
+    // First warp reduces the partial sums
+    if (warp_id == 0) {
+        val1 = (tid < (MAX_WG / WARP_SIZE)) ? shmem[lane_id] : 0.0;
+        val2 = (tid < (MAX_WG / WARP_SIZE)) ? shmem2[lane_id] : 0.0;
+        val1 = subgroupAdd(val1);
+        val2 = subgroupAdd(val2);
+    }
+    
+    result1 = val1;
+    result2 = val2;
+}
+
+void backward_kernel() {
+    LayerNorm1DContext ctx = push.context.ctx;
+    
+    // Each workgroup processes one sequence (one [N] slice)
+    uint sample_idx = gl_WorkGroupID.x; // Index in flattened [B, M]
+    uint tid = gl_LocalInvocationID.x;
+    
+    uint N = ctx.normalized_size;
+    uint base_idx = sample_idx * N; // Starting index for this sample's features
+    
+    // Load saved statistics for this sample
+    float mean = ctx.save_mean.data.data[sample_idx];
+    float rstd = ctx.save_rstd.data.data[sample_idx]; // reciprocal std
+    
+    // Phase 1: Compute gradient contributions for weight and bias
+    // Also compute terms needed for input gradient
+    float grad_weight_sum = 0.0;  // sum of (grad_out * normalized)
+    float grad_bias_sum = 0.0;    // sum of grad_out
+    
+    for (uint i = tid; i < N; i += MAX_WG) {
+        uint idx = base_idx + i;
+        float grad_out = ctx.out_tensor.grad.grad[idx];
+        float x = ctx.input_tensor.data.data[idx];
+        float normalized = (x - mean) * rstd;
+        
+        float weight = ctx.weight_tensor.data.data[i];
+        grad_weight_sum += grad_out * normalized;
+        grad_bias_sum += grad_out;
+    }
+    
+    // Reduce across block to get total gradient contributions
+    float grad_weight_total, grad_bias_total;
+    blockReduceSum2(grad_weight_sum, grad_bias_sum, grad_weight_total, grad_bias_total);
+    
+    barrier();
+    
+    // Thread 0 accumulates weight and bias gradients
+    // Since multiple samples share the same weight/bias, we must use atomics
+    if (tid == 0) {
+        // Accumulate gradients for weight and bias across all samples
+        for (uint i = 0; i < N; i++) {
+            uint idx = base_idx + i;
+            float grad_out = ctx.out_tensor.grad.grad[idx];
+            float x = ctx.input_tensor.data.data[idx];
+            float normalized = (x - mean) * rstd;
+            
+            float grad_w = grad_out * normalized;
+            float grad_b = grad_out;
+            
+            if (ctx.accumulate_grad == 1) {
+                atomicAdd(ctx.weight_tensor.grad.grad[i], grad_w);
+                atomicAdd(ctx.bias_tensor.grad.grad[i], grad_b);
+            } else {
+                atomicAdd(ctx.weight_tensor.grad.grad[i], grad_w);
+                atomicAdd(ctx.bias_tensor.grad.grad[i], grad_b);
+            }
+        }
+    }
+    
+    barrier();
+    
+    // Phase 2: Compute input gradients
+    // Need to compute: sum(grad_out * weight) and sum(grad_out * weight * normalized)
+    float sum_grad_output = 0.0;
+    float sum_grad_times_normalized = 0.0;
+    
+    for (uint i = tid; i < N; i += MAX_WG) {
+        uint idx = base_idx + i;
+        float grad_out = ctx.out_tensor.grad.grad[idx];
+        float x = ctx.input_tensor.data.data[idx];
+        float normalized = (x - mean) * rstd;
+        float weight = ctx.weight_tensor.data.data[i];
+        
+        float grad_normalized = grad_out * weight;
+        sum_grad_output += grad_normalized;
+        sum_grad_times_normalized += grad_normalized * normalized;
+    }
+    
+    // Reduce these sums across the block
+    float total_grad_output, total_grad_times_norm;
+    blockReduceSum2(sum_grad_output, sum_grad_times_normalized, 
+                    total_grad_output, total_grad_times_norm);
+    
+    barrier();
+    
+    // Store reduced values in shared memory
+    if (tid == 0) {
+        shmem[0] = total_grad_output;
+        shmem[1] = total_grad_times_norm;
+    }
+    
+    barrier();
+    
+    // All threads read the reduced values
+    float mean_grad_output = shmem[0] / float(N);
+    float mean_grad_times_norm = shmem[1] / float(N);
+    
+    // Compute input gradients using the LayerNorm backward formula
+    // grad_input = (grad_normalized - mean(grad_normalized) - normalized * mean(grad_normalized * normalized)) * rstd
+    for (uint i = tid; i < N; i += MAX_WG) {
+        uint idx = base_idx + i;
+        float grad_out = ctx.out_tensor.grad.grad[idx];
+        float x = ctx.input_tensor.data.data[idx];
+        float normalized = (x - mean) * rstd;
+        float weight = ctx.weight_tensor.data.data[i];
+        
+        float grad_normalized = grad_out * weight;
+        float grad_input = (grad_normalized - mean_grad_output - normalized * mean_grad_times_norm) * rstd;
+        
+        if (ctx.accumulate_grad == 1) {
+            atomicAdd(ctx.input_tensor.grad.grad[idx], grad_input);
+        } else {
+            ctx.input_tensor.grad.grad[idx] = grad_input;
+        }
+        ctx.out_tensor.grad.grad[idx] = 0.0f; // zero out upstream gradient after calculations
+    }
+}
+
+void main() {
+    backward_kernel();
+}
