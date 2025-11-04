@@ -41,6 +41,7 @@ struct LayerNorm1DContext {
     TensorImpl out_tensor;      // [B, M, N]
     TensorImpl save_mean;       // [B, M] - mean for each sample
     TensorImpl save_rstd;       // [B, M] - reciprocal std for each sample
+    uint mode;                  // mode will always be 0 in the backward pass, cause obviously, backward pass means training
     uint normalized_size;       // N - size of normalized dimension
     uint batch_stride;          // M * N - elements per batch
     uint accumulate_grad;

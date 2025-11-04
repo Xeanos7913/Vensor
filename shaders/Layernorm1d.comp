@@ -41,6 +41,7 @@ struct LayerNorm1DContext {
     TensorImpl out_tensor;      // [B, M, N]
     TensorImpl save_mean;       // [B, M] - mean for each sample
     TensorImpl save_rstd;       // [B, M] - reciprocal std for each sample
+    uint mode;                  // 0 = train, 1 = eval
     uint normalized_size;       // N - size of normalized dimension
     uint batch_stride;          // M * N - elements per batch
     uint accumulate_grad;
@@ -118,15 +119,17 @@ void forward_kernel() {
     
     barrier();
     
-    // Finalize statistics and save for backward pass
+    // Finalize statistics and optionally save for backward pass
     if (tid == 0) {
         mean = mean / float(N);
         var = (var / float(N)) - (mean * mean);
         float rstd = 1.0 / sqrt(var + ctx.eps);
         
-        // Save statistics for backward pass
-        ctx.save_mean.data.data[sample_idx] = mean;
-        ctx.save_rstd.data.data[sample_idx] = rstd;
+        // Only save statistics if in training mode (mode == 0)
+        if (ctx.mode == 0) {
+            ctx.save_mean.data.data[sample_idx] = mean;
+            ctx.save_rstd.data.data[sample_idx] = rstd;
+        }
         
         shmem[0] = mean;
         shmem[1] = rstd;

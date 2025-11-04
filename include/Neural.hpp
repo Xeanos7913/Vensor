@@ -17,6 +17,8 @@ struct Module {
 	}
 	virtual std::vector<Tensor<T>*> getTrainableTensors() {return {};}
 	virtual std::vector<Tensor<T>*> getIntermediateTensors() {return {};}
+	virtual void serializeTrainableTensors(std::ofstream& filestream){}
+	virtual void loadFromSerializedTensor(std::ifstream& filestream){}
 	virtual size_t getTrainableParamCount() {return 0;}
 	virtual ~Module() = default;
 	bool requires_target = false; // Whether this module needs target labels (e.g., for loss functions)
@@ -74,6 +76,16 @@ struct LinearReLU : public Module<T>{
 
 	std::vector<Tensor<T>*> getTrainableTensors() override {
 		return {weights, bias};
+	}
+
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		weights->save_to_stream(filestream);
+		bias->save_to_stream(filestream);
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		weights->load_from_stream(filestream);
+		bias->load_from_stream(filestream);
 	}
 	
 	Tensor<T>* forward(Tensor<T>* input) override {
@@ -141,6 +153,16 @@ struct Linear : public Module<T> {
 
 	std::vector<Tensor<T>*> getTrainableTensors() override {
 		return {weights, bias};
+	}
+
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		weights->save_to_stream(filestream);
+		bias->save_to_stream(filestream);
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		weights->load_from_stream(filestream);
+		bias->load_from_stream(filestream);
 	}
 
 	Tensor<T>* forward(Tensor<T>* input) override {
@@ -273,15 +295,15 @@ struct BatchNorm1d : public Module<T> {
 	Tensor<T>* running_var;   // [M] - running variance (for inference)
 	Tensor<T>* save_mean;     // [M] - saved mean (for backward)
 	Tensor<T>* save_var;      // [M] - saved variance (for backward)
-	uint mode;                // 0 = train, 1 = eval
-	uint batch_size;
-	uint accumulate_grad;     // 0: overwrite, 1: += for grads
+	uint32_t mode;                // 0 = train, 1 = eval
+	uint32_t batch_size;
+	uint32_t accumulate_grad;     // 0: overwrite, 1: += for grads
 	float momentum;         // momentum for running stats
 	float eps;              // epsilon for numerical stability
 	TensorPool<T>* tensorPool;
 	std::string name;
 	std::string output_name;
-	BatchNorm1d(TensorPool<T>* pool, uint32_t features, uint32_t channels, uint32_t batch_size, const std::string& name) : tensorPool(pool), name(name) {
+	BatchNorm1d(TensorPool<T>* pool, uint32_t features, uint32_t channels, uint32_t batch_size, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
 		output_name = name + "-output";
 		std::vector<uint32_t> shape = { batch_size, channels, features };
 		this->output = &tensorPool->createTensor(shape, output_name);
@@ -290,14 +312,18 @@ struct BatchNorm1d : public Module<T> {
 		bias_tensor = &tensorPool->createTensor({ channels, features }, name + "-bias");
 		running_mean = &tensorPool->createTensor({ channels, features }, name + "-running_mean");
 		running_var = &tensorPool->createTensor({ channels, features }, name + "-running_var");
-		save_mean = &tensorPool->createTensor({ channels, features }, name + "-save_mean");
-		save_var = &tensorPool->createTensor({ channels, features }, name + "-save_var");
 
+		// no need for save_mean or save_var for eval mode
+		if(mode == 0){
+			save_mean = &tensorPool->createTensor({ channels, features }, name + "-save_mean");
+			save_var = &tensorPool->createTensor({ channels, features }, name + "-save_var");
+		}
+		
 		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
 		// keep bias at zero at initialization
 	}
 
-	BatchNorm1d(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::string& name) : tensorPool(pool), name(name) {
+	BatchNorm1d(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
 		output_name = name + "-output";
 		this->output = &tensorPool->createTensor(shape, output_name);
 		
@@ -308,8 +334,12 @@ struct BatchNorm1d : public Module<T> {
 		bias_tensor = &tensorPool->createTensor({ channels, features }, name + "-bias");
 		running_mean = &tensorPool->createTensor({ channels, features }, name + "-running_mean");
 		running_var = &tensorPool->createTensor({ channels, features }, name + "-running_var");
-		save_mean = &tensorPool->createTensor({ channels, features }, name + "-save_mean");
-		save_var = &tensorPool->createTensor({ channels, features }, name + "-save_var");
+
+		// no need for save_mean or save_var for eval mode
+		if(mode == 0){
+			save_mean = &tensorPool->createTensor({ channels, features }, name + "-save_mean");
+			save_var = &tensorPool->createTensor({ channels, features }, name + "-save_var");
+		}
 
 		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
 		// keep bias at zero at initialization
@@ -321,11 +351,30 @@ struct BatchNorm1d : public Module<T> {
 		return {weight_tensor, bias_tensor};
 	}
 
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		weight_tensor->save_to_stream(filestream);
+		bias_tensor->save_to_stream(filestream);
+		running_mean->save_to_stream(filestream);
+		running_var->save_to_stream(filestream);
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		weight_tensor->load_from_stream(filestream);
+		bias_tensor->load_from_stream(filestream);
+		running_mean->load_from_stream(filestream);
+		running_var->load_from_stream(filestream);
+	}
+
 	Tensor<T>* forward(Tensor<T>* input) override {
-		tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
+		if (mode == 0){
+			tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
+		}else {
+			tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, "", "", 0);
+		}
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
+		if(mode != 0) throw std::invalid_argument("can't call backward on Batchnorm1d with mode = 1 (eval)");
 		tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 1);
 	}
 };
@@ -340,16 +389,16 @@ struct BatchNorm2d : public Module<T> {
     //Tensor<T>* out_tensor;    // [B, C, H, W]
     Tensor<T>* save_mean;       // [C]
     Tensor<T>* save_var;        // [C]
-	uint mode;                
-	uint batch_size;
-	uint accumulate_grad;     // 0: overwrite, 1: += for grads
+	uint32_t mode;                
+	uint32_t batch_size;
+	uint32_t accumulate_grad;     // 0: overwrite, 1: += for grads
 	float momentum;         // momentum for running stats
 	float eps;              // epsilon for numerical stability
 	TensorPool<T>* tensorPool;
 	std::string name;
 	std::string output_name;
 
-	BatchNorm2d(TensorPool<T>* tensorPool, uint32_t channels, uint32_t width, uint32_t height, uint32_t batch_size, const std::string& name): tensorPool(tensorPool), name(name) {
+	BatchNorm2d(TensorPool<T>* tensorPool, uint32_t channels, uint32_t width, uint32_t height, uint32_t batch_size, const std::string& name, uint32_t mode = 0): tensorPool(tensorPool), name(name), mode(mode) {
 		output_name = name + "-output";
 		std::vector<uint32_t> shape = { batch_size, channels, height, width };
 		this->output = &tensorPool->createTensor(shape, output_name);
@@ -358,13 +407,17 @@ struct BatchNorm2d : public Module<T> {
 		bias_tensor = &tensorPool->createTensor({ channels }, name + "-bias");
 		running_mean = &tensorPool->createTensor({ channels }, name + "-running_mean");
 		running_var = &tensorPool->createTensor({ channels }, name + "-running_var");
-		save_mean = &tensorPool->createTensor({ channels }, name + "-save_mean");
-		save_var = &tensorPool->createTensor({ channels }, name + "-save_var");
+
+		// no need for save_mean or save_var for eval mode
+		if(mode == 0){
+			save_mean = &tensorPool->createTensor({ channels }, name + "-save_mean");
+			save_var = &tensorPool->createTensor({ channels }, name + "-save_var");
+		}
 
 		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
 	}
 
-	BatchNorm2d(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::string& name) : tensorPool(pool), name(name) {
+	BatchNorm2d(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
 		output_name = name + "-output";
 		this->output = &tensorPool->createTensor(shape, output_name);
 		auto batch = shape[0];
@@ -376,8 +429,12 @@ struct BatchNorm2d : public Module<T> {
 		bias_tensor = &tensorPool->createTensor({ channels }, name + "-bias");
 		running_mean = &tensorPool->createTensor({ channels }, name + "-running_mean");
 		running_var = &tensorPool->createTensor({ channels }, name + "-running_var");
-		save_mean = &tensorPool->createTensor({ channels }, name + "-save_mean");
-		save_var = &tensorPool->createTensor({ channels }, name + "-save_var");
+
+		// no need for save_mean or save_var for eval mode
+		if(mode == 0){
+			save_mean = &tensorPool->createTensor({ channels }, name + "-save_mean");
+			save_var = &tensorPool->createTensor({ channels }, name + "-save_var");
+		}
 
 		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
 		// keep bias at zero at initialization
@@ -389,8 +446,26 @@ struct BatchNorm2d : public Module<T> {
 		return {weight_tensor, bias_tensor};
 	}
 
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		weight_tensor->save_to_stream(filestream);
+		bias_tensor->save_to_stream(filestream);
+		running_mean->save_to_stream(filestream);
+		running_var->save_to_stream(filestream);
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		weight_tensor->load_from_stream(filestream);
+		bias_tensor->load_from_stream(filestream);
+		running_mean->load_from_stream(filestream);
+		running_var->load_from_stream(filestream);
+	}
+
 	Tensor<T>* forward(Tensor<T>* input) override {
-		tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
+		if(mode == 0){
+			tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
+		} else {
+			tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, "", "", 0);
+		}
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
@@ -409,21 +484,26 @@ struct Layernorm1d : public Module<T> {
 	TensorPool<T>* tensorPool;
 	std::string name;
 	std::string output_name;
-	Layernorm1d(TensorPool<T>* pool, uint32_t features, uint32_t channels, uint32_t batch_size, const std::string& name) : tensorPool(pool), name(name) {
+	uint32_t mode; // 0 = train, 1 = eval
+	Layernorm1d(TensorPool<T>* pool, uint32_t features, uint32_t channels, uint32_t batch_size, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
 		output_name = name + "-output";
 		std::vector<uint32_t> shape = { batch_size, channels, features };
 		this->output = &tensorPool->createTensor(shape, output_name);
 		
 		weight_tensor = &tensorPool->createTensor({ features }, name + "-weight");
 		bias_tensor = &tensorPool->createTensor({ features }, name + "-bias");
-		save_mean = &tensorPool->createTensor({ batch_size, channels }, name + "-save_mean");
-		save_rstd = &tensorPool->createTensor({ batch_size, channels }, name + "-save_rstd");
 
+		// no need for save_mean or save_var for eval mode
+		if(mode == 0){
+			save_mean = &tensorPool->createTensor({ batch_size, channels }, name + "-save_mean");
+			save_rstd = &tensorPool->createTensor({ batch_size, channels }, name + "-save_rstd");
+		}
+		
 		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
 		// keep bias at zero at initialization
 	}
 
-	Layernorm1d(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::string& name) : tensorPool(pool), name(name) {
+	Layernorm1d(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
 		output_name = name + "-output";
 		this->output = &tensorPool->createTensor(shape, output_name);
 		
@@ -433,8 +513,12 @@ struct Layernorm1d : public Module<T> {
 
 		weight_tensor = &tensorPool->createTensor({ features }, name + "-weight");
 		bias_tensor = &tensorPool->createTensor({ features }, name + "-bias");
-		save_mean = &tensorPool->createTensor({ batch_size, channels }, name + "-save_mean");
-		save_rstd = &tensorPool->createTensor({ batch_size, channels }, name + "-save_rstd");
+
+		// no need for save_mean or save_var for eval mode
+		if(mode == 0){
+			save_mean = &tensorPool->createTensor({ batch_size, channels }, name + "-save_mean");
+			save_rstd = &tensorPool->createTensor({ batch_size, channels }, name + "-save_rstd");
+		}
 
 		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
 		// keep bias at zero at initialization
@@ -446,8 +530,23 @@ struct Layernorm1d : public Module<T> {
 		return {weight_tensor, bias_tensor};
 	}
 
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		weight_tensor->save_to_stream(filestream);
+		bias_tensor->save_to_stream(filestream);
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		weight_tensor->load_from_stream(filestream);
+		bias_tensor->load_from_stream(filestream);
+	}
+
 	Tensor<T>* forward(Tensor<T>* input) override {
-		tensorPool->tensor_layernorm_1d(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 0);
+		if(mode == 0){
+			tensorPool->tensor_layernorm_1d(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 0);
+		}
+		else {
+			tensorPool->tensor_layernorm_1d(input->name, weight_tensor->name, bias_tensor->name, this->output->name, "", "", 0);
+		}
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
@@ -511,7 +610,7 @@ struct Conv2d3x3 : public Module<T> {
 		this->groups = groups;
 		
 		output_name = name + "-output";
-		this->output = &tensorPool->createTensor({ batch_size, out_channels, output_height, output_width }, output_name);
+		this->output = &tensorPool->createTensor({ batch_size, out_channels, this->output_height, this->output_width }, output_name);
 		
 		weight_tensor = &tensorPool->createTensor({ out_channels, in_channels, 3, 3 }, name + "-weight");
 		bias_tensor = &tensorPool->createTensor({ out_channels }, name + "-bias");
@@ -540,6 +639,16 @@ struct Conv2d3x3 : public Module<T> {
 
 	std::vector<Tensor<T>*> getTrainableTensors() override {
 		return {weight_tensor, bias_tensor};
+	}
+
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		weight_tensor->save_to_stream(filestream);
+		bias_tensor->save_to_stream(filestream);
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		weight_tensor->load_from_stream(filestream);
+		bias_tensor->load_from_stream(filestream);
 	}
 
 	// input tensor shape: [N, C_in, H_in, W_in]
@@ -591,6 +700,14 @@ struct EmbeddingTable : public Module<T> {
 
 	EmbeddingTable(){}; // empty default ctor
 	
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		embedding_tensor->save_to_stream(filestream);
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		embedding_tensor->load_from_stream(filestream);
+	}
+
 	// input tensor contains token indices (B, token_count)
 	Tensor<T>* forward(Tensor<T>* input) override {
 		tensorPool->tensor_embed_lookup(this->output->name, embedding_tensor->name, input->name, 0);
@@ -701,6 +818,19 @@ struct Sequential : public Module<T> {
 		}
 		layers.push_back(std::move(layer));
 	}
+
+	void serializeTrainableTensors(std::ofstream& filestream) override {
+		for (auto& layer : layers){
+			layer->serializeTrainableTensors(filestream);
+		}
+	}
+
+	void loadFromSerializedTensor(std::ifstream& filestream) override {
+		for (auto& layer : layers){
+			layer->loadFromSerializedTensor(filestream);
+		}
+	}
+
 	Tensor<T>* forward(Tensor<T>* input) override {
 		for (auto& layer : layers) {
 			layer->forward(input);

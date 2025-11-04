@@ -240,6 +240,7 @@ struct tensor_layernorm1d_context {
     tensor_impl out_tensor;      // [B, M, N]
     tensor_impl save_mean;       // [B, M] - mean for each sample
     tensor_impl save_rstd;       // [B, M] - reciprocal std for each sample
+    uint mode;                   // 0 = train, 1 = eval
     uint normalized_size;       // N - size of normalized dimension
     uint batch_stride;          // M * N - elements per batch
     uint accumulate_grad;
@@ -519,6 +520,36 @@ struct Tensor {
         std::cout << "Tensor saved to " << filename << "\n";
     }
 
+    void save_to_stream(std::ofstream& out) const {
+        if (!out)
+            throw std::runtime_error("Invalid output stream");
+
+        const uint32_t magicNumber = 0x544E5352; // "TNSR"
+        out.write(reinterpret_cast<const char*>(&magicNumber), sizeof(magicNumber));
+
+        uint32_t nameLength = static_cast<uint32_t>(name.size());
+        out.write(reinterpret_cast<const char*>(&nameLength), sizeof(nameLength));
+        out.write(name.c_str(), nameLength);
+
+        uint32_t shapeSize = static_cast<uint32_t>(shape.size());
+        out.write(reinterpret_cast<const char*>(&shapeSize), sizeof(shapeSize));
+        out.write(reinterpret_cast<const char*>(shape.data()), shapeSize * sizeof(uint32_t));
+
+        uint32_t stridesSize = static_cast<uint32_t>(strides.size());
+        out.write(reinterpret_cast<const char*>(&stridesSize), sizeof(stridesSize));
+        out.write(reinterpret_cast<const char*>(strides.data()), stridesSize * sizeof(uint32_t));
+
+        auto dataBuf = dataBuffer->downloadBuffer();
+        uint32_t dataSize = static_cast<uint32_t>(dataBuf.size());
+        out.write(reinterpret_cast<const char*>(&dataSize), sizeof(dataSize));
+        out.write(reinterpret_cast<const char*>(dataBuf.data()), dataSize * sizeof(T));
+
+        auto gradBuf = gradientBuffer->downloadBuffer();
+        uint32_t gradSize = static_cast<uint32_t>(gradBuf.size());
+        out.write(reinterpret_cast<const char*>(&gradSize), sizeof(gradSize));
+        out.write(reinterpret_cast<const char*>(gradBuf.data()), gradSize * sizeof(T));
+    }
+
     void load_from_file(const std::string& filename) {
         std::ifstream inFile(filename, std::ios::binary);
         if (!inFile) {
@@ -565,6 +596,54 @@ struct Tensor {
         gradientBuffer->alloc(gradBuf);
         inFile.close();
         std::cout << "Tensor loaded from " << filename << "\n";
+    }
+
+    void load_from_stream(std::ifstream& in) {
+        if (!in)
+            throw std::runtime_error("Invalid input stream");
+
+        // Verify magic number
+        uint32_t magicNumber;
+        in.read(reinterpret_cast<char*>(&magicNumber), sizeof(magicNumber));
+        if (magicNumber != 0x544E5352)
+            throw std::runtime_error("Invalid tensor stream (bad magic number)");
+
+        // Name
+        uint32_t nameLength;
+        in.read(reinterpret_cast<char*>(&nameLength), sizeof(nameLength));
+        name.resize(nameLength);
+        in.read(&name[0], nameLength);
+        std::cout << "Loading tensor: " << name << "\n";
+
+        // Shape
+        uint32_t shapeSize;
+        in.read(reinterpret_cast<char*>(&shapeSize), sizeof(shapeSize));
+        shape.resize(shapeSize);
+        in.read(reinterpret_cast<char*>(shape.data()), shapeSize * sizeof(uint32_t));
+        shapeBuffer->alloc(shape);
+
+        // Strides
+        uint32_t stridesSize;
+        in.read(reinterpret_cast<char*>(&stridesSize), sizeof(stridesSize));
+        strides.resize(stridesSize);
+        in.read(reinterpret_cast<char*>(strides.data()), stridesSize * sizeof(uint32_t));
+        stridesBuffer->alloc(strides);
+
+        // Data buffer
+        uint32_t dataSize;
+        in.read(reinterpret_cast<char*>(&dataSize), sizeof(dataSize));
+        std::vector<T> dataBuf(dataSize);
+        in.read(reinterpret_cast<char*>(dataBuf.data()), dataSize * sizeof(T));
+        dataBuffer->alloc(dataBuf);
+
+        // Gradient buffer
+        uint32_t gradSize;
+        in.read(reinterpret_cast<char*>(&gradSize), sizeof(gradSize));
+        std::vector<T> gradBuf(gradSize);
+        in.read(reinterpret_cast<char*>(gradBuf.data()), gradSize * sizeof(T));
+        gradientBuffer->alloc(gradBuf);
+
+        std::cout << "Tensor loaded from stream\n";
     }
 
    size_t getIndex(std::initializer_list<uint32_t> indices) const {  
@@ -1044,7 +1123,8 @@ struct TensorPool {
                          const std::string& out_tensor,
                          const std::string& save_mean,
                          const std::string& save_var,
-                         uint32_t mode = 0) // 0 = forward, 1 = backward
+                         uint32_t mode = 0 // 0 = forward, 1 = backward
+                         )
     {
         // Validate existence & shapes
         try {
@@ -1081,11 +1161,18 @@ struct TensorPool {
         uniform.running_mean   = tensors[running_mean]->getTensorImpl();
         uniform.running_var    = tensors[running_var]->getTensorImpl();
         uniform.out_tensor     = tensors[out_tensor]->getTensorImpl();
-        uniform.save_mean      = tensors[save_mean]->getTensorImpl();
-        uniform.save_var       = tensors[save_var]->getTensorImpl();
 
-        uniform.batch_size     = batch_size;
-        uniform.mode           = mode; // kernel mode (0 forward, 1 backward)
+        // if no save_mean is provided, it is assumed to be eval mode
+        if(!save_mean.empty()){
+            uniform.save_mean      = tensors[save_mean]->getTensorImpl();
+            uniform.save_var       = tensors[save_var]->getTensorImpl();
+            uniform.mode           = 0; // 0 = train, 1 = eval
+        }else {
+            uniform.mode = 1; 
+        }
+        
+        uniform.batch_size = batch_size;
+        
         uniform.accumulate_grad = 1;    // default; caller can change if needed
         uniform.momentum = 0.1f;
         uniform.eps = 1e-05;
@@ -1194,14 +1281,22 @@ struct TensorPool {
         uniform.running_mean = tensors[running_mean]->getTensorImpl();
         uniform.running_var = tensors[running_var]->getTensorImpl();
         uniform.out_tensor = tensors[out_tensor]->getTensorImpl();
-        uniform.save_mean = tensors[save_mean]->getTensorImpl();
-        uniform.save_var = tensors[save_var]->getTensorImpl();
+
+        // if no save_mean is provided, it is assumed to be eval mode
+        if (!save_mean.empty()){
+            uniform.save_mean = tensors[save_mean]->getTensorImpl();
+            uniform.save_var = tensors[save_var]->getTensorImpl();
+            uniform.mode = 0; // 0 = training (forward), 1 = evaluation (forward)
+        }
+        else {
+            uniform.mode = 1;
+        }
         
         uniform.batch_size = B;
         uniform.channels = C;
         uniform.height = H;
         uniform.width = W;
-        uniform.mode = mode; // 0 = training (forward), 1 = evaluation (forward), or backward
+        
         uniform.accumulate_grad = 1; // default; can be set by caller if needed
         uniform.momentum = momentum;
         uniform.eps = eps;
@@ -1315,8 +1410,15 @@ struct TensorPool {
         uniform.weight_tensor  = tensors[weight_tensor]->getTensorImpl();
         uniform.bias_tensor    = tensors[bias_tensor]->getTensorImpl();
         uniform.out_tensor     = tensors[out_tensor]->getTensorImpl();
-        uniform.save_mean      = tensors[save_mean]->getTensorImpl();
-        uniform.save_rstd      = tensors[save_rstd]->getTensorImpl();
+
+        // if no save_mean or save_rstd is given, eval mode is assumed.
+        if(!save_mean.empty()){
+            uniform.save_mean      = tensors[save_mean]->getTensorImpl();
+            uniform.save_rstd      = tensors[save_rstd]->getTensorImpl();
+            uniform.mode = 0;
+        }else {
+            uniform.mode = 1;
+        }
 
         uniform.normalized_size = N;           // Size of normalized dimension
         uniform.batch_stride    = batch_stride; // M * N

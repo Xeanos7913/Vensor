@@ -483,7 +483,7 @@ struct Trainer {
 		tensorPool = TensorPool<float>(allocator);
 
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
-		testDataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 5);
+		testDataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 5, "mnist_image_batch_test_");
 
 		sequence = Sequential<float>(&tensorPool, "digit-recognision");
 
@@ -550,6 +550,18 @@ struct Trainer {
 		std::cout << "val_loss: " << loss << "\n";
 	}
 
+	void save_model(){
+		auto save_stream = std::ofstream("models/MNIST_model.vnsr", std::ios::binary);
+		sequence.serializeTrainableTensors(save_stream);
+		save_stream.close();
+	}
+
+	void load_model(){
+		auto load_stream = std::ifstream("models/MNIST_model.vnsr", std::ios::binary);
+		sequence.loadFromSerializedTensor(load_stream);
+		load_stream.close();
+	}
+
 	~Trainer(){
 		delete allocator;
 	}
@@ -559,11 +571,15 @@ int main(void){
 	
 	Trainer t = Trainer();
 
-	for (int i = 0; i < 100; i++){
-		t.train_epoch();
-		t.test_epoch();
-	}
+	//for (int i = 0; i < 100; i++){
+	//	t.train_epoch();
+	//	t.test_epoch();
+	//}
+
+	//t.save_model();
 	
+	t.load_model();
+
 	return 0;
 }
 

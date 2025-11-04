@@ -119,7 +119,7 @@ struct MNISTDataloader {
 
     MNISTDataloader() = default;
 
-    MNISTDataloader(TensorPool<T>* pool, uint32_t batch_size, uint32_t num_batches)
+    MNISTDataloader(TensorPool<T>* pool, uint32_t batch_size, uint32_t num_batches, const std::string& name = "mnist_image_bath_")
         : tensorPool(pool), batch_size(batch_size), num_batches(num_batches)
     {
         num_pixels = channels * height * width;
@@ -128,8 +128,8 @@ struct MNISTDataloader {
         std::vector<uint32_t> lbl_shape = { batch_size, 1, num_classes };
 
         for (uint32_t i = 0; i < num_batches; ++i) {
-            auto& img = tensorPool->createTensor(img_shape, "mnist_image_batch_" + std::to_string(i));
-            auto& lbl = tensorPool->createTensor(lbl_shape, "mnist_label_batch_" + std::to_string(i));
+            auto& img = tensorPool->createTensor(img_shape, name + "inputs" + std::to_string(i));
+            auto& lbl = tensorPool->createTensor(lbl_shape, name + "labels" + std::to_string(i));
             imagesBatchTensors.push_back(&img);
             labelTensors.push_back(&lbl);
         }
