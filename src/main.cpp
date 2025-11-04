@@ -571,12 +571,12 @@ int main(void){
 	
 	Trainer t = Trainer();
 
-	//for (int i = 0; i < 100; i++){
-	//	t.train_epoch();
-	//	t.test_epoch();
-	//}
+	for (int i = 0; i < 100; i++){
+		t.train_epoch();
+		t.test_epoch();
+	}
 
-	//t.save_model();
+	t.save_model();
 	
 	t.load_model();
 
