@@ -1265,11 +1265,19 @@ struct TensorPool {
             throw std::invalid_argument("Running var tensor must have shape [C=" + std::to_string(C) + "]");
         }
 
-        // Validate output shape matches input
+        // Validate output shape has same number of elements as input
         const auto& outShape = tensors[out_tensor]->shape;
-        if (outShape.size() != 4 || outShape[0] != B || outShape[1] != C || 
-            outShape[2] != H || outShape[3] != W) {
-            throw std::invalid_argument("Output tensor shape must match input [B, C, H, W]");
+        const size_t inputElements = std::accumulate(inShape.begin(), inShape.end(), 
+                                                    1ULL, std::multiplies<size_t>());
+        const size_t outputElements = std::accumulate(outShape.begin(), outShape.end(), 
+                                                    1ULL, std::multiplies<size_t>());
+
+        if (inputElements != outputElements) {
+            throw std::invalid_argument(
+                "Output tensor must have same number of elements as input (got " +
+                std::to_string(outputElements) + ", expected " + 
+                std::to_string(inputElements) + ")"
+            );
         }
 
         // Fill context structure

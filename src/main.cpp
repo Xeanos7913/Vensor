@@ -4,7 +4,7 @@ This main file contains some testing code (in the commented out parts) and an ex
 
 #include <iostream>
 #include <fstream>
-#define DEBUG
+//#define DEBUG
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/VkCalcium.hpp"
@@ -483,7 +483,7 @@ struct Trainer {
 		tensorPool = TensorPool<float>(allocator);
 
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
-		testDataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 1, 1, "mnist_image_batch_test_");
+		testDataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 1, 100, "mnist_image_batch_test_");
 
 		sequence = Sequential<float>(&tensorPool, "digit-recognision");
 
