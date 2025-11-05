@@ -4,7 +4,7 @@ This main file contains some testing code (in the commented out parts) and an ex
 
 #include <iostream>
 #include <fstream>
-//#define DEBUG
+#define DEBUG
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/VkCalcium.hpp"
@@ -483,7 +483,7 @@ struct Trainer {
 		tensorPool = TensorPool<float>(allocator);
 
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
-		testDataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 5, "mnist_image_batch_test_");
+		testDataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 1, 1, "mnist_image_batch_test_");
 
 		sequence = Sequential<float>(&tensorPool, "digit-recognision");
 
@@ -494,28 +494,28 @@ struct Trainer {
 		// build the model:
 		// build conv1, grab its output dims, move into sequence
 		{
-			auto c1 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 1, 5, 16, 28, 28, "conv1", 1, 1, 0, 0);
+			auto c1 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 1, 5, 1, 28, 28, "conv1", 1, 1, 0, 0);
 			auto out_w1 = c1->output_width;
 			auto out_h1 = c1->output_height;
 			sequence.addLayer(std::move(c1));
 			// batchnorm1 depends on conv1 output dims
-			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w1, out_h1, 16, "bn1"));
+			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w1, out_h1, 1, "bn1", 1));
 			// build conv2 using conv1's output dims as its input dims, grab conv2 dims, move into sequence
-			auto c2 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 5, 5, 16, out_h1, out_w1, "conv2", 1, 1, 0, 0);
+			auto c2 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 5, 5, 1, out_h1, out_w1, "conv2", 1, 1, 0, 0);
 			auto out_w2 = c2->output_width;
 			auto out_h2 = c2->output_height;
 			sequence.addLayer(std::move(c2));
 			// batchnorm2 depends on conv2 output dims
-			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w2, out_h2, 16, "bn2"));
+			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w2, out_h2, 1, "bn2", 1));
 
 			// remaining layers can be constructed inline using conv2 output dims
 			sequence.addLayer(std::make_unique<FlattenTo1d<float>>(&tensorPool, "f"));
-			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 16, "linear1"));
-			sequence.addLayer(std::make_unique<BatchNorm1d<float>>(&tensorPool, 1024, 1, 16, "bn3"));
-			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, 1024, 16, "relu1"));
-			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 1024, 10, 16, "linear2"));
+			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 1, "linear1"));
+			sequence.addLayer(std::make_unique<BatchNorm1d<float>>(&tensorPool, 1024, 1, 1, "bn3", 1));
+			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, 1024, 1, "relu1"));
+			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 1024, 10, 1, "linear2"));
 		}
-		softmax = std::make_unique<SoftmaxCrossEntropy<float>>(&tensorPool, 10, 1, 16, "softmax");
+		softmax = std::make_unique<SoftmaxCrossEntropy<float>>(&tensorPool, 10, 1, 1, "softmax");
 		optim.load_tensors(sequence);
 	}
 
@@ -537,14 +537,11 @@ struct Trainer {
 
 	void test_epoch(){
 		testDataLoader->loadMNIST("dataset/test.idx3-ubyte", "dataset/test_labels.idx1-ubyte");
-		for (uint32_t i = 0; testDataLoader->num_batches; i++){
-			auto* input = testDataLoader->imagesBatchTensors[i];
+		for (uint32_t k = 0; k < testDataLoader->num_batches; k++){
+			auto* input = testDataLoader->imagesBatchTensors[k];
 			sequence.forward(input);
-			softmax->target = testDataLoader->labelTensors[i];
+			softmax->target = testDataLoader->labelTensors[k];
 			softmax->forward(sequence.output);
-
-			softmax->backward(sequence.output);
-			sequence.backward(input);
 		}
 		auto loss = tensorPool.find_mean_of_tensor(softmax->output->name);
 		std::cout << "val_loss: " << loss << "\n";
@@ -567,18 +564,86 @@ struct Trainer {
 	}
 };
 
+struct Tester {
+	// Vulkan stuff:
+	Init init;
+	Allocator* allocator; // need to use heap-allocated allocator for it to work. I don't actually know why this is the case.
+
+	// Data prep:
+	TensorPool<float> tensorPool;
+	std::unique_ptr<MNISTDataloader<float>> dataLoader;
+
+	// contains the model
+	Sequential<float> sequence;
+	std::unique_ptr<SoftmaxCrossEntropy<float>> softmax;
+
+	Tester(){
+		device_initialization(init);
+		allocator = new Allocator(&init);
+		tensorPool = TensorPool<float>(allocator);
+
+		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 1, 100);
+
+		// build the model:
+		// build conv1, grab its output dims, move into sequence. Also set mode = 1 for norm layers
+		{
+			auto c1 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 1, 5, 16, 28, 28, "conv1", 1, 1, 0, 0);
+			auto out_w1 = c1->output_width;
+			auto out_h1 = c1->output_height;
+			sequence.addLayer(std::move(c1));
+			// batchnorm1 depends on conv1 output dims
+			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w1, out_h1, 16, "bn1", 1));
+			// build conv2 using conv1's output dims as its input dims, grab conv2 dims, move into sequence
+			auto c2 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 5, 5, 16, out_h1, out_w1, "conv2", 1, 1, 0, 0);
+			auto out_w2 = c2->output_width;
+			auto out_h2 = c2->output_height;
+			sequence.addLayer(std::move(c2));
+			// batchnorm2 depends on conv2 output dims
+			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w2, out_h2, 16, "bn2", 1));
+
+			// remaining layers can be constructed inline using conv2 output dims
+			sequence.addLayer(std::make_unique<FlattenTo1d<float>>(&tensorPool, "f"));
+			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 16, "linear1"));
+			sequence.addLayer(std::make_unique<BatchNorm1d<float>>(&tensorPool, 1024, 1, 16, "bn3", 1));
+			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, 1024, 16, "relu1"));
+			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 1024, 10, 16, "linear2"));
+		}
+		softmax = std::make_unique<SoftmaxCrossEntropy<float>>(&tensorPool, 10, 1, 1, "softmax");
+	}
+
+	void test(){
+		dataLoader->loadMNIST("dataset/test.idx3-ubyte", "dataset/test_labels.idx1-ubyte");
+		for (uint32_t i = 0; i < dataLoader->num_batches; i++){
+			auto* input = dataLoader->imagesBatchTensors[i];
+			sequence.forward(input);
+			softmax->target = dataLoader->labelTensors[i];
+			softmax->forward(sequence.output);
+		}
+		auto loss = tensorPool.find_mean_of_tensor(softmax->output->name);
+		std::cout << "test_loss: " << loss << "\n";
+	}
+
+	void load_model(){
+		auto load_stream = std::ifstream("models/MNIST_model.vnsr", std::ios::binary);
+		sequence.loadFromSerializedTensor(load_stream);
+		load_stream.close();
+	}
+
+	~Tester(){
+		delete allocator;
+	}
+};
+
 int main(void){
 	
 	Trainer t = Trainer();
 
-	for (int i = 0; i < 100; i++){
-		t.train_epoch();
+	t.load_model();
+
+	for (int i = 0; i < 1; i++){
+		//t.train_epoch();
 		t.test_epoch();
 	}
-
-	t.save_model();
-	
-	t.load_model();
 
 	return 0;
 }

@@ -1222,16 +1222,16 @@ struct TensorPool {
                           float eps = 1e-05f)
     {
         // Validate tensor existence
-        if (tensors.find(input_tensor) == tensors.end() ||
-            tensors.find(weight_tensor) == tensors.end() ||
-            tensors.find(bias_tensor) == tensors.end() ||
-            tensors.find(running_mean) == tensors.end() ||
-            tensors.find(running_var) == tensors.end() ||
-            tensors.find(out_tensor) == tensors.end() ||
-            tensors.find(save_mean) == tensors.end() ||
-            tensors.find(save_var) == tensors.end()) {
-            throw std::invalid_argument("One or more tensors not found for BatchNorm2D");
-        }
+        //if (tensors.find(input_tensor) == tensors.end() ||
+        //    tensors.find(weight_tensor) == tensors.end() ||
+        //    tensors.find(bias_tensor) == tensors.end() ||
+        //    tensors.find(running_mean) == tensors.end() ||
+        //    tensors.find(running_var) == tensors.end() ||
+        //    tensors.find(out_tensor) == tensors.end() ||
+        //    tensors.find(save_mean) == tensors.end() ||
+        //    tensors.find(save_var) == tensors.end()) {
+        //    throw std::invalid_argument("One or more tensors not found for BatchNorm2D");
+        //}
 
         const auto& inShape = tensors[input_tensor]->shape;
         
