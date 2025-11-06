@@ -34,3 +34,4 @@ There's a tiny ~2k line graphics engine inside Vensor called VkCalcium.hpp. It's
 9. SoftmaxCrossEntropy (softmax + cross_entropy loss merged together)
 10. EmbeddingLookup (copy embedded vectors from embedding tensor using a one-hot vector as input)
 11. Sequential
+12. ResidualConnect (makes a residual connection from input Module's output tensor to the previous module's output tensor)
