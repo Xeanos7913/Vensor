@@ -167,6 +167,14 @@ struct matadd_context {
 	uint32_t accumulate_grad;   // Whether to accumulate or overwrite gradients
 };
 
+struct matadd_inplace_context {
+    tensor_impl input_a;      // [B?, M, N] - addend (read-only)
+    tensor_impl input_b;      // [B?, M, N] - accumulator (read-write, in-place)
+    uint batch_size;
+    uint m, n;
+    uint accumulate_grad;    // 0: overwrite, 1: += for grads
+};
+
 struct embedding_lookup_context {
     tensor_impl embedding_tensor;
     tensor_impl indices_tensor;
@@ -732,6 +740,10 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/tensor_addition.comp.spv"), alloc, tile_size),
             additionShaderBackward(
                 readShaderBytecode("compiled_shaders/tensor_addition_backward.comp.spv"), alloc, tile_size),
+            inplaceAdditionShader(
+                readShaderBytecode("compiled_shaders/tensor_inplace_addition.comp.spv"), alloc, tile_size),
+            inplaceAdditionShaderBackward(
+                readShaderBytecode("compiled_shaders/tensor_inplace_addition_backward.comp.spv"), alloc, tile_size),
             batchnormShader(
                 readShaderBytecode("compiled_shaders/Batchnorm.comp.spv"), alloc, nullptr),
             batchnormShaderBackward(
@@ -1672,6 +1684,94 @@ struct TensorPool {
         }
 	}
 
+    void tensor_add_inplace(const std::string& tensor_b, const std::string& tensor_a, uint32_t mode = 0) {
+        try {
+            broadcastShapes(tensors[tensor_a]->shape, tensors[tensor_b]->shape, Operation::ADDITION);
+        }
+        catch (const std::invalid_argument& e) {
+            throw std::invalid_argument("Rank must be >= 2");
+        }
+
+        matadd_inplace_context uniform{};
+        
+        // Helpers
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; 
+            for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return (uint32_t)p;
+        };
+        
+        auto leading_equal = [](const std::vector<uint32_t>& a,
+                            const std::vector<uint32_t>& b)->bool {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) return false;
+            return true;
+        };
+
+        const auto& shapeA = tensors[tensor_a]->shape; // A[..., M, N]
+        const auto& shapeB = tensors[tensor_b]->shape; // B[..., M, N] (in-place output)
+        
+        if (shapeA.size() < 1 || shapeB.size() < 1)
+            throw std::invalid_argument("Rank must be >= 1");
+        
+        if (!leading_equal(shapeA, shapeB))
+            throw std::invalid_argument("Shapes must match exactly for in-place addition");
+        
+        // last-2 dims
+        uint32_t M = shapeB.size() >= 2 ? shapeB[shapeB.size() - 2] : 1;
+        uint32_t N = shapeB.back();
+        
+        // flatten all leading dims -> B
+        uint32_t batch_size = prod(shapeB, 0, shapeB.size() - 2);
+        
+        // uniforms
+        uniform.input_a = tensors[tensor_a]->getTensorImpl();
+        uniform.input_b = tensors[tensor_b]->getTensorImpl(); // in-place output
+        uniform.batch_size = batch_size;
+        uniform.m = M;
+        uniform.n = N;
+        uniform.accumulate_grad = 0;
+        
+        // Compute dispatch grid
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t dispatchM, dispatchN, dispatchBatch;
+        
+        // Use input_b (in-place output) tensor dimensions
+        dispatchM = M;
+        dispatchN = N;
+        dispatchBatch = batch_size;
+        
+        DEBUG_PRINT("Dispatch (in-place): ");
+        uint32_t groupX = ceilDiv(dispatchN, tile_size[0]);
+        uint32_t groupY = ceilDiv(dispatchM, tile_size[1]);
+        uint32_t groupZ = dispatchBatch;
+        
+        DEBUG_PRINT(groupX << " × " << groupY
+                    << " × " << groupZ << " (covering " << dispatchM << "×"
+                    << dispatchN << " per batch)");
+        
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+        
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+        
+        if (mode == 0) {
+            // Forward pass
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = inplaceAdditionShader.uniformBuffer->getBufferAddress();
+            inplaceAdditionShader.loadUniform(uniform, pushConsts);
+            inplaceAdditionShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            // Backward pass
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = inplaceAdditionShaderBackward.uniformBuffer->getBufferAddress();
+            inplaceAdditionShaderBackward.loadUniform(uniform, pushConsts);
+            inplaceAdditionShaderBackward.execute(workgroup);
+        }
+    }
+
     void tensor_linear_ReLU(const std::string& output_tensor,
         const std::string& input_tensor,
         const std::string& weight_tensor,
@@ -2087,6 +2187,8 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, matmul_context> multiplicationShaderBackward;
 	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShader; // computes C = A + B
 	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShader; // computes B = B + A
+    gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShaderBackward;
 	gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShader; // computes ReLU
     gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShaderBackward;
 	gpuTaskNoDesc<T, tensor_push_const, tensor_softmax_context> softmaxShader;  // computes softmax

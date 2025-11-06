@@ -31,7 +31,7 @@ struct MataddContext {
     TensorImpl input_a;   // [B?, M, N]
     TensorImpl input_b;   // [B?, M, N]
     TensorImpl out_tensor;// [B?, M, N] ; out_tensor.grad holds dC
-    uint mode;            // 0 = tiled, 1 = simple
+    uint mode;            
     uint batch_size;
     uint m, n;
     uint accumulate_grad; // 0: overwrite, 1: += for grads

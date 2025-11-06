@@ -474,6 +474,33 @@ struct BatchNorm2d : public Module<T> {
 };
 
 template<typename T>
+struct ResidualConnect : public Module<T>{
+
+	// input_b = input_b + input_a
+	Tensor<T>* input_a;		// [any dims]
+	Tensor<T>* input_b;		// [same dim as input_a]
+
+	TensorPool<T>* tensorPool;
+	std::string name;
+
+	// input_module is the module whose output will be used to add to the output of the layer that comes before this ResidualConnect layer.
+	ResidualConnect(TensorPool<T>* tensorPool, Module<T>& input_module, const std::string& name) : tensorPool(tensorPool), name(name) {
+		input_a = input_module.output;
+		if(this->prev == nullptr) std::runtime_error("a residual connection needs to have a layer above it!");
+		input_b = this->prev->output;
+	}
+
+	Tensor<T>* forward(Tensor<T>* input) override {
+		tensorPool->tensor_add_inplace(input_b->name, input_a->name, 0);
+		return input_b;
+	}
+
+	void backward(Tensor<T>* input) override {
+		tensorPool->tensor_add_inplace(input_b->name, input_a->name, 1);
+	}
+};
+
+template<typename T>
 struct Layernorm1d : public Module<T> {
 	//Tensor<T>* output;
 	Tensor<T>* input_tensor;    // [B, M, N]
