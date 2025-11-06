@@ -4,7 +4,7 @@ This main file contains some testing code (in the commented out parts) and an ex
 
 #include <iostream>
 #include <fstream>
-//#define DEBUG
+#define DEBUG
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/VkCalcium.hpp"
@@ -579,6 +579,7 @@ int main(void){
 	return 0;
 }
 
+
 // dataloader sanity check:
 /*
 int main(void){
@@ -621,4 +622,32 @@ int main(void){
 	return 0;
 }
 
+*/
+
+// MSE loss sanity check
+/*
+int main(void){
+
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
+
+	TensorPool<float> tensorPool = TensorPool<float>(allocator);
+
+	MSEloss<float> mse = MSEloss<float>(&tensorPool, 16, "mse");
+
+	Tensor<float>* input = &tensorPool.createTensor({16, 3, 48, 48}, "input");
+	Tensor<float>* target = &tensorPool.createTensor({16, 3, 48, 48}, "target");
+
+	tensorPool.tensor_fill_random(input->name, -1.0f, 1.0f);
+	tensorPool.tensor_fill_random(target->name, -0.1f, 0.1f);
+
+	mse.target = target;
+	mse.forward(input);
+
+	mse.output->print();
+
+	delete allocator;
+	return 0;
+}
 */

@@ -5,10 +5,10 @@ A simple C++ machine learning library, using Vulkan for GPU acceleration. I made
 Vensor works using Layers and Sequences of Layers. You load up a "Sequential" with various layers, one after the other, being through with their dimentions, and then you pass in the input tensor. An example of how to use Vensor to make neural networks is provided in the main.cpp file. Namely, a basic implementation of the MNIST handwritten digit recognision with Conv2d3x3, Batchnorm2d, Linear and Bacthnorm1d layers.
 
 ## What it lacks
-Well, just about everything apart from the basic function. There's also no residual connection system. No proper compute graph representation. I was too busy focusing on the shader kernel implementations and kind of just winged the higher level API of the engine.
+Well, just about everything apart from the basic function. There's also no proper compute graph representation. I was too busy focusing on the shader kernel implementations and kind of just winged the higher level API of the engine.
 
 ## Future plans
-To have the ability to save and load model weights from other sources would be nice. And also to load pytorch models would be cool to have. I'd also like to have a better compute graph representation and implement residual connections.
+To have the ability to save and load model weights from other sources would be nice. And also to load pytorch models would be cool to have. I'd also like to have a better compute graph representation.
 
 ## Bonus
 There's a tiny ~2k line graphics engine inside Vensor called VkCalcium.hpp. It's heavily flawed (backface culling and horizontal mouse is reversed for linux and windows), and the whole file is commented out by default, but it does work.
@@ -21,3 +21,16 @@ There's a tiny ~2k line graphics engine inside Vensor called VkCalcium.hpp. It's
 5. glm
 6. glfw (for VkCalcum.hpp. You don't need this to just run Vensor's machine learning engine)
 7. glslang compiler to compile shaders (usually the vulkan SDK has it by default)
+
+## Layers Implemented
+1. Linear
+2. ReLU
+3. LinearReLU
+4. BatchNorm1d
+5. BatchNorm2d
+6. LayerNorm1d (It's basically just LayerNorm that norms over the last dimention of the input tensor)
+7. Conv2d3x3 (kernel size is fixed at 3x3 for this layer. I should probably make some kind of shader builder that calculates the constants needed for MxN conv2d)
+8. MSEloss
+9. SoftmaxCrossEntropy (softmax + cross_entropy loss merged together)
+10. EmbeddingLookup (copy embedded vectors from embedding tensor using a one-hot vector as input)
+11. Sequential

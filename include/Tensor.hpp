@@ -255,6 +255,14 @@ struct tensor_layernorm1d_context {
     float eps;
 };
 
+struct mse_loss_context {
+    tensor_impl target_tensor;      // [B, ...]
+    tensor_impl predicted_tensor;   // [B, ...]
+    tensor_impl loss_tensor;        // [B, ...]
+    uint32_t batch_size;
+    uint32_t elements_per_batch;
+};
+
 struct tensor_conv2d_3x3_context {
     tensor_impl input_tensor;  // [N, C_in, H_in, W_in]
     tensor_impl weight_tensor; // [C_out, C_in, K_h, K_w]
@@ -774,6 +782,8 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/Fused_Cross_Entropy.comp.spv"), alloc, nullptr),
             crossEntropyShaderBackward(
                 readShaderBytecode("compiled_shaders/Fused_Cross_Entropy_backward.comp.spv"), alloc, nullptr),
+            mseLossShader(
+                readShaderBytecode("compiled_shaders/MSE_loss.comp.spv"), alloc, nullptr),
             mean_shader(
                 readShaderBytecode("compiled_shaders/find_mean.comp.spv"), alloc, nullptr),
             softmaxShader(
@@ -2055,6 +2065,43 @@ struct TensorPool {
         }
     }
 
+    // automatically populates predicted tensor's gradient buffer with the single call. No need to call .backward()
+    void mse_loss(const std::string& predicted, const std::string& target, const std::string& loss){
+        mse_loss_context uniform;
+        uniform.loss_tensor = tensors[loss]->getTensorImpl();
+        uniform.predicted_tensor = tensors[predicted]->getTensorImpl();
+        uniform.target_tensor = tensors[target]->getTensorImpl();
+
+        // num_elements per batch element
+        constexpr uint32_t VEC_TILE_SIZE = 4;  // As defined in shader
+        constexpr uint32_t ELEMENTS_PER_VEC4 = 4;
+        constexpr uint32_t TILE = VEC_TILE_SIZE * ELEMENTS_PER_VEC4;  // 16 elements per thread
+        constexpr uint32_t GRP = 256;
+
+        uint32_t num_elements = std::accumulate(
+            tensors[target]->shape.begin() + 1, 
+            tensors[target]->shape.end(), 
+            1, 
+            std::multiplies<uint32_t>()
+        );
+
+        uint32_t batch_size = tensors[target]->shape[0];
+
+        uniform.batch_size = batch_size;
+        uniform.elements_per_batch = num_elements;
+
+        // Each workgroup has GRP threads, each processing TILE elements
+        uint32_t num_workgroups_x = (num_elements + (GRP * TILE) - 1) / (GRP * TILE);
+        
+        uint32_t workgroup[3] = {num_workgroups_x, 1, batch_size};
+
+        DEBUG_PRINT("MSE loss on tensor: " << predicted << " Using targets: " << target << " with dispatch: " << "(" << num_workgroups_x << ", " << "1, " << batch_size << ")");
+        tensor_push_const push;
+        push.uniformAddress = mseLossShader.uniformBuffer->getBufferAddress();
+        mseLossShader.loadUniform(uniform, push);
+        mseLossShader.execute(workgroup);
+    }
+
     void tensor_fill_random(const std::string& tensor, T min, T max) {
         tensor_fill_rand_uniform_address<T> uniform{};
 
@@ -2189,6 +2236,7 @@ private:
 	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShader; // computes B = B + A
     gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, mse_loss_context> mseLossShader; // computes Mean Squared Error (MSE) loss
 	gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShader; // computes ReLU
     gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShaderBackward;
 	gpuTaskNoDesc<T, tensor_push_const, tensor_softmax_context> softmaxShader;  // computes softmax

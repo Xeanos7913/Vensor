@@ -286,6 +286,27 @@ struct SoftmaxCrossEntropy : public Module<T> {
 };
 
 template<typename T>
+struct MSEloss : public Module<T> {
+
+	TensorPool<T>* tensorPool;
+	Tensor<T>* target; 		// shape = [B, ...]
+	// Tensor<T>* output; 	// shape = [B] (this is the loss tensor. Calculates loss for each example in the batch tensor)
+	std::string name;
+
+	MSEloss(TensorPool<T>* pool, uint32_t batch_size, const std::string& name) : tensorPool(pool), name(name){
+		this->output = &tensorPool->createTensor({batch_size}, name + "-loss");
+	}
+
+	Tensor<T>* forward(Tensor<T>* input) override {
+		if(target == nullptr) throw std::runtime_error("Target tensor for MSE loss not set!");
+		tensorPool->mse_loss(input->name, target->name, this->output->name);
+		return this->output;
+	}
+
+	void backward(Tensor<T>* input) override {} // does nothing
+};
+
+template<typename T>
 struct BatchNorm1d : public Module<T> {
 	//Tensor<T>* output;
 	Tensor<T>* input_tensor;  // [B, M, N] - input feature vector
@@ -889,8 +910,6 @@ struct Sequential : public Module<T> {
 		}
 	}
 };
-
-
 
 template<typename T>
 struct SDGoptim : public Optimiser<T>{
