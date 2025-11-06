@@ -15,11 +15,11 @@ There's a tiny ~2k line graphics engine inside Vensor called VkCalcium.hpp. It's
 
 ## Dependencies
 1. Standard Vulkan headers
-2. stb_image
-3. stb_image_write
-4. VKBootstrap
-5. glm
-6. glfw (for VkCalcum.hpp. You don't need this to just run Vensor's machine learning engine)
+2. stb_image (https://github.com/nothings/stb)
+3. stb_image_write (https://github.com/nothings/stb)
+4. VKBootstrap (https://github.com/charles-lunarg/vk-bootstrap)
+5. glm (https://github.com/g-truc/glm)
+6. glfw (for VkCalcum.hpp. You don't need this to just run Vensor's machine learning engine) (https://github.com/glfw/glfw)
 7. glslang compiler to compile shaders (usually the vulkan SDK has it by default)
 
 ## Layers Implemented
