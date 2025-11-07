@@ -233,7 +233,6 @@ int main(void) {
 */
 
 // batchnorm test
-
 /*
 int main(void) {
 	Init init;
@@ -241,10 +240,10 @@ int main(void) {
 	Allocator* allocator = new Allocator(&init);
 	TensorPool<float> tensorPool(allocator);
 
-	auto &input = tensorPool.createTensor({5, 32, 32}, "input");
+	auto &input = tensorPool.createTensor({16, 32, 32}, "input");
 	tensorPool.tensor_fill_random("input", -1.0f, 1.0f);
-	auto batchnorm = BatchNorm1d<float>(&tensorPool, 32, 32, 5, "batchnorm");
-	auto batchnorm2 = BatchNorm1d<float>(&tensorPool, 32, 32, 5, "batchnorm2");
+	auto batchnorm = BatchNorm1d<float>(&tensorPool, 32, 32, 16, "batchnorm");
+	auto batchnorm2 = BatchNorm1d<float>(&tensorPool, 32, 32, 16, "batchnorm2");
 
 	batchnorm.forward(&input);
 	batchnorm2.forward(batchnorm.output);
@@ -256,7 +255,6 @@ int main(void) {
 	return 0;
 }
 */
-
 /*
 int main(void) {
 	Init init;
@@ -362,17 +360,16 @@ int main(void){
 */
 
 // Layernorm test
-/*
 int main(void) {
 	Init init;
 	device_initialization(init);
 	Allocator* allocator = new Allocator(&init);
 	TensorPool<float> tensorPool(allocator);
 
-	auto &input = tensorPool.createTensor({5, 32, 32}, "input");
+	auto &input = tensorPool.createTensor({16, 32, 32}, "input");
 	tensorPool.tensor_fill_random("input", -1.0f, 1.0f);
-	auto batchnorm = Layernorm1d<float>(&tensorPool, 32, 32, 5, "batchnorm");
-	auto batchnorm2 = Layernorm1d<float>(&tensorPool, 32, 32, 5, "batchnorm2");
+	auto batchnorm = Layernorm1d<float>(&tensorPool, 32, 32, 16, "batchnorm");
+	auto batchnorm2 = Layernorm1d<float>(&tensorPool, 32, 32, 16, "batchnorm2");
 
 	batchnorm.forward(&input);
 	batchnorm2.forward(batchnorm.output);
@@ -383,7 +380,6 @@ int main(void) {
 	delete allocator;
 	return 0;
 }
-*/
 
 // Batchnorm2d test
 /*
@@ -460,6 +456,7 @@ int main(void){
 */
 
 // A handwritten digit recognision neural network
+/*
 struct Trainer {
 	
 	// Vulkan stuff:
@@ -578,7 +575,7 @@ int main(void){
 
 	return 0;
 }
-
+*/
 
 // dataloader sanity check:
 /*
