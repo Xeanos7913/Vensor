@@ -368,8 +368,8 @@ int main(void) {
 
 	auto &input = tensorPool.createTensor({16, 32, 32}, "input");
 	tensorPool.tensor_fill_random("input", -1.0f, 1.0f);
-	auto batchnorm = Layernorm1d<float>(&tensorPool, 32, 32, 16, "batchnorm");
-	auto batchnorm2 = Layernorm1d<float>(&tensorPool, 32, 32, 16, "batchnorm2");
+	auto batchnorm = Layernorm<float>(&tensorPool, {16, 32, 32}, {32, 32}, "batchnorm");
+	auto batchnorm2 = Layernorm<float>(&tensorPool, {16, 32, 32}, {32, 32}, "batchnorm2");
 
 	batchnorm.forward(&input);
 	batchnorm2.forward(batchnorm.output);

@@ -1362,7 +1362,7 @@ struct TensorPool {
         }
     }
 
-    void tensor_layernorm_1d(const std::string& input_tensor,
+    void tensor_layernorm(const std::string& input_tensor,
                          const std::string& weight_tensor,
                          const std::string& bias_tensor,
                          const std::string& out_tensor,
@@ -1372,13 +1372,17 @@ struct TensorPool {
     {
         // Validate existence & get shapes
         try {
-            // LayerNorm: weight and bias should broadcast with last dimension
             const auto& inShape = tensors[input_tensor]->shape;
             const auto& wShape = tensors[weight_tensor]->shape;
             const auto& bShape = tensors[bias_tensor]->shape;
             
-            if (inShape.empty()) {
-                throw std::invalid_argument("Input tensor cannot be empty");
+            if (inShape.empty() || wShape.empty() || bShape.empty()) {
+                throw std::invalid_argument("Tensors cannot be empty");
+            }
+            
+            // Weight and bias shapes must match
+            if (wShape != bShape) {
+                throw std::invalid_argument("Weight and bias shapes must match");
             }
         }
         catch (const std::invalid_argument& e) {
@@ -1396,44 +1400,27 @@ struct TensorPool {
         }; 
 
         const auto& inShape = tensors[input_tensor]->shape;
-        if (inShape.size() < 2) {
-            throw std::invalid_argument("Input rank must be >= 2 for LayerNorm1D (need [..., M, N])");
+        const auto& normShape = tensors[weight_tensor]->shape;
+
+        if (inShape.size() < normShape.size() + 1) {
+            throw std::invalid_argument("Input rank must be >= weight rank + 1 (need [B, ...])");
         }
 
-        // LayerNorm normalizes over the last dimension N
-        // Shape: [B, M, N] -> normalize over N for each (B, M) sample
-        uint32_t N = inShape.back(); // normalized_size
-        uint32_t M = inShape[inShape.size() - 2];
-        uint32_t batch_size = prod(inShape, 0, inShape.size() - 2); // All dims before M
+        // Batch is always first dimension
+        uint32_t batch_size = inShape[0];
         
-        uint32_t batch_stride = M * N; // elements per batch
-        uint32_t num_samples = batch_size * M; // total number of [N] sequences to normalize
-
-        // Validate weight/bias shapes are [N] (normalized shape)
-        auto expectNormShape = [&](const std::string& name) {
-            const auto& s = tensors[name]->shape;
-            if (s.size() != 1 || s[0] != N) {
-                throw std::invalid_argument(name + " must be shape [N=" + std::to_string(N) + 
-                                        "] matching input's last dimension");
-            }
-        };
-        expectNormShape(weight_tensor);
-        expectNormShape(bias_tensor);
-
-        // Validate save_mean and save_rstd shapes are [B, M] (one per sample)
-        auto expectStatsShape = [&](const std::string& name) {
-            const auto& s = tensors[name]->shape;
-            // Should be [batch_size, M] or flattened [batch_size * M]
-            uint32_t expected_size = batch_size * M;
-            uint32_t actual_size = prod(s, 0, s.size());
-            if (actual_size != expected_size) {
-                throw std::invalid_argument(name + " must have " + std::to_string(expected_size) + 
-                                        " elements for [B=" + std::to_string(batch_size) + 
-                                        ", M=" + std::to_string(M) + "]");
-            }
-        };
-        expectStatsShape(save_mean);
-        expectStatsShape(save_rstd);
+        // Calculate normalized_size (product of dimensions we're normalizing over)
+        uint32_t normalized_size = prod(normShape, 0, normShape.size());
+        
+        // Calculate number of separate sequences to normalize
+        // This is batch_size * product of remaining dimensions not being normalized
+        uint32_t num_samples = batch_size;
+        for (size_t i = 1; i < inShape.size() - normShape.size(); i++) {
+            num_samples *= inShape[i];
+        }
+        
+        // Stride between batch elements
+        uint32_t batch_stride = prod(inShape, 1, inShape.size());
 
         // Fill uniform/context expected by shader
         uniform.input_tensor   = tensors[input_tensor]->getTensorImpl();
@@ -1441,7 +1428,6 @@ struct TensorPool {
         uniform.bias_tensor    = tensors[bias_tensor]->getTensorImpl();
         uniform.out_tensor     = tensors[out_tensor]->getTensorImpl();
 
-        // if no save_mean or save_rstd is given, eval mode is assumed.
         if(!save_mean.empty()){
             uniform.save_mean      = tensors[save_mean]->getTensorImpl();
             uniform.save_rstd      = tensors[save_rstd]->getTensorImpl();
@@ -1450,34 +1436,31 @@ struct TensorPool {
             uniform.mode = 1;
         }
 
-        uniform.normalized_size = N;           // Size of normalized dimension
-        uniform.batch_stride    = batch_stride; // M * N
-        uniform.accumulate_grad = 1;           // default; caller can change if needed
+        uniform.normalized_size = normalized_size;
+        uniform.batch_stride    = batch_stride;
+        uniform.accumulate_grad = 1;
         uniform.eps = 1e-05f;
 
-        // Dispatch grid calculation
-        // Each workgroup processes one [N] sequence
-        // Total workgroups = batch_size * M
-        uint32_t groupX = num_samples; // batch_size * M
+        // Each workgroup processes one sequence
+        uint32_t groupX = num_samples;
         uint32_t groupY = 1;
         uint32_t groupZ = 1;
 
         DEBUG_PRINT("LayerNorm dispatch: " << groupX << " x " << groupY << " x " << groupZ
-                << " (normalizing " << num_samples << " sequences of size " << N << ")");
+                << " (normalizing " << num_samples << " sequences of size " << normalized_size << ")");
 
         uint32_t workgroup[3] = { groupX, groupY, groupZ };
 
         tensor_push_const pushConsts{};
         pushConsts.grid_size = { groupX, groupY, groupZ };
 
-        // Choose shader based on mode
         if (mode == 0) {
-            pushConsts.mode = 0; // forward
+            pushConsts.mode = 0;
             pushConsts.uniformAddress = layernorm1dShader.uniformBuffer->getBufferAddress();
             layernorm1dShader.loadUniform(uniform, pushConsts);
             layernorm1dShader.execute(workgroup);
         } else {
-            pushConsts.mode = 1; // backward
+            pushConsts.mode = 1;
             pushConsts.uniformAddress = layernorm1dShaderBackward.uniformBuffer->getBufferAddress();
             layernorm1dShaderBackward.loadUniform(uniform, pushConsts);
             layernorm1dShaderBackward.execute(workgroup);

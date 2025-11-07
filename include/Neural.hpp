@@ -522,7 +522,7 @@ struct ResidualConnect : public Module<T>{
 };
 
 template<typename T>
-struct Layernorm1d : public Module<T> {
+struct Layernorm : public Module<T> {
 	//Tensor<T>* output;
 	Tensor<T>* input_tensor;    // [B, M, N]
     Tensor<T>* weight_tensor;   // [N] - normalized shape
@@ -533,46 +533,35 @@ struct Layernorm1d : public Module<T> {
 	std::string name;
 	std::string output_name;
 	uint32_t mode; // 0 = train, 1 = eval
-	Layernorm1d(TensorPool<T>* pool, uint32_t features, uint32_t channels, uint32_t batch_size, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
-		output_name = name + "-output";
-		std::vector<uint32_t> shape = { batch_size, channels, features };
-		this->output = &tensorPool->createTensor(shape, output_name);
-		
-		weight_tensor = &tensorPool->createTensor({ features }, name + "-weight");
-		bias_tensor = &tensorPool->createTensor({ features }, name + "-bias");
 
-		// no need for save_mean or save_var for eval mode
-		if(mode == 0){
-			save_mean = &tensorPool->createTensor({ batch_size, channels }, name + "-save_mean");
-			save_rstd = &tensorPool->createTensor({ batch_size, channels }, name + "-save_rstd");
-		}
-		
-		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
-		// keep bias at zero at initialization
-	}
-
-	Layernorm1d(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
+	Layernorm(TensorPool<T>* pool, const std::vector<uint32_t>& shape, const std::vector<uint32_t>& norm_over, const std::string& name, uint32_t mode = 0) : tensorPool(pool), name(name), mode(mode) {
 		output_name = name + "-output";
 		this->output = &tensorPool->createTensor(shape, output_name);
-		
-		auto batch_size = shape[0];
-		auto channels = shape[1];
-		auto features = shape[2];
 
-		weight_tensor = &tensorPool->createTensor({ features }, name + "-weight");
-		bias_tensor = &tensorPool->createTensor({ features }, name + "-bias");
+		// weight/bias correspond to the normalized-over dims (the tail of `shape`)
+		weight_tensor = &tensorPool->createTensor(norm_over, name + "-weight");
+		bias_tensor = &tensorPool->createTensor(norm_over, name + "-bias");
 
-		// no need for save_mean or save_var for eval mode
-		if(mode == 0){
-			save_mean = &tensorPool->createTensor({ batch_size, channels }, name + "-save_mean");
-			save_rstd = &tensorPool->createTensor({ batch_size, channels }, name + "-save_rstd");
+		// save_mean and save_rstd shapes are the prefix of `shape` up to (but not including) the normalized dims.
+		// e.g. if shape = {B, D1, D2, ..., Dn, Dn+1, ...} and norm_over = {Dn, Dn+1, ...},
+		// then save shapes = {B, D1, D2, ..., Dn-1, Dn} -> which is shape[0 .. prefix_len-1]
+		if (mode == 0) {
+			if (norm_over.size() > shape.size() - 1) {
+				throw std::invalid_argument("norm_over has more dimensions than input shape (excluding batch)");
+			}
+			size_t prefix_len = shape.size() - norm_over.size();
+			std::vector<uint32_t> save_shape;
+			save_shape.reserve(prefix_len);
+			for (size_t i = 0; i < prefix_len; ++i) save_shape.push_back(shape[i]);
+			save_mean = &tensorPool->createTensor(save_shape, name + "-save_mean");
+			save_rstd = &tensorPool->createTensor(save_shape, name + "-save_rstd");
 		}
 
 		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
 		// keep bias at zero at initialization
 	}
 
-	Layernorm1d(){}; // default empty ctor
+	Layernorm(){}; // default empty ctor
 
 	std::vector<Tensor<T>*> getTrainableTensors() override {
 		return {weight_tensor, bias_tensor};
@@ -590,15 +579,16 @@ struct Layernorm1d : public Module<T> {
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(mode == 0){
-			tensorPool->tensor_layernorm_1d(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 0);
+			tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 0);
 		}
 		else {
-			tensorPool->tensor_layernorm_1d(input->name, weight_tensor->name, bias_tensor->name, this->output->name, "", "", 0);
+			tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, "", "", 0);
 		}
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
-		tensorPool->tensor_layernorm_1d(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 1);
+		if(mode == 1) throw std::runtime_error("Cannot call backward on Layernorm with eval mode on! \n Change mode = 0 -> mode = 1 in the ctor.");
+		tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 1);
 	}
 };
 
