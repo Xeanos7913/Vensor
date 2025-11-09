@@ -360,6 +360,7 @@ int main(void){
 */
 
 // Layernorm test
+/*
 int main(void) {
 	Init init;
 	device_initialization(init);
@@ -374,12 +375,16 @@ int main(void) {
 	batchnorm.forward(&input);
 	batchnorm2.forward(batchnorm.output);
 
+	batchnorm2.backward(batchnorm.output);
+	batchnorm.backward(&input);
+
 	batchnorm2.save_mean->print();
 	batchnorm2.save_rstd->print();
 	
 	delete allocator;
 	return 0;
 }
+*/
 
 // Batchnorm2d test
 /*
@@ -401,6 +406,25 @@ int main(void) {
 	batchnorm2.save_var->print();
 	
 	delete allocator;
+	return 0;
+}
+*/
+
+// Max Pooling test
+/*
+int main(void) {
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
+	TensorPool<float> pool = TensorPool<float>(allocator);
+
+	auto &input = pool.createTensor({16, 3, 64, 64}, "input");
+
+	auto maxPool = MaxPool<float>(&pool, 16, 64, 64, 3, "maxPool");
+
+	auto output = maxPool(&input);
+	
+	output->printShape();
 	return 0;
 }
 */
@@ -456,7 +480,6 @@ int main(void){
 */
 
 // A handwritten digit recognision neural network
-/*
 struct Trainer {
 	
 	// Vulkan stuff:
@@ -575,7 +598,6 @@ int main(void){
 
 	return 0;
 }
-*/
 
 // dataloader sanity check:
 /*

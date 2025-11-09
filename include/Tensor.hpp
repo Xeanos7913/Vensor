@@ -26,6 +26,7 @@
 #include <numeric>
 
 std::vector<char> readShaderBytecode(const std::string& filename) {
+    DEBUG_PRINT("Making Shader: " << filename);
     std::ifstream file(filename, std::ios::ate | std::ios::binary);  // Open file at the end in binary mode
     
     if (!file.is_open()) {
@@ -276,6 +277,15 @@ struct tensor_conv2d_3x3_context {
     uint dilation_w;
     uint groups;
     uint accumulate_grad;
+};
+
+struct tensor_max_pool_context {
+    tensor_impl input_tensor;    // [B, C, H, W]
+    tensor_impl output_tensor;   // [B, C, H_out, W_out]
+    uint kernel_size_h;
+    uint kernel_size_w;
+    uint stride_h;
+    uint stride_w;
 };
 
 struct tensor_ops_uniform_address {
@@ -710,6 +720,14 @@ struct Tensor {
 	   std::cout << "\n";
    }
 
+   void printShape() const {
+        std::cout << "Tensor shape: (";
+        for (auto& dim : shape) {
+            std::cout << dim << ", ";
+        }
+        std::cout << ")\n";
+   }
+
    void printGradient() const {
        auto buf = gradientBuffer->downloadBuffer();
        std::cout << "Tensor shape: " << shapeToString(shape) << "\n";
@@ -796,6 +814,10 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/Conv2d3x3.comp.spv"), alloc, tile_size),
             conv2dShader3x3Backward(
                 readShaderBytecode("compiled_shaders/Conv2d3x3_backward.comp.spv"), alloc, tile_size),
+            maxPoolShader(
+                readShaderBytecode("compiled_shaders/MaxPooling.comp.spv"), alloc, tile_size),
+            maxPoolShaderBackward(
+                readShaderBytecode("compiled_shaders/MaxPooling_backward.comp.spv"), alloc, nullptr),
             cmpShader(
                 readShaderBytecode("compiled_shaders/Is_tensor_equal.comp.spv"), alloc, nullptr)
     {
@@ -1031,6 +1053,32 @@ struct TensorPool {
             }
         }
     };
+
+    void tensor_max_pool(const std::string& input_tensor, const std::string& output_tensor, uint32_t kernel_h, uint32_t kernel_w, uint32_t stride_h, uint32_t stride_w, uint32_t mode = 0){
+        tensor_max_pool_context uniform;
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.kernel_size_h = kernel_h;
+        uniform.kernel_size_w = kernel_w;
+        uniform.stride_h = stride_h;
+        uniform.stride_w = stride_w;
+
+        uint32_t numel = uniform.output_tensor.num_elements;
+        uint32_t groupX = (numel + 255) / 256;
+        uint32_t workgrp[3] = {groupX, 1, 1};
+        tensor_push_const push;
+        if(mode == 0){
+            push.mode = mode;
+            push.uniformAddress = maxPoolShader.uniformBuffer->getBufferAddress();
+            maxPoolShader.loadUniform(uniform, push);
+            maxPoolShader.execute(workgrp);
+        }else if (mode == 1) {
+            push.mode = mode;
+            push.uniformAddress = maxPoolShaderBackward.uniformBuffer->getBufferAddress();
+            maxPoolShaderBackward.loadUniform(uniform, push);
+            maxPoolShaderBackward.execute(workgrp);
+        }
+    }
 
     void tensor_softmax(const std::string& output_tensor, const std::string& input_tensor, uint32_t mode = 0) {
         // Check if shapes match
@@ -2242,8 +2290,11 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, tensor_fill_rand_uniform_address<T>> fillRandomShader; // fills tensor with random values
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3; // computes 2D convolution with 3x3 kernel
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3Backward; // computes 2D convolution with 3x3 kernel backward pass
+    gpuTaskNoDesc<T, tensor_push_const, tensor_max_pool_context> maxPoolShader;     // computes maxPool2D with any kernel shape
+    gpuTaskNoDesc<T, tensor_push_const, tensor_max_pool_context> maxPoolShaderBackward;     // computes maxPool2D's backward pass with any kernel shape
 };
 
+// not used at the moment
 template<typename T>
 struct BiOpNode {
 

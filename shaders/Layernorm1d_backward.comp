@@ -30,10 +30,10 @@ struct LayerNorm1DContext {
     TensorImpl input_tensor;    // [B, M, N]
     TensorImpl weight_tensor;   // [N]
     TensorImpl bias_tensor;     // [N]
-    TensorImpl out_tensor;      // [B, M, N]  (out.grad holds upstream grads)
+    TensorImpl out_tensor;      // [B, M, N]
     TensorImpl save_mean;       // [B, M]
     TensorImpl save_rstd;       // [B, M]
-    uint mode;                  // 0 (training)
+    uint mode;                  // 0 = train, 1 = eval
     uint normalized_size;       // N
     uint batch_stride;          // M * N
     uint accumulate_grad;
@@ -56,39 +56,42 @@ const uint VEC4S_PER_THREAD = 2u;            // tuneable: 1..4
 const uint FLOATS_PER_THREAD = VEC4 * VEC4S_PER_THREAD;
 const uint NUM_WARPS = MAX_WG / WARP_SIZE;
 
-// contiguous vec4 load (handles tail)
-vec4 loadVec4Contig(tensor_data buf, uint base_idx, uint remaining) {
-    vec4 r = vec4(0.0);
+// contiguous vec4 load (handles tail) - fixed to avoid type issues
+void loadVec4Contig(inout tensor_data buf, uint base_idx, uint remaining, out float x, out float y, out float z, out float w) {
+    x = 0.0;
+    y = 0.0;
+    z = 0.0;
+    w = 0.0;
+    
     if (remaining >= 4u) {
-        r.x = buf.data[base_idx + 0u];
-        r.y = buf.data[base_idx + 1u];
-        r.z = buf.data[base_idx + 2u];
-        r.w = buf.data[base_idx + 3u];
+        x = buf.data[base_idx + 0u];
+        y = buf.data[base_idx + 1u];
+        z = buf.data[base_idx + 2u];
+        w = buf.data[base_idx + 3u];
     } else {
-        if (remaining >= 1u) r.x = buf.data[base_idx + 0u];
-        if (remaining >= 2u) r.y = buf.data[base_idx + 1u];
-        if (remaining >= 3u) r.z = buf.data[base_idx + 2u];
+        if (remaining >= 1u) x = buf.data[base_idx + 0u];
+        if (remaining >= 2u) y = buf.data[base_idx + 1u];
+        if (remaining >= 3u) z = buf.data[base_idx + 2u];
     }
-    return r;
 }
 
 // store vec4 to input.grad with optional atomic add
-void storeVec4Grad(tensor_grad buf, uint base_idx, vec4 v, uint remaining, bool accumulate) {
+void storeVec4Grad(inout tensor_grad buf, uint base_idx, float vx, float vy, float vz, float vw, uint remaining, bool accumulate) {
     if (accumulate) {
-        if (remaining >= 1u) atomicAdd(buf.grad[base_idx + 0u], v.x);
-        if (remaining >= 2u) atomicAdd(buf.grad[base_idx + 1u], v.y);
-        if (remaining >= 3u) atomicAdd(buf.grad[base_idx + 2u], v.z);
-        if (remaining >= 4u) atomicAdd(buf.grad[base_idx + 3u], v.w);
+        if (remaining >= 1u) atomicAdd(buf.grad[base_idx + 0u], vx);
+        if (remaining >= 2u) atomicAdd(buf.grad[base_idx + 1u], vy);
+        if (remaining >= 3u) atomicAdd(buf.grad[base_idx + 2u], vz);
+        if (remaining >= 4u) atomicAdd(buf.grad[base_idx + 3u], vw);
     } else {
-        if (remaining >= 1u) buf.grad[base_idx + 0u] = v.x;
-        if (remaining >= 2u) buf.grad[base_idx + 1u] = v.y;
-        if (remaining >= 3u) buf.grad[base_idx + 2u] = v.z;
-        if (remaining >= 4u) buf.grad[base_idx + 3u] = v.w;
+        if (remaining >= 1u) buf.grad[base_idx + 0u] = vx;
+        if (remaining >= 2u) buf.grad[base_idx + 1u] = vy;
+        if (remaining >= 3u) buf.grad[base_idx + 2u] = vz;
+        if (remaining >= 4u) buf.grad[base_idx + 3u] = vw;
     }
 }
 
 // atomic add for param grads (float buffer)
-void atomicAddParam(tensor_grad buf, uint idx, float v) {
+void atomicAddParam(inout tensor_grad buf, uint idx, float v) {
     atomicAdd(buf.grad[idx], v);
 }
 
@@ -156,37 +159,61 @@ void backward_kernel() {
             uint remaining = min(VEC4, N - idx);
 
             // load upstream grad (out.grad), input x, weight
-            vec4 grad_out_v = loadVec4Contig(ctx.out_tensor.grad, base_idx + idx, remaining);
-            vec4 x_v        = loadVec4Contig(ctx.input_tensor.data, base_idx + idx, remaining);
-            vec4 w_v        = loadVec4Contig(ctx.weight_tensor.data, idx, remaining);
+            float grad_out_x, grad_out_y, grad_out_z, grad_out_w;
+            float x_x, x_y, x_z, x_w;
+            float w_x, w_y, w_z, w_w;
+            
+            loadVec4Contig(ctx.out_tensor.grad, base_idx + idx, remaining, grad_out_x, grad_out_y, grad_out_z, grad_out_w);
+            loadVec4Contig(ctx.input_tensor.data, base_idx + idx, remaining, x_x, x_y, x_z, x_w);
+            loadVec4Contig(ctx.weight_tensor.data, idx, remaining, w_x, w_y, w_z, w_w);
 
             // normalized = (x - mean) * rstd
-            vec4 norm_v = (x_v - vec4(mean)) * vec4(rstd);
+            float norm_x = (x_x - mean) * rstd;
+            float norm_y = (x_y - mean) * rstd;
+            float norm_z = (x_z - mean) * rstd;
+            float norm_w = (x_w - mean) * rstd;
 
             // grad_w = grad_out * normalized  (per-feature)
-            vec4 grad_w_v = grad_out_v * norm_v;
+            float grad_w_x = grad_out_x * norm_x;
+            float grad_w_y = grad_out_y * norm_y;
+            float grad_w_z = grad_out_z * norm_z;
+            float grad_w_w = grad_out_w * norm_w;
+            
             // grad_b = grad_out
-            vec4 grad_b_v = grad_out_v;
+            float grad_b_x = grad_out_x;
+            float grad_b_y = grad_out_y;
+            float grad_b_z = grad_out_z;
+            float grad_b_w = grad_out_w;
 
             // write parameter grads atomically (one atomic per scalar component)
-            // atomicAdd is required because many samples write to same param elements
-            // note: weight_tensor.grad and bias_tensor.grad indexed by feature idx (relative to N)
-            for (uint c = 0u; c < remaining; ++c) {
-                uint feature_idx = idx + c;
-                float gw = (c==0u) ? grad_w_v.x : (c==1u) ? grad_w_v.y : (c==2u) ? grad_w_v.z : grad_w_v.w;
-                float gb = (c==0u) ? grad_b_v.x : (c==1u) ? grad_b_v.y : (c==2u) ? grad_b_v.z : grad_b_v.w;
-                atomicAddParam(ctx.weight_tensor.grad, feature_idx, gw);
-                atomicAddParam(ctx.bias_tensor.grad, feature_idx, gb);
+            if (remaining >= 1u) {
+                atomicAddParam(ctx.weight_tensor.grad, idx + 0u, grad_w_x);
+                atomicAddParam(ctx.bias_tensor.grad, idx + 0u, grad_b_x);
+            }
+            if (remaining >= 2u) {
+                atomicAddParam(ctx.weight_tensor.grad, idx + 1u, grad_w_y);
+                atomicAddParam(ctx.bias_tensor.grad, idx + 1u, grad_b_y);
+            }
+            if (remaining >= 3u) {
+                atomicAddParam(ctx.weight_tensor.grad, idx + 2u, grad_w_z);
+                atomicAddParam(ctx.bias_tensor.grad, idx + 2u, grad_b_z);
+            }
+            if (remaining >= 4u) {
+                atomicAddParam(ctx.weight_tensor.grad, idx + 3u, grad_w_w);
+                atomicAddParam(ctx.bias_tensor.grad, idx + 3u, grad_b_w);
             }
 
             // grad_normalized = grad_out * weight
-            vec4 grad_norm_v = grad_out_v * w_v;
+            float grad_norm_x = grad_out_x * w_x;
+            float grad_norm_y = grad_out_y * w_y;
+            float grad_norm_z = grad_out_z * w_z;
+            float grad_norm_w = grad_out_w * w_w;
 
             // accumulate reductions needed for input gradient
-            // sum of grad_normalized components
-            t_sum_grad_norm += (grad_norm_v.x + grad_norm_v.y + grad_norm_v.z + grad_norm_v.w);
+            t_sum_grad_norm += (grad_norm_x + grad_norm_y + grad_norm_z + grad_norm_w);
             // dot(grad_normalized, normalized)
-            t_sum_grad_norm_times_norm += dot(grad_norm_v, norm_v);
+            t_sum_grad_norm_times_norm += (grad_norm_x * norm_x + grad_norm_y * norm_y + 
+                                           grad_norm_z * norm_z + grad_norm_w * norm_w);
         }
     }
 
@@ -219,21 +246,34 @@ void backward_kernel() {
             if (idx >= N) break;
             uint remaining = min(VEC4, N - idx);
 
-            vec4 grad_out_v = loadVec4Contig(ctx.out_tensor.grad, base_idx + idx, remaining);
-            vec4 x_v        = loadVec4Contig(ctx.input_tensor.data, base_idx + idx, remaining);
-            vec4 w_v        = loadVec4Contig(ctx.weight_tensor.data, idx, remaining);
+            float grad_out_x, grad_out_y, grad_out_z, grad_out_w;
+            float x_x, x_y, x_z, x_w;
+            float w_x, w_y, w_z, w_w;
+            
+            loadVec4Contig(ctx.out_tensor.grad, base_idx + idx, remaining, grad_out_x, grad_out_y, grad_out_z, grad_out_w);
+            loadVec4Contig(ctx.input_tensor.data, base_idx + idx, remaining, x_x, x_y, x_z, x_w);
+            loadVec4Contig(ctx.weight_tensor.data, idx, remaining, w_x, w_y, w_z, w_w);
 
-            vec4 norm_v = (x_v - vec4(mean)) * vec4(rstd);
-            vec4 grad_norm_v = grad_out_v * w_v;
+            float norm_x = (x_x - mean) * rstd;
+            float norm_y = (x_y - mean) * rstd;
+            float norm_z = (x_z - mean) * rstd;
+            float norm_w = (x_w - mean) * rstd;
+            
+            float grad_norm_x = grad_out_x * w_x;
+            float grad_norm_y = grad_out_y * w_y;
+            float grad_norm_z = grad_out_z * w_z;
+            float grad_norm_w = grad_out_w * w_w;
 
             // grad_input = (grad_normalized - mean_grad_norm - normalized * mean_grad_norm_times_norm) * rstd
-            vec4 g = (grad_norm_v - vec4(mean_grad_norm) - norm_v * vec4(mean_grad_norm_times_norm)) * vec4(rstd);
+            float g_x = (grad_norm_x - mean_grad_norm - norm_x * mean_grad_norm_times_norm) * rstd;
+            float g_y = (grad_norm_y - mean_grad_norm - norm_y * mean_grad_norm_times_norm) * rstd;
+            float g_z = (grad_norm_z - mean_grad_norm - norm_z * mean_grad_norm_times_norm) * rstd;
+            float g_w = (grad_norm_w - mean_grad_norm - norm_w * mean_grad_norm_times_norm) * rstd;
 
             // write input grad (atomic or store)
-            storeVec4Grad(ctx.input_tensor.grad, base_idx + idx, g, remaining, ctx.accumulate_grad == 1u);
+            storeVec4Grad(ctx.input_tensor.grad, base_idx + idx, g_x, g_y, g_z, g_w, remaining, ctx.accumulate_grad == 1u);
 
             // zero out upstream grad
-            // atomic not needed for zeroing since this workgroup owns sample's upstream grads, but use store
             if (remaining >= 1u) ctx.out_tensor.grad.grad[base_idx + idx + 0u] = 0.0;
             if (remaining >= 2u) ctx.out_tensor.grad.grad[base_idx + idx + 1u] = 0.0;
             if (remaining >= 3u) ctx.out_tensor.grad.grad[base_idx + idx + 2u] = 0.0;

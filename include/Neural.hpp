@@ -723,6 +723,58 @@ struct Conv2d3x3 : public Module<T> {
 };
 
 template<typename T>
+struct MaxPool : public Module<T> {
+
+	std::string name;
+	uint32_t kernel_h;
+	uint32_t kernel_w;
+	uint32_t stride_h;
+	uint32_t stride_w;
+	TensorPool<T>* tensorPool;
+
+	uint32_t height, width, channels;
+
+	MaxPool(TensorPool<T>* pool, uint32_t batch_size, uint32_t height, uint32_t width, uint32_t channels, const std::string& name, uint32_t kernel_h = 4, uint32_t kernel_w = 4, uint32_t stride_h = 1, uint32_t stride_w = 1)
+	: tensorPool(pool), kernel_h(kernel_h), kernel_w(kernel_w), stride_h(stride_h), stride_w(stride_w), name(name), height(height), width(width), channels(channels) {
+
+		// basic sanity checks
+		if (kernel_h == 0 || kernel_w == 0) throw std::invalid_argument("MaxPool kernel dimensions must be > 0");
+		if (stride_h == 0 || stride_w == 0) throw std::invalid_argument("MaxPool stride dimensions must be > 0");
+		if (height == 0 || width == 0) throw std::invalid_argument("Input height/width must be > 0");
+		if (channels == 0) throw std::invalid_argument("Channels must be > 0");
+		if (height < kernel_h) throw std::invalid_argument("Input height is smaller than kernel height");
+		if (width  < kernel_w) throw std::invalid_argument("Input width is smaller than kernel width");
+
+		// compute output spatial dimensions using (H - K) / S + 1 (integer division)
+		// flag if there would be a partial/window remainder (could indicate user mistake)
+		uint32_t diff_h = height - kernel_h;
+		uint32_t diff_w = width  - kernel_w;
+		if (diff_h % stride_h != 0) {
+			throw std::invalid_argument("MaxPool configuration produces a non-integer number of steps in height ( (height - kernel_h) % stride_h != 0 )");
+		}
+		if (diff_w % stride_w != 0) {
+			throw std::invalid_argument("MaxPool configuration produces a non-integer number of steps in width ( (width - kernel_w) % stride_w != 0 )");
+		}
+
+		uint32_t out_height = 1 + diff_h / stride_h;
+		uint32_t out_width  = 1 + diff_w / stride_w;
+
+		if (out_height == 0 || out_width == 0) throw std::invalid_argument("Computed output spatial dimensions are zero");
+
+		std::string output_name = name + "-output";
+		this->output = &tensorPool->createTensor({ batch_size, channels, out_height, out_width }, output_name);
+	}
+
+	Tensor<T>* forward(Tensor<T>* input) override {
+		tensorPool->tensor_max_pool(input->name, this->output->name, kernel_h, kernel_w, stride_h, stride_w, 0);
+		return this->output;
+	}
+	void backward(Tensor<T>* input) override {
+		tensorPool->tensor_max_pool(input->name, this->output->name, kernel_h, kernel_w, stride_h, stride_w, 1);
+	}
+};
+
+template<typename T>
 struct EmbeddingTable : public Module<T> {
 	std::string name;
 	uint32_t vocab_size;

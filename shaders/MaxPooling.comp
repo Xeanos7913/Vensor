@@ -1,0 +1,228 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct MaxPoolingContext {
+    TensorImpl input_tensor;    // [B, C, H, W]
+    TensorImpl output_tensor;   // [B, C, H_out, W_out]
+    uint kernel_size_h;
+    uint kernel_size_w;
+    uint stride_h;
+    uint stride_w;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    MaxPoolingContext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;  // 0 = forward, 1 = backward
+} push;
+
+// Kernel types
+const uint KERNEL_FORWARD = 0u;
+const uint KERNEL_BACKWARD = 1u;
+
+// Shared memory for cooperative loading and reduction
+shared float shared_vals[256];
+shared uint shared_indices[256];
+
+// Helper function to compute flat index from 4D coordinates
+uint compute_index_4d(int b, int c, int h, int w, tensor_shape shape_buf, tensor_strides strides_buf) {
+    int stride0 = strides_buf.strides[0];
+    int stride1 = strides_buf.strides[1];
+    int stride2 = strides_buf.strides[2];
+    int stride3 = strides_buf.strides[3];
+    
+    int idx = b * stride0 + c * stride1 + h * stride2 + w * stride3;
+    return uint(idx);
+}
+
+// Check if memory access is contiguous (stride == 1 for innermost dimension)
+bool is_contiguous_w(tensor_strides strides_buf) {
+    return strides_buf.strides[3] == 1;
+}
+
+// Subgroup reduction to find max value and its index
+void subgroup_max_reduce(inout float val, inout uint idx) {
+    // Parallel reduction using subgroup shuffles
+    for (uint offset = gl_SubgroupSize >> 1u; offset > 0u; offset >>= 1u) {
+        float other_val = subgroupShuffleXor(val, offset);
+        uint other_idx = subgroupShuffleXor(idx, offset);
+        
+        if (other_val > val) {
+            val = other_val;
+            idx = other_idx;
+        }
+    }
+}
+
+// Forward pass
+void maxpool_forward() {
+    MaxPoolingContext ctx = push.context.ctx;
+    
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint total_outputs = ctx.output_tensor.numel;
+    
+    if (gid >= total_outputs) return;
+    
+    // Get output dimensions
+    int B = ctx.output_tensor.shape.dims[0];
+    int C = ctx.output_tensor.shape.dims[1];
+    int H_out = ctx.output_tensor.shape.dims[2];
+    int W_out = ctx.output_tensor.shape.dims[3];
+    
+    // Get input dimensions
+    int H_in = ctx.input_tensor.shape.dims[2];
+    int W_in = ctx.input_tensor.shape.dims[3];
+    
+    // Compute 4D coordinates from linear index
+    uint w_out_u = gid % uint(W_out);
+    uint h_out_u = (gid / uint(W_out)) % uint(H_out);
+    uint c_u = (gid / uint(W_out * H_out)) % uint(C);
+    uint b_u = gid / uint(W_out * H_out * C);
+    
+    int w_out = int(w_out_u);
+    int h_out = int(h_out_u);
+    int c = int(c_u);
+    int b = int(b_u);
+    
+    // Compute input region bounds
+    int h_start = h_out * int(ctx.stride_h);
+    int w_start = w_out * int(ctx.stride_w);
+    int h_end = min(h_start + int(ctx.kernel_size_h), H_in);
+    int w_end = min(w_start + int(ctx.kernel_size_w), W_in);
+    
+    int kernel_h = h_end - h_start;
+    int kernel_w = w_end - w_start;
+    int kernel_size = kernel_h * kernel_w;
+    
+    float max_val = -1.0 / 0.0; // -infinity
+    uint max_local_idx = 0u;
+    
+    bool use_vectorized = is_contiguous_w(ctx.input_tensor.strides) && (kernel_w >= 4);
+    
+    if (use_vectorized && ((kernel_w & 3) == 0)) {
+        // Vectorized path: load 4 elements at a time
+        for (int h = h_start; h < h_end; h++) {
+            uint base_idx = compute_index_4d(b, c, h, w_start,
+                                            ctx.input_tensor.shape,
+                                            ctx.input_tensor.strides);
+            
+            for (int w = 0; w < kernel_w; w += 4) {
+                uint idx0 = base_idx + uint(w);
+                uint idx1 = idx0 + 1u;
+                uint idx2 = idx0 + 2u;
+                uint idx3 = idx0 + 3u;
+                
+                float val0 = ctx.input_tensor.data.data[idx0];
+                float val1 = ctx.input_tensor.data.data[idx1];
+                float val2 = ctx.input_tensor.data.data[idx2];
+                float val3 = ctx.input_tensor.data.data[idx3];
+                
+                // Find max
+                uint local_w = uint((h - h_start) * kernel_w + w);
+                if (val0 > max_val) {
+                    max_val = val0;
+                    max_local_idx = local_w;
+                }
+                if (val1 > max_val) {
+                    max_val = val1;
+                    max_local_idx = local_w + 1u;
+                }
+                if (val2 > max_val) {
+                    max_val = val2;
+                    max_local_idx = local_w + 2u;
+                }
+                if (val3 > max_val) {
+                    max_val = val3;
+                    max_local_idx = local_w + 3u;
+                }
+            }
+        }
+    } else {
+        // Scalar path for non-contiguous or small kernels
+        uint local_idx = 0u;
+        for (int h = h_start; h < h_end; h++) {
+            for (int w = w_start; w < w_end; w++) {
+                uint idx = compute_index_4d(b, c, h, w,
+                                           ctx.input_tensor.shape,
+                                           ctx.input_tensor.strides);
+                float val = ctx.input_tensor.data.data[idx];
+                if (val > max_val) {
+                    max_val = val;
+                    max_local_idx = local_idx;
+                }
+                local_idx++;
+            }
+        }
+    }
+    
+    // Use subgroup reduction for large kernels
+    if (kernel_size > int(gl_SubgroupSize)) {
+        subgroup_max_reduce(max_val, max_local_idx);
+        
+        // Only subgroup leader writes to shared memory
+        if (gl_SubgroupInvocationID == 0u) {
+            uint subgroup_id = lid / gl_SubgroupSize;
+            shared_vals[subgroup_id] = max_val;
+            shared_indices[subgroup_id] = max_local_idx;
+        }
+        
+        barrier();
+        
+        // Final reduction across subgroups
+        if (lid == 0u) {
+            uint num_subgroups = (gl_WorkGroupSize.x + gl_SubgroupSize - 1u) / gl_SubgroupSize;
+            for (uint i = 1u; i < num_subgroups; i++) {
+                if (shared_vals[i] > max_val) {
+                    max_val = shared_vals[i];
+                    max_local_idx = shared_indices[i];
+                }
+            }
+        }
+    }
+    
+    // Write output
+    uint out_idx = compute_index_4d(b, c, h_out, w_out,
+                                    ctx.output_tensor.shape,
+                                    ctx.output_tensor.strides);
+    ctx.output_tensor.data.data[out_idx] = max_val;
+}
+
+void main() {
+    maxpool_forward();
+}
