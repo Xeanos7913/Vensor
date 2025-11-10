@@ -1,0 +1,483 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+// Workgroup configuration
+#define TILE 16
+#define OUT_TILE_X 2
+#define OUT_TILE_Y 2
+#define THREADS_X (TILE / OUT_TILE_X)
+#define THREADS_Y (TILE / OUT_TILE_Y)
+
+// Conservative maximums for shared memory allocation
+#define MAX_KERNEL_SIZE 15
+#define MAX_PAD 7
+#define MAX_DILATION 4
+#define MAX_STRIDE 4
+
+// Maximum shared memory dimensions
+#define SHARED_H_MAX (TILE * MAX_STRIDE + (MAX_KERNEL_SIZE - 1) * MAX_DILATION + 1 + MAX_PAD * 2)
+#define SHARED_W_MAX (TILE * MAX_STRIDE + (MAX_KERNEL_SIZE - 1) * MAX_DILATION + 1 + MAX_PAD * 2)
+#define SHARED_W_PAD (SHARED_W_MAX + 1)
+
+layout(local_size_x = THREADS_X, local_size_y = THREADS_Y, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct Conv2dContext {
+    TensorImpl input_tensor;  // [N, C_in, H_in, W_in]
+    TensorImpl weight_tensor; // [C_out, C_in, K_h, K_w]
+    TensorImpl bias_tensor;   // [C_out]
+    TensorImpl out_tensor;    // [N, C_out, H_out, W_out]
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+    uint dilation_h;
+    uint dilation_w;
+    uint kernel_h;
+    uint kernel_w;
+    uint groups;
+    uint accumulate_grad;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    Conv2dContext ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;  // 0: input grad, 1: weight grad, 2: bias grad
+} push;
+
+// Shared memory tile
+shared float sh[SHARED_H_MAX][SHARED_W_PAD];
+
+// Helper function to load 4 floats from gradient buffer (vectorized load)
+void load4_shared(int sh_x, int sh_y, int global_offset, int valid_count, tensor_grad grad_buffer) {
+    vec4 v = vec4(0.0);
+    
+    if (valid_count >= 4) {
+        v.x = grad_buffer.grad[global_offset + 0];
+        v.y = grad_buffer.grad[global_offset + 1];
+        v.z = grad_buffer.grad[global_offset + 2];
+        v.w = grad_buffer.grad[global_offset + 3];
+    } else if (valid_count > 0) {
+        for (int i = 0; i < valid_count; ++i) {
+            v[i] = grad_buffer.grad[global_offset + i];
+        }
+    }
+    
+    sh[sh_y][sh_x + 0] = v.x;
+    sh[sh_y][sh_x + 1] = v.y;
+    sh[sh_y][sh_x + 2] = v.z;
+    sh[sh_y][sh_x + 3] = v.w;
+}
+
+// Helper function to load 4 floats from data buffer (vectorized load)
+void load4_shared_data(int sh_x, int sh_y, int global_offset, int valid_count, tensor_data data_buffer) {
+    vec4 v = vec4(0.0);
+    
+    if (valid_count >= 4) {
+        v.x = data_buffer.data[global_offset + 0];
+        v.y = data_buffer.data[global_offset + 1];
+        v.z = data_buffer.data[global_offset + 2];
+        v.w = data_buffer.data[global_offset + 3];
+    } else if (valid_count > 0) {
+        for (int i = 0; i < valid_count; ++i) {
+            v[i] = data_buffer.data[global_offset + i];
+        }
+    }
+    
+    sh[sh_y][sh_x + 0] = v.x;
+    sh[sh_y][sh_x + 1] = v.y;
+    sh[sh_y][sh_x + 2] = v.z;
+    sh[sh_y][sh_x + 3] = v.w;
+}
+
+// KERNEL 0: Compute gradient w.r.t. input (transposed convolution)
+void compute_input_grad() {
+    Conv2dContext ctx = push.context.ctx;
+    
+    int B = int(ctx.input_tensor.shape.dims[0]);
+    int C_in = int(ctx.input_tensor.shape.dims[1]);
+    int H_in = int(ctx.input_tensor.shape.dims[2]);
+    int W_in = int(ctx.input_tensor.shape.dims[3]);
+    int C_out = int(ctx.weight_tensor.shape.dims[0]);
+    int H_out = int(ctx.out_tensor.shape.dims[2]);
+    int W_out = int(ctx.out_tensor.shape.dims[3]);
+    
+    int stride_h = int(ctx.stride_h);
+    int stride_w = int(ctx.stride_w);
+    int pad_h = int(ctx.pad_h);
+    int pad_w = int(ctx.pad_w);
+    int dilation_h = int(ctx.dilation_h);
+    int dilation_w = int(ctx.dilation_w);
+    int K_h = int(ctx.kernel_h);
+    int K_w = int(ctx.kernel_w);
+    
+    int block_out_x = int(gl_WorkGroupID.x) * TILE;
+    int block_out_y = int(gl_WorkGroupID.y) * TILE;
+    int tx = int(gl_LocalInvocationID.x);
+    int ty = int(gl_LocalInvocationID.y);
+    
+    int out_x0 = block_out_x + tx * OUT_TILE_X;
+    int out_y0 = block_out_y + ty * OUT_TILE_Y;
+    
+    int b = int(gl_WorkGroupID.z) / C_in;
+    int c = int(gl_WorkGroupID.z) % C_in;
+    
+    if (b >= B) return;
+    
+    int grad_out_b_offset = b * C_out * H_out * W_out;
+    int grad_input_b_offset = b * C_in * H_in * W_in;
+    
+    float acc[OUT_TILE_Y][OUT_TILE_X];
+    for (int oy = 0; oy < OUT_TILE_Y; ++oy) {
+        for (int ox = 0; ox < OUT_TILE_X; ++ox) {
+            acc[oy][ox] = 0.0;
+        }
+    }
+    
+    // Calculate shared memory size for grad_output loading
+    int shared_h = TILE + (K_h - 1) * dilation_h;
+    int shared_w = TILE + (K_w - 1) * dilation_w;
+    shared_h = min(shared_h, SHARED_H_MAX);
+    shared_w = min(shared_w, SHARED_W_MAX);
+    
+    // Loop over output channels (filters)
+    for (int f = 0; f < C_out; ++f) {
+        // Load grad_output tile into shared memory
+        // For transposed conv, we need to map input positions to output positions
+        for (int sy = ty; sy < shared_h; sy += THREADS_Y) {
+            int in_y = block_out_y + sy;
+            
+            for (int sx = tx * 4; sx < shared_w; sx += THREADS_X * 4) {
+                // Zero out shared memory first
+                sh[sy][sx + 0] = 0.0;
+                sh[sy][sx + 1] = 0.0;
+                sh[sy][sx + 2] = 0.0;
+                sh[sy][sx + 3] = 0.0;
+                
+                // For each input position, determine if it corresponds to valid output positions
+                for (int v = 0; v < 4; ++v) {
+                    int in_x = block_out_x + sx + v;
+                    
+                    // Check if this input position aligns with stride
+                    int out_y_candidate = (in_y + pad_h);
+                    int out_x_candidate = (in_x + pad_w);
+                    
+                    if (out_y_candidate % stride_h == 0 && out_x_candidate % stride_w == 0) {
+                        int out_y = out_y_candidate / stride_h;
+                        int out_x = out_x_candidate / stride_w;
+                        
+                        if (out_y >= 0 && out_y < H_out && out_x >= 0 && out_x < W_out) {
+                            int global_offset = grad_out_b_offset + f * H_out * W_out + out_y * W_out + out_x;
+                            sh[sy][sx + v] = ctx.out_tensor.grad.grad[global_offset];
+                        }
+                    }
+                }
+            }
+        }
+        
+        barrier();
+        
+        // Convolve with transposed/flipped kernel
+        int kbase = (f * C_in + c) * K_h * K_w;
+        
+        for (int oy = 0; oy < OUT_TILE_Y; ++oy) {
+            for (int ox = 0; ox < OUT_TILE_X; ++ox) {
+                int in_y = out_y0 + oy;
+                int in_x = out_x0 + ox;
+                
+                if (in_y >= H_in || in_x >= W_in) continue;
+                
+                int sy = in_y - block_out_y;
+                int sx = in_x - block_out_x;
+                
+                float sum = 0.0;
+                
+                // Transposed convolution: flip kernel indices
+                for (int ky = 0; ky < K_h; ++ky) {
+                    for (int kx = 0; kx < K_w; ++kx) {
+                        int sh_y = sy + ky * dilation_h;
+                        int sh_x = sx + kx * dilation_w;
+                        
+                        if (sh_y >= 0 && sh_y < shared_h && sh_x >= 0 && sh_x < shared_w) {
+                            // Flip kernel: (K_h-1-ky, K_w-1-kx)
+                            int k_idx = kbase + (K_h - 1 - ky) * K_w + (K_w - 1 - kx);
+                            sum += sh[sh_y][sh_x] * ctx.weight_tensor.data.data[k_idx];
+                        }
+                    }
+                }
+                
+                acc[oy][ox] += sum;
+            }
+        }
+        
+        barrier();
+    }
+    
+    // Write grad_input
+    for (int oy = 0; oy < OUT_TILE_Y; ++oy) {
+        int out_y = out_y0 + oy;
+        if (out_y < 0 || out_y >= H_in) continue;
+        
+        for (int ox = 0; ox < OUT_TILE_X; ++ox) {
+            int out_x = out_x0 + ox;
+            if (out_x < 0 || out_x >= W_in) continue;
+            
+            int out_idx = grad_input_b_offset + c * (H_in * W_in) + out_y * W_in + out_x;
+            atomicAdd(ctx.input_tensor.grad.grad[out_idx], acc[oy][ox]);
+        }
+    }
+}
+
+// KERNEL 1: Compute gradient w.r.t. weights
+void compute_weight_grad() {
+    Conv2dContext ctx = push.context.ctx;
+    
+    int B = int(ctx.input_tensor.shape.dims[0]);
+    int C_in = int(ctx.input_tensor.shape.dims[1]);
+    int H_in = int(ctx.input_tensor.shape.dims[2]);
+    int W_in = int(ctx.input_tensor.shape.dims[3]);
+    int C_out = int(ctx.weight_tensor.shape.dims[0]);
+    int H_out = int(ctx.out_tensor.shape.dims[2]);
+    int W_out = int(ctx.out_tensor.shape.dims[3]);
+    
+    int stride_h = int(ctx.stride_h);
+    int stride_w = int(ctx.stride_w);
+    int pad_h = int(ctx.pad_h);
+    int pad_w = int(ctx.pad_w);
+    int dilation_h = int(ctx.dilation_h);
+    int dilation_w = int(ctx.dilation_w);
+    int K_h = int(ctx.kernel_h);
+    int K_w = int(ctx.kernel_w);
+    
+    int block_out_x = int(gl_WorkGroupID.x) * TILE;
+    int block_out_y = int(gl_WorkGroupID.y) * TILE;
+    int tx = int(gl_LocalInvocationID.x);
+    int ty = int(gl_LocalInvocationID.y);
+    
+    int out_x0 = block_out_x + tx * OUT_TILE_X;
+    int out_y0 = block_out_y + ty * OUT_TILE_Y;
+    
+    int b = int(gl_WorkGroupID.z) / C_out;
+    int f = int(gl_WorkGroupID.z) % C_out;
+    
+    if (b >= B) return;
+    
+    int input_b_offset = b * C_in * H_in * W_in;
+    int grad_out_b_offset = b * C_out * H_out * W_out;
+    
+    // Dynamically allocate accumulator for kernel gradient
+    // Using a flat array to avoid deep nesting and register pressure
+    const int MAX_K = MAX_KERNEL_SIZE * MAX_KERNEL_SIZE;
+    float grad_k_flat[MAX_K];
+    
+    // Initialize gradient accumulator
+    for (int i = 0; i < K_h * K_w; ++i) {
+        grad_k_flat[i] = 0.0;
+    }
+    
+    // Calculate shared memory size needed
+    int kernel_h_eff = (K_h - 1) * dilation_h + 1;
+    int kernel_w_eff = (K_w - 1) * dilation_w + 1;
+    int shared_h = TILE * stride_h + kernel_h_eff - stride_h + pad_h * 2;
+    int shared_w = TILE * stride_w + kernel_w_eff - stride_w + pad_w * 2;
+    shared_h = min(shared_h, SHARED_H_MAX);
+    shared_w = min(shared_w, SHARED_W_MAX);
+    
+    // Loop over input channels
+    for (int c = 0; c < C_in; ++c) {
+        // Load input tile into shared memory
+        int in_y_start = block_out_y * stride_h - pad_h;
+        int in_x_start = block_out_x * stride_w - pad_w;
+        
+        for (int sy = ty; sy < shared_h; sy += THREADS_Y) {
+            int in_y = in_y_start + sy;
+            
+            for (int sx = tx * 4; sx < shared_w; sx += THREADS_X * 4) {
+                int in_x = in_x_start + sx;
+                
+                int valid = 0;
+                if (in_y >= 0 && in_y < H_in) {
+                    if (in_x >= 0 && in_x + 3 < W_in) {
+                        valid = 4;
+                    } else if (in_x >= 0 && in_x < W_in) {
+                        valid = W_in - in_x;
+                    }
+                }
+                
+                if (valid > 0) {
+                    int global_offset = input_b_offset + c * H_in * W_in + in_y * W_in + in_x;
+                    load4_shared_data(sx, sy, global_offset, valid, ctx.input_tensor.data);
+                } else {
+                    sh[sy][sx + 0] = 0.0;
+                    sh[sy][sx + 1] = 0.0;
+                    sh[sy][sx + 2] = 0.0;
+                    sh[sy][sx + 3] = 0.0;
+                }
+            }
+        }
+        
+        barrier();
+        
+        // Compute weight gradient contribution
+        for (int oy = 0; oy < OUT_TILE_Y; ++oy) {
+            int out_y = out_y0 + oy;
+            if (out_y < 0 || out_y >= H_out) continue;
+            
+            for (int ox = 0; ox < OUT_TILE_X; ++ox) {
+                int out_x = out_x0 + ox;
+                if (out_x < 0 || out_x >= W_out) continue;
+                
+                // Position in shared memory
+                int sy_base = (out_y - block_out_y) * stride_h + pad_h;
+                int sx_base = (out_x - block_out_x) * stride_w + pad_w;
+                
+                // Load grad_output value
+                int grad_idx = grad_out_b_offset + f * (H_out * W_out) + out_y * W_out + out_x;
+                float grad_out_val = ctx.out_tensor.grad.grad[grad_idx];
+                
+                // Accumulate gradient for each kernel position with dilation
+                for (int ky = 0; ky < K_h; ++ky) {
+                    for (int kx = 0; kx < K_w; ++kx) {
+                        int k_flat_idx = ky * K_w + kx;
+                        int sh_y = sy_base + ky * dilation_h;
+                        int sh_x = sx_base + kx * dilation_w;
+                        
+                        if (sh_y >= 0 && sh_y < shared_h && sh_x >= 0 && sh_x < shared_w) {
+                            grad_k_flat[k_flat_idx] += sh[sh_y][sh_x] * grad_out_val;
+                        }
+                    }
+                }
+            }
+        }
+        
+        barrier();
+        
+        // Write weight gradients using atomic operations
+        int kbase = (f * C_in + c) * K_h * K_w;
+        for (int k_idx = 0; k_idx < K_h * K_w; ++k_idx) {
+            if (grad_k_flat[k_idx] != 0.0) {
+                atomicAdd(ctx.weight_tensor.grad.grad[kbase + k_idx], grad_k_flat[k_idx]);
+            }
+            grad_k_flat[k_idx] = 0.0; // Reset for next channel
+        }
+    }
+}
+
+// Shared memory for reduction
+shared float reduction[THREADS_X * THREADS_Y];
+
+// KERNEL 2: Compute gradient w.r.t. bias
+void compute_bias_grad() {
+    Conv2dContext ctx = push.context.ctx;
+    
+    int B = int(ctx.input_tensor.shape.dims[0]);
+    int H_out = int(ctx.out_tensor.shape.dims[2]);
+    int W_out = int(ctx.out_tensor.shape.dims[3]);
+    int C_out = int(ctx.weight_tensor.shape.dims[0]);
+    
+    // Each workgroup handles one filter's bias gradient
+    int f = int(gl_WorkGroupID.x);
+    if (f >= C_out) return;
+    
+    int local_id = int(gl_LocalInvocationID.x) + int(gl_LocalInvocationID.y) * THREADS_X;
+    int local_size = THREADS_X * THREADS_Y;
+    
+    float sum = 0.0;
+    
+    // Sum all grad_output values for this filter across all batches
+    for (int b = 0; b < B; ++b) {
+        int grad_out_offset = b * C_out * H_out * W_out + f * H_out * W_out;
+        
+        for (int idx = local_id; idx < H_out * W_out; idx += local_size) {
+            sum += ctx.out_tensor.grad.grad[grad_out_offset + idx];
+        }
+    }
+    
+    // Reduce within workgroup using shared memory
+    reduction[local_id] = sum;
+    barrier();
+    
+    // Tree reduction
+    for (int stride = local_size / 2; stride > 0; stride /= 2) {
+        if (local_id < stride) {
+            reduction[local_id] += reduction[local_id + stride];
+        }
+        barrier();
+    }
+    
+    // Write result
+    if (local_id == 0) {
+        atomicAdd(ctx.bias_tensor.grad.grad[f], reduction[0]);
+    }
+}
+
+// Optional: Zero out grad_output after bias computation
+void zero_grad_output() {
+    Conv2dContext ctx = push.context.ctx;
+    
+    int B = int(ctx.input_tensor.shape.dims[0]);
+    int H_out = int(ctx.out_tensor.shape.dims[2]);
+    int W_out = int(ctx.out_tensor.shape.dims[3]);
+    int C_out = int(ctx.weight_tensor.shape.dims[0]);
+    
+    int f = int(gl_WorkGroupID.x);
+    if (f >= C_out) return;
+    
+    int local_id = int(gl_LocalInvocationID.x) + int(gl_LocalInvocationID.y) * THREADS_X;
+    int local_size = THREADS_X * THREADS_Y;
+    
+    for (int b = 0; b < B; ++b) {
+        int grad_out_offset = b * C_out * H_out * W_out + f * H_out * W_out;
+        
+        for (int idx = local_id; idx < H_out * W_out; idx += local_size) {
+            ctx.out_tensor.grad.grad[grad_out_offset + idx] = 0.0;
+        }
+    }
+}
+
+void main() {
+    if (push.kernel_type == 0) {
+        compute_input_grad();
+    } else if (push.kernel_type == 1) {
+        compute_weight_grad();
+    } else if (push.kernel_type == 2) {
+        compute_bias_grad();
+    } else if (push.kernel_type == 3) {
+        zero_grad_output();
+    }
+}

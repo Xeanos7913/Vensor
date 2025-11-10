@@ -29,6 +29,7 @@ struct TensorFillContext {
     uint m, n;
     float min;
     float max;
+    uint seed;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer {
@@ -42,8 +43,6 @@ layout(push_constant) uniform PushConstants {
 } push;
 
 // ---------------- RNG helpers ----------------
-const uint GPU_SEED = 0xA511E9B5u;
-
 uint finalizer32(uint x) {
     x ^= x >> 16u;
     x *= 0x7feb352du;
@@ -91,12 +90,12 @@ void main() {
 
     if (index >= tensor.numel) return;
 
-    uint seed = make_seed(GPU_SEED, index, gid);
+    uint seed = make_seed(ctx.seed, index, gid);
     float val;
 
     if (ctx.type == 0u) {
         float mean = (ctx.min + ctx.max) * 0.5;
-        float stddev = (ctx.max - ctx.min) / 6.0;
+        float stddev = 1.0;
         val = clamp(random_gaussian(seed, mean, stddev), ctx.min, ctx.max);
     } else {
         val = ctx.min + random_uniform(seed) * (ctx.max - ctx.min);

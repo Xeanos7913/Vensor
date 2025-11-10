@@ -1,0 +1,189 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_WG 256
+#define WARP_SIZE 32
+#define TILE_SIZE 4
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct KLD_loss {
+    TensorImpl mu_tensor;
+    TensorImpl logvar_tensor;
+    TensorImpl loss_tensor;
+    uint batch_size;
+    uint elements_per_batch;
+    float beta;
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    KLD_loss ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;
+} push;
+
+// Shared memory for subgroup reduction
+shared float shmem[MAX_WG / WARP_SIZE];
+
+// Optimized block-level reduction using subgroups
+float blockReduceSum(float val) {
+    uint tid = gl_LocalInvocationID.x;
+    uint warp_id = tid / WARP_SIZE;
+    uint lane_id = tid % WARP_SIZE;
+    
+    // Warp-level reduction using subgroup intrinsics
+    val = subgroupAdd(val);
+    
+    // First thread in each warp writes to shared memory
+    if (lane_id == 0) {
+        shmem[warp_id] = val;
+    }
+    
+    barrier();
+    
+    // First warp reduces the partial sums
+    if (warp_id == 0) {
+        val = (tid < (MAX_WG / WARP_SIZE)) ? shmem[lane_id] : 0.0;
+        val = subgroupAdd(val);
+    }
+    
+    return val;
+}
+
+void main() {
+    KLD_loss ctx = push.context.ctx;
+    
+    uint batch_idx = gl_WorkGroupID.z;
+    uint tid = gl_LocalInvocationID.x;
+    uint block_id = gl_WorkGroupID.x;
+    uint global_tid = block_id * gl_WorkGroupSize.x + tid;
+    
+    uint elements_per_batch = ctx.elements_per_batch;
+    uint batch_offset = batch_idx * elements_per_batch;
+    
+    // Thread-local accumulator for loss
+    float local_sum = 0.0;
+    
+    // Gradient scaling factor: -0.5 * beta
+    float grad_scale = -0.5 * ctx.beta;
+    
+    // Vectorized loading: each thread processes TILE_SIZE elements
+    uint base_idx = global_tid * TILE_SIZE;
+    
+    // Process vec4 of elements per thread
+    if (base_idx + TILE_SIZE <= elements_per_batch) {
+        // Full vectorized load
+        vec4 mu_vec = vec4(
+            ctx.mu_tensor.data.data[batch_offset + base_idx],
+            ctx.mu_tensor.data.data[batch_offset + base_idx + 1],
+            ctx.mu_tensor.data.data[batch_offset + base_idx + 2],
+            ctx.mu_tensor.data.data[batch_offset + base_idx + 3]
+        );
+        
+        vec4 logvar_vec = vec4(
+            ctx.logvar_tensor.data.data[batch_offset + base_idx],
+            ctx.logvar_tensor.data.data[batch_offset + base_idx + 1],
+            ctx.logvar_tensor.data.data[batch_offset + base_idx + 2],
+            ctx.logvar_tensor.data.data[batch_offset + base_idx + 3]
+        );
+        
+        // Element-wise operation: 1 + logvar - mu*mu - exp(logvar)
+        vec4 result = vec4(1.0) + logvar_vec - mu_vec * mu_vec - exp(logvar_vec);
+        
+        // Thread-local reduction of vec4
+        local_sum = result.x + result.y + result.z + result.w;
+        
+        // Compute gradients
+        // d(loss)/d(mu) = -0.5 * beta * d(sum)/d(mu) = -0.5 * beta * (-2 * mu) = beta * mu
+        // d(loss)/d(logvar) = -0.5 * beta * d(sum)/d(logvar) = -0.5 * beta * (1 - exp(logvar))
+        
+        vec4 mu_grad = grad_scale * (-2.0 * mu_vec);  // = beta * mu
+        vec4 logvar_grad = grad_scale * (vec4(1.0) - exp(logvar_vec));
+        
+        // Write gradients back (atomically accumulate)
+        if (ctx.mu_tensor.requires_grad != 0) {
+            atomicAdd(ctx.mu_tensor.grad.grad[batch_offset + base_idx], mu_grad.x);
+            atomicAdd(ctx.mu_tensor.grad.grad[batch_offset + base_idx + 1], mu_grad.y);
+            atomicAdd(ctx.mu_tensor.grad.grad[batch_offset + base_idx + 2], mu_grad.z);
+            atomicAdd(ctx.mu_tensor.grad.grad[batch_offset + base_idx + 3], mu_grad.w);
+        }
+        
+        if (ctx.logvar_tensor.requires_grad != 0) {
+            atomicAdd(ctx.logvar_tensor.grad.grad[batch_offset + base_idx], logvar_grad.x);
+            atomicAdd(ctx.logvar_tensor.grad.grad[batch_offset + base_idx + 1], logvar_grad.y);
+            atomicAdd(ctx.logvar_tensor.grad.grad[batch_offset + base_idx + 2], logvar_grad.z);
+            atomicAdd(ctx.logvar_tensor.grad.grad[batch_offset + base_idx + 3], logvar_grad.w);
+        }
+    } else {
+        // Handle tail elements
+        for (uint i = 0; i < TILE_SIZE; ++i) {
+            uint idx = base_idx + i;
+            if (idx < elements_per_batch) {
+                float mu = ctx.mu_tensor.data.data[batch_offset + idx];
+                float logvar = ctx.logvar_tensor.data.data[batch_offset + idx];
+                
+                // Forward pass
+                local_sum += 1.0 + logvar - mu * mu - exp(logvar);
+                
+                // Backward pass - compute and accumulate gradients
+                if (ctx.mu_tensor.requires_grad != 0) {
+                    float mu_grad = grad_scale * (-2.0 * mu);
+                    atomicAdd(ctx.mu_tensor.grad.grad[batch_offset + idx], mu_grad);
+                }
+                
+                if (ctx.logvar_tensor.requires_grad != 0) {
+                    float logvar_grad = grad_scale * (1.0 - exp(logvar));
+                    atomicAdd(ctx.logvar_tensor.grad.grad[batch_offset + idx], logvar_grad);
+                }
+            }
+        }
+    }
+    
+    // Block-level reduction using subgroups
+    float block_sum = blockReduceSum(local_sum);
+    
+    // First thread writes the loss result
+    if (tid == 0) {
+        // Apply beta scaling and -0.5 factor: loss = -0.5 * beta * sum
+        float loss_value = -0.5 * ctx.beta * block_sum;
+        
+        // Atomic add to accumulate partial sums from all blocks
+        atomicAdd(ctx.loss_tensor.data.data[batch_idx], loss_value);
+    }
+}

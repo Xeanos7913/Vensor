@@ -279,6 +279,42 @@ struct tensor_conv2d_3x3_context {
     uint accumulate_grad;
 };
 
+struct tensor_conv2d_context {
+    tensor_impl input_tensor;  // [N, C_in, H_in, W_in]
+    tensor_impl weight_tensor; // [C_out, C_in, K_h, K_w]
+    tensor_impl bias_tensor;   // [C_out]
+    tensor_impl out_tensor;    // [N, C_out, H_out, W_out]
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+    uint dilation_h;
+    uint dilation_w;
+    uint kernel_h;            // Dynamic kernel height
+    uint kernel_w;            // Dynamic kernel width
+    uint groups;
+    uint accumulate_grad;
+};
+
+struct tensor_transposed_conv2d_context {
+    tensor_impl input_tensor;  // [N, C_in, H_in, W_in] - smaller input
+    tensor_impl weight_tensor; // [C_in, C_out, K_h, K_w] - note: C_in first for transposed conv
+    tensor_impl bias_tensor;   // [C_out]
+    tensor_impl out_tensor;    // [N, C_out, H_out, W_out] - larger output
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+    uint dilation_h;
+    uint dilation_w;
+    uint kernel_h;            // Dynamic kernel height
+    uint kernel_w;            // Dynamic kernel width
+    uint output_pad_h;        // Output padding for transposed conv
+    uint output_pad_w;
+    uint groups;
+    uint accumulate_grad;
+};
+
 struct tensor_max_pool_context {
     tensor_impl input_tensor;    // [B, C, H, W]
     tensor_impl output_tensor;   // [B, C, H_out, W_out]
@@ -299,10 +335,11 @@ struct tensor_fill_uniform_address {
 template<typename T>
 struct tensor_fill_rand_uniform_address {
 	tensor_impl tensor;
-	uint32_t type; // 0 = float, 1 = int, 2 = uint
+	uint32_t type; // 0 = gaussian, 1 = uniform
     uint32_t m, n;
 	T min;
     T max;
+    uint seed;
 };
 
 template<typename T>
@@ -811,9 +848,17 @@ struct TensorPool {
             embedLookupShaderBackward(
                 readShaderBytecode("compiled_shaders/Embedding_table_backward.comp.spv"), alloc, nullptr),
             conv2dShader3x3(
-                readShaderBytecode("compiled_shaders/Conv2d3x3.comp.spv"), alloc, tile_size),
+                readShaderBytecode("compiled_shaders/Conv2d3x3.comp.spv"), alloc, nullptr),
             conv2dShader3x3Backward(
-                readShaderBytecode("compiled_shaders/Conv2d3x3_backward.comp.spv"), alloc, tile_size),
+                readShaderBytecode("compiled_shaders/Conv2d3x3_backward.comp.spv"), alloc, nullptr),
+            conv2dShader(
+                readShaderBytecode("compiled_shaders/Conv2d.comp.spv"), alloc, nullptr),
+            conv2dShaderBackward(
+                readShaderBytecode("compiled_shaders/Conv2d_backward.comp.spv"), alloc, nullptr),
+            transposedConv2dShader(
+                readShaderBytecode("compiled_shaders/Conv2d_Transposed.comp.spv"), alloc, nullptr),
+            transposedConv2dShaderBackward(
+                readShaderBytecode("compiled_shaders/Conv2d_Transposed_backward.comp.spv"), alloc, nullptr),
             maxPoolShader(
                 readShaderBytecode("compiled_shaders/MaxPooling.comp.spv"), alloc, tile_size),
             maxPoolShaderBackward(
@@ -1053,6 +1098,210 @@ struct TensorPool {
             }
         }
     };
+
+    // general MxN convolution supporting kernel sizes up to 15x15
+    void tensor_conv2d(const std::string& output_tensor, const std::string& input_tensor, const std::string& weight_tensor, const std::string& bias_tensor, uint32_t kernel_h, uint32_t kernel_w, uint32_t mode = 0,
+        uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1, uint32_t groups = 1) {
+        tensor_conv2d_context uniform{};
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+        uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+        uniform.out_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.stride_h = stride_h;
+        uniform.stride_w = stride_w;
+        uniform.pad_h = pad_h;
+        uniform.pad_w = pad_w;
+        uniform.dilation_h = dilation_h;
+        uniform.dilation_w = dilation_w;
+        uniform.kernel_h = kernel_h;
+        uniform.kernel_w = kernel_w;
+        uniform.groups = groups;
+        uniform.accumulate_grad = 1; // accumulate gradients
+
+        DEBUG_PRINT("Conv2D tensor " << input_tensor << " with weights from " << weight_tensor << " into " << output_tensor);
+        
+        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        
+        tensor_push_const pushConsts{};
+        if (mode == 0) {
+            uint32_t groupX = cielDiv(tensors[output_tensor]->shape[3], 16u); // W_out
+            uint32_t groupY = cielDiv(tensors[output_tensor]->shape[2], 16u); // H_out
+            uint32_t groupZ = tensors[output_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * Filters
+
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
+            pushConsts.mode = mode; // forward pass
+            pushConsts.uniformAddress = conv2dShader.uniformBuffer->getBufferAddress();
+            pushConsts.grid_size = { groupX, groupY, groupZ };
+            conv2dShader.loadUniform(uniform, pushConsts);
+            conv2dShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            pushConsts.uniformAddress = conv2dShaderBackward.uniformBuffer->getBufferAddress();
+            
+            // Kernel 0: Compute gradient w.r.t. input
+            {
+                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
+                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
+                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[input_tensor]->shape[1]; // batch * C_in
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                
+                pushConsts.grid_size = { groupX, groupY, groupZ };
+                pushConsts.mode = 0; // input gradient
+                conv2dShaderBackward.loadUniform(uniform, pushConsts);
+                conv2dShaderBackward.execute(workgroup);
+            }
+            
+            // Kernel 1: Compute gradient w.r.t. weights
+            {
+                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
+                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
+                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * F
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                
+                pushConsts.grid_size = { groupX, groupY, groupZ };
+                pushConsts.mode = 1; // weight gradient
+                conv2dShaderBackward.loadUniform(uniform, pushConsts);
+                conv2dShaderBackward.execute(workgroup);
+            }
+            
+            // Kernel 2: Compute gradient w.r.t. bias
+            {
+                uint32_t groupX = tensors[weight_tensor]->shape[0]; // F (num filters)
+                uint32_t groupY = 1;
+                uint32_t groupZ = 1;
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                
+                pushConsts.grid_size = { groupX, groupY, groupZ };
+                pushConsts.mode = 2; // bias gradient
+                conv2dShaderBackward.loadUniform(uniform, pushConsts);
+                conv2dShaderBackward.execute(workgroup);
+            }
+            
+            // Kernel 3: Zero out upstream gradient
+            {
+                uint32_t groupX = tensors[weight_tensor]->shape[0]; // F (num filters)
+                uint32_t groupY = 1;
+                uint32_t groupZ = 1;
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                
+                pushConsts.grid_size = { groupX, groupY, groupZ };
+                pushConsts.mode = 3; // zero out upstream gradients
+                conv2dShaderBackward.loadUniform(uniform, pushConsts);
+                conv2dShaderBackward.execute(workgroup);
+            }
+        }
+    };
+
+    // general transposed (de)conv2d supporting dynamic kernel sizes
+    void tensor_transposed_conv2d(const std::string& output_tensor,
+                                const std::string& input_tensor,
+                                const std::string& weight_tensor,
+                                const std::string& bias_tensor,
+                                uint32_t kernel_h, uint32_t kernel_w,
+                                uint32_t mode = 0,
+                                uint32_t stride_w = 1, uint32_t stride_h = 1,
+                                uint32_t pad_h = 0, uint32_t pad_w = 0,
+                                uint32_t dilation_h = 1, uint32_t dilation_w = 1,
+                                uint32_t output_pad_h = 0, uint32_t output_pad_w = 0,
+                                uint32_t groups = 1) {
+        tensor_transposed_conv2d_context uniform{};
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();   // [N, C_in, H_in, W_in]
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl(); // [C_in, C_out, K_h, K_w]
+        uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();     // [C_out]
+        uniform.out_tensor = tensors[output_tensor]->getTensorImpl();    // [N, C_out, H_out, W_out]
+        uniform.stride_h = stride_h;
+        uniform.stride_w = stride_w;
+        uniform.pad_h = pad_h;
+        uniform.pad_w = pad_w;
+        uniform.dilation_h = dilation_h;
+        uniform.dilation_w = dilation_w;
+        uniform.kernel_h = kernel_h;
+        uniform.kernel_w = kernel_w;
+        uniform.output_pad_h = output_pad_h;
+        uniform.output_pad_w = output_pad_w;
+        uniform.groups = groups;
+        uniform.accumulate_grad = 1; // accumulate gradients
+
+        DEBUG_PRINT("TransposedConv2D tensor " << input_tensor << " with weights from " << weight_tensor << " into " << output_tensor);
+
+        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        tensor_push_const pushConsts{};
+        if (mode == 0) {
+            // Forward pass: map threads over output spatial dims and output channels
+            uint32_t groupX = cielDiv(tensors[output_tensor]->shape[3], 16u); // W_out
+            uint32_t groupY = cielDiv(tensors[output_tensor]->shape[2], 16u); // H_out
+            // output channels (C_out) are weight_tensor->shape[1] per your struct
+            uint32_t groupZ = tensors[output_tensor]->shape[0] * tensors[weight_tensor]->shape[1]; // batch * C_out
+
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
+            pushConsts.mode = 0; // forward
+            pushConsts.uniformAddress = transposedConv2dShader.uniformBuffer->getBufferAddress();
+            pushConsts.grid_size = { groupX, groupY, groupZ };
+            transposedConv2dShader.loadUniform(uniform, pushConsts);
+            transposedConv2dShader.execute(workgroup);
+        }
+        else if (mode == 1) {
+            const uint32_t TILE = 16u;
+            pushConsts.uniformAddress = transposedConv2dShaderBackward.uniformBuffer->getBufferAddress();
+
+            // Kernel 0: gradient w.r.t. input (smaller input spatial)
+            {
+                uint32_t H_in = tensors[input_tensor]->shape[2];
+                uint32_t W_in = tensors[input_tensor]->shape[3];
+                uint32_t B = tensors[input_tensor]->shape[0];
+                uint32_t C_in = tensors[input_tensor]->shape[1];
+
+                uint32_t grid_x = cielDiv(H_in, TILE); // tile over height
+                uint32_t grid_y = cielDiv(W_in, TILE); // tile over width
+                uint32_t grid_z = B * C_in;            // batch * C_in
+
+                uint32_t workgroup[3] = { grid_x, grid_y, grid_z };
+                pushConsts.grid_size = { grid_x, grid_y, grid_z };
+                pushConsts.mode = 0; // input gradient
+                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
+                transposedConv2dShaderBackward.execute(workgroup);
+            }
+
+            // Kernel 1: gradient w.r.t. weights
+            {
+                uint32_t H_out = tensors[output_tensor]->shape[2];
+                uint32_t W_out = tensors[output_tensor]->shape[3];
+                uint32_t B = tensors[input_tensor]->shape[0];
+                uint32_t C_in = tensors[input_tensor]->shape[1];
+
+                uint32_t grid_x = cielDiv(H_out, TILE); // tile over output height
+                uint32_t grid_y = cielDiv(W_out, TILE); // tile over output width
+                uint32_t grid_z = B * C_in;             // batch * C_in (note: C_in, not C_out)
+
+                uint32_t workgroup[3] = { grid_x, grid_y, grid_z };
+                pushConsts.grid_size = { grid_x, grid_y, grid_z };
+                pushConsts.mode = 1; // weight gradient
+                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
+                transposedConv2dShaderBackward.execute(workgroup);
+            }
+
+            // Kernel 2: gradient w.r.t. bias
+            {
+                uint32_t C_out = tensors[weight_tensor]->shape[1]; // C_out
+                uint32_t workgroup[3] = { C_out, 1u, 1u };
+                pushConsts.grid_size = { C_out, 1u, 1u };
+                pushConsts.mode = 2; // bias gradient
+                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
+                transposedConv2dShaderBackward.execute(workgroup);
+            }
+
+            // Kernel 3: Zero out upstream gradient
+            {
+                uint32_t C_out = tensors[weight_tensor]->shape[1]; // C_out
+                uint32_t workgroup[3] = { C_out, 1u, 1u };
+                pushConsts.grid_size = { C_out, 1u, 1u };
+                pushConsts.mode = 3; // zero upstream grads
+                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
+                transposedConv2dShaderBackward.execute(workgroup);
+            }
+        }
+    }
 
     void tensor_max_pool(const std::string& input_tensor, const std::string& output_tensor, uint32_t kernel_h, uint32_t kernel_w, uint32_t stride_h, uint32_t stride_w, uint32_t mode = 0){
         tensor_max_pool_context uniform;
@@ -2154,6 +2403,11 @@ struct TensorPool {
 
         uniform.max = max;
         uniform.min = min;
+        uniform.type = 0; // gaussian
+
+        std::random_device rd; // random seed
+        uniform.seed = static_cast<uint>(rd());
+        
         tensor_push_const p;
         p.uniformAddress = fillRandomShader.uniformBuffer->getBufferAddress();
 
@@ -2290,6 +2544,10 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, tensor_fill_rand_uniform_address<T>> fillRandomShader; // fills tensor with random values
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3; // computes 2D convolution with 3x3 kernel
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3Backward; // computes 2D convolution with 3x3 kernel backward pass
+    gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_context> conv2dShader;    // generalized conv2d shader. Supports any kernel size up to 15x15
+    gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_context> conv2dShaderBackward;    // generalized conv2d backward shader. Supports any kernel size up to 15x15
+    gpuTaskNoDesc<T, tensor_push_const, tensor_transposed_conv2d_context> transposedConv2dShader;   // generalized transposed conv2d shader.
+    gpuTaskNoDesc<T, tensor_push_const, tensor_transposed_conv2d_context> transposedConv2dShaderBackward;   // generalized transposed conv2d backward shader.
     gpuTaskNoDesc<T, tensor_push_const, tensor_max_pool_context> maxPoolShader;     // computes maxPool2D with any kernel shape
     gpuTaskNoDesc<T, tensor_push_const, tensor_max_pool_context> maxPoolShaderBackward;     // computes maxPool2D's backward pass with any kernel shape
 };

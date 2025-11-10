@@ -4,7 +4,7 @@ This main file contains some testing code (in the commented out parts) and an ex
 
 #include <iostream>
 #include <fstream>
-#define DEBUG
+//#define DEBUG
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/VkCalcium.hpp"
@@ -367,19 +367,19 @@ int main(void) {
 	Allocator* allocator = new Allocator(&init);
 	TensorPool<float> tensorPool(allocator);
 
-	auto &input = tensorPool.createTensor({16, 32, 32}, "input");
-	tensorPool.tensor_fill_random("input", -1.0f, 1.0f);
-	auto batchnorm = Layernorm<float>(&tensorPool, {16, 32, 32}, {32, 32}, "batchnorm");
-	auto batchnorm2 = Layernorm<float>(&tensorPool, {16, 32, 32}, {32, 32}, "batchnorm2");
+	auto &input = tensorPool.createTensor({1, 512}, "input");
+	tensorPool.tensor_fill_random("input", -5.0f, 5.0f);
+	auto batchnorm = Layernorm<float>(&tensorPool, {1, 512}, {512}, "batchnorm");
+	//auto batchnorm2 = Layernorm<float>(&tensorPool, {16, 32, 32}, {32, 32}, "batchnorm2");
 
 	batchnorm.forward(&input);
-	batchnorm2.forward(batchnorm.output);
+	//batchnorm2.forward(batchnorm.output);
 
-	batchnorm2.backward(batchnorm.output);
-	batchnorm.backward(&input);
+	//batchnorm2.backward(batchnorm.output);
+	//batchnorm.backward(&input);
 
-	batchnorm2.save_mean->print();
-	batchnorm2.save_rstd->print();
+	batchnorm.save_mean->print();
+	batchnorm.save_rstd->print();
 	
 	delete allocator;
 	return 0;
@@ -480,6 +480,7 @@ int main(void){
 */
 
 // A handwritten digit recognision neural network
+/*
 struct Trainer {
 	
 	// Vulkan stuff:
@@ -598,6 +599,39 @@ int main(void){
 
 	return 0;
 }
+*/
+
+// Handwritten image generation model using a VAE
+
+struct Trainer {
+
+	Init init;
+	Allocator* allocator;
+	TensorPool<float> tensorPool;
+
+	MNISTDataloader<float> dataLoader;
+
+	Sequential<float> sequence;
+	MSEloss<float> mseLoss;
+
+	Trainer() {
+		device_initialization(init);
+		allocator = new Allocator(&init);
+		tensorPool = TensorPool<float>(allocator);
+		dataLoader = MNISTDataloader<float>(&tensorPool, 16, 200);
+
+		// build the VAE encoder-decoder
+		{
+			// encode
+			auto encoder = std::make_unique<Sequential<float>>(&tensorPool);
+			auto conv1 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 1, 32, 16, 28, 28, "conv2d-1", 2, 2);
+			auto flatten1 = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 32 * conv1->output_height * conv1->output_width}, "flatten1");
+			auto ReLU1 = std::make_unique<ReLU<float>>(&tensorPool, 32 * conv1->output_height * conv1->output_width, 16, "relu-1");
+			auto reshape1 = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 32, conv1->output_height, conv1->output_width}, "reshape1");
+			auto conv2 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, "conv2d-2", 2, 2);
+		}
+	}
+};
 
 // dataloader sanity check:
 /*
