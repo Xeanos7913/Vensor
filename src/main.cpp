@@ -360,31 +360,45 @@ int main(void){
 */
 
 // Layernorm test
-/*
 int main(void) {
 	Init init;
 	device_initialization(init);
 	Allocator* allocator = new Allocator(&init);
 	TensorPool<float> tensorPool(allocator);
 
-	auto &input = tensorPool.createTensor({1, 512}, "input");
-	tensorPool.tensor_fill_random("input", -5.0f, 5.0f);
-	auto batchnorm = Layernorm<float>(&tensorPool, {1, 512}, {512}, "batchnorm");
-	//auto batchnorm2 = Layernorm<float>(&tensorPool, {16, 32, 32}, {32, 32}, "batchnorm2");
-
-	batchnorm.forward(&input);
-	//batchnorm2.forward(batchnorm.output);
-
-	//batchnorm2.backward(batchnorm.output);
-	//batchnorm.backward(&input);
-
-	batchnorm.save_mean->print();
-	batchnorm.save_rstd->print();
+	auto &input = tensorPool.createTensor({5, 1, 512}, "input");
+	tensorPool.tensor_fill_random("input", -1.0f, 1.0f);
+	auto linear = Linear<float>(&tensorPool, 512, 512, 5, "linear");
+	auto layernorm = Layernorm<float>(&tensorPool, {5, 1, 512}, {1, 512}, "layernorm");
 	
+	//std::vector<float> ones(512, 1.0f);
+	//layernorm.bias_tensor->gradientBuffer.get()->alloc(ones);
+
+	auto linear1 = Linear<float>(&tensorPool, 512, 10, 5, "linear1");
+	auto softmax = SoftmaxCrossEntropy<float>(&tensorPool, 10, 1, 5, "softmax");
+
+	auto& target = tensorPool.createTensor({5, 1, 10}, "targets");
+
+	target.setElement(1.0f, {0, 0, 1});
+	target.setElement(1.0f, {1, 0, 1});
+	target.setElement(1.0f, {2, 0, 1});
+	target.setElement(1.0f, {3, 0, 1});
+	target.setElement(1.0f, {4, 0, 1});
+
+	softmax.target = &target;
+
+	softmax(linear1((layernorm(linear(&input)))));
+	
+	softmax.backward(linear1.output);
+	linear1.backward(layernorm.output);
+	layernorm.backward(linear.output);
+	//linear.backward(&input);
+
+	linear.output->printGradient();
+
 	delete allocator;
 	return 0;
 }
-*/
 
 // Batchnorm2d test
 /*
@@ -480,6 +494,7 @@ int main(void){
 */
 
 // A handwritten digit recognision neural network
+/*
 struct Trainer {
 	
 	// Vulkan stuff:
@@ -532,7 +547,7 @@ struct Trainer {
 			// remaining layers can be constructed inline using conv2 output dims
 			sequence.addLayer(std::make_unique<FlattenTo1d<float>>(&tensorPool, "f"));
 			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 16, "linear1"));
-			sequence.addLayer(std::make_unique<BatchNorm1d<float>>(&tensorPool, 1024, 1, 16, "ln1"));
+			sequence.addLayer(std::make_unique<Layernorm<float>>(&tensorPool, vec{16, 1, 1024}, vec{1, 1024}, "ln1"));
 			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, 1024, 16, "relu1"));
 			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 1024, 10, 16, "linear2"));
 		}
@@ -598,6 +613,7 @@ int main(void){
 
 	return 0;
 }
+*/
 
 // Handwritten image generation model using a VAE
 /*

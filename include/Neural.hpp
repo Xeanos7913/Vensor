@@ -54,8 +54,8 @@ struct LinearReLU : public Module<T>{
 		weights = &tensorPool->createTensor({weight_shape[0], weight_shape[1], weight_shape[2]}, weights_name);
 		bias = &tensorPool->createTensor(output_shape, bias_name);
 		this->output = &tensorPool->createTensor(output_shape, output_name);
-		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
-		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
 	}
 
 	LinearReLU(TensorPool<T>* pool, const std::vector<uint32_t>& weight_dims, const std::vector<uint32_t>& output_dims, const std::string& name) : tensorPool(pool), name(name) {
@@ -68,8 +68,8 @@ struct LinearReLU : public Module<T>{
 		weights = &tensorPool->createTensor(weight_dims, weights_name);
 		bias = &tensorPool->createTensor(output_dims, bias_name);
 		this->output = &tensorPool->createTensor(output_dims, output_name);
-		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
-		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
 	}
 
 	LinearReLU(){}; // default empty ctor
@@ -129,10 +129,10 @@ struct Linear : public Module<T> {
 		output_name = name + "-output";
 
 		weights = &tensorPool->createTensor(weight_shape, weights_name);
-		bias = &tensorPool->createTensor(output_shape, bias_name);
+		bias = &tensorPool->createTensor({1, 1, out_features}, bias_name);
 		this->output = &tensorPool->createTensor(output_shape, output_name);
-		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
-		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
 	}
 
 	Linear(TensorPool<T>* pool, const std::vector<uint32_t>& weight_dims, const std::vector<uint32_t>& output_dims, const std::string& name) : tensorPool(pool), name(name) {
@@ -145,8 +145,8 @@ struct Linear : public Module<T> {
 		weights = &tensorPool->createTensor(weight_dims, weights_name);
 		bias = &tensorPool->createTensor({1, output_dims[1], output_dims[2]}, bias_name); // exclude the batch dim
 		this->output = &tensorPool->createTensor(output_dims, output_name);
-		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
-		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
 	}
 
 	Linear(){}; // default empty ctor
