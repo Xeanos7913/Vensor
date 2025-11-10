@@ -480,7 +480,6 @@ int main(void){
 */
 
 // A handwritten digit recognision neural network
-/*
 struct Trainer {
 	
 	// Vulkan stuff:
@@ -516,28 +515,28 @@ struct Trainer {
 		// build conv1, grab its output dims, move into sequence
 		// make sure "mode" is set to 0 for training and 1 for eval in the norm layers
 		{
-			auto c1 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 1, 5, 1, 28, 28, "conv1", 1, 1, 0, 0);
+			auto c1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 5, 16, 28, 28, 3, 3, "conv1", 1, 1, 0, 0);
 			auto out_w1 = c1->output_width;
 			auto out_h1 = c1->output_height;
 			sequence.addLayer(std::move(c1));
 			// batchnorm1 depends on conv1 output dims
-			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w1, out_h1, 1, "bn1", 1));
+			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w1, out_h1, 16, "bn1"));
 			// build conv2 using conv1's output dims as its input dims, grab conv2 dims, move into sequence
-			auto c2 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 5, 5, 1, out_h1, out_w1, "conv2", 1, 1, 0, 0);
+			auto c2 = std::make_unique<Conv2d<float>>(&tensorPool, 5, 5, 16, out_h1, out_w1, 3, 3, "conv2", 1, 1, 0, 0);
 			auto out_w2 = c2->output_width;
 			auto out_h2 = c2->output_height;
 			sequence.addLayer(std::move(c2));
 			// batchnorm2 depends on conv2 output dims
-			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w2, out_h2, 1, "bn2", 1));
+			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w2, out_h2, 16, "bn2"));
 
 			// remaining layers can be constructed inline using conv2 output dims
 			sequence.addLayer(std::make_unique<FlattenTo1d<float>>(&tensorPool, "f"));
-			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 1, "linear1"));
-			sequence.addLayer(std::make_unique<BatchNorm1d<float>>(&tensorPool, 1024, 1, 1, "bn3", 1));
-			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, 1024, 1, "relu1"));
-			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 1024, 10, 1, "linear2"));
+			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 16, "linear1"));
+			sequence.addLayer(std::make_unique<BatchNorm1d<float>>(&tensorPool, 1024, 1, 16, "ln1"));
+			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, 1024, 16, "relu1"));
+			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 1024, 10, 16, "linear2"));
 		}
-		softmax = std::make_unique<SoftmaxCrossEntropy<float>>(&tensorPool, 10, 1, 1, "softmax");
+		softmax = std::make_unique<SoftmaxCrossEntropy<float>>(&tensorPool, 10, 1, 16, "softmax");
 		optim.load_tensors(sequence);
 	}
 
@@ -590,19 +589,18 @@ int main(void){
 	
 	Trainer t = Trainer();
 
-	t.load_model();
-
-	for (int i = 0; i < 1; i++){
-		//t.train_epoch();
-		t.test_epoch();
+	for (int i = 0; i < 60; i++){
+		t.train_epoch();
+		//t.test_epoch();
 	}
+
+	t.save_model();
 
 	return 0;
 }
-*/
 
 // Handwritten image generation model using a VAE
-
+/*
 struct Trainer {
 
 	Init init;
@@ -624,14 +622,15 @@ struct Trainer {
 		{
 			// encode
 			auto encoder = std::make_unique<Sequential<float>>(&tensorPool);
-			auto conv1 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 1, 32, 16, 28, 28, "conv2d-1", 2, 2);
+			auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
 			auto flatten1 = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 32 * conv1->output_height * conv1->output_width}, "flatten1");
 			auto ReLU1 = std::make_unique<ReLU<float>>(&tensorPool, 32 * conv1->output_height * conv1->output_width, 16, "relu-1");
 			auto reshape1 = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 32, conv1->output_height, conv1->output_width}, "reshape1");
-			auto conv2 = std::make_unique<Conv2d3x3<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, "conv2d-2", 2, 2);
+			auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, "conv2d-2", 2, 2);
 		}
 	}
 };
+*/
 
 // dataloader sanity check:
 /*

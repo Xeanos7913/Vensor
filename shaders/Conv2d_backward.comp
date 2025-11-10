@@ -17,9 +17,9 @@
 #define THREADS_Y (TILE / OUT_TILE_Y)
 
 // Conservative maximums for shared memory allocation
-#define MAX_KERNEL_SIZE 15
-#define MAX_PAD 7
-#define MAX_DILATION 4
+#define MAX_KERNEL_SIZE 10
+#define MAX_PAD 3
+#define MAX_DILATION 3
 #define MAX_STRIDE 4
 
 // Maximum shared memory dimensions

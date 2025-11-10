@@ -17,9 +17,9 @@
 #define THREADS_Y (TILE / OUT_TILE_Y)
 
 // Conservative maximums for shared memory allocation
-#define MAX_KERNEL_SIZE 15  // Supports up to 15x15 kernels
-#define MAX_PAD 7           // Maximum padding supported
-#define MAX_DILATION 4      // Maximum dilation supported
+#define MAX_KERNEL_SIZE 10  // Supports up to 15x15 kernels
+#define MAX_PAD 3           // Maximum padding supported
+#define MAX_DILATION 3      // Maximum dilation supported
 #define MAX_STRIDE 4        // Maximum stride supported
 
 // For transposed conv, input is smaller and output is larger
