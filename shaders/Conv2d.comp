@@ -69,6 +69,7 @@ struct Conv2dContext {
     uint kernel_w;            // Dynamic kernel width
     uint groups;
     uint accumulate_grad;
+    uint kernel_type; // doesnt do anything in forward pass
 };
 
 layout(buffer_reference, std430, scalar) buffer ContextBuffer {

@@ -252,6 +252,7 @@ struct tensor_layernorm1d_context {
     uint mode;                   // 0 = train, 1 = eval
     uint normalized_size;       // N - size of normalized dimension
     uint batch_stride;          // M * N - elements per batch
+    uint batch_size;
     uint accumulate_grad;
     float eps;
 };
@@ -277,6 +278,7 @@ struct tensor_conv2d_3x3_context {
     uint dilation_w;
     uint groups;
     uint accumulate_grad;
+    uint kernel_type;
 };
 
 struct tensor_conv2d_context {
@@ -294,6 +296,7 @@ struct tensor_conv2d_context {
     uint kernel_w;            // Dynamic kernel width
     uint groups;
     uint accumulate_grad;
+    uint kernel_type;
 };
 
 struct tensor_transposed_conv2d_context {
@@ -313,6 +316,7 @@ struct tensor_transposed_conv2d_context {
     uint output_pad_w;
     uint groups;
     uint accumulate_grad;
+    uint kernel_type;
 };
 
 struct tensor_max_pool_context {
@@ -1067,6 +1071,7 @@ struct TensorPool {
                 
                 pushConsts.grid_size = { groupX, groupY, groupZ };
                 pushConsts.mode = 0; // input gradient
+                uniform.kernel_type = 0;
                 conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
                 conv2dShader3x3Backward.execute(workgroup);
             }
@@ -1080,6 +1085,7 @@ struct TensorPool {
                 
                 pushConsts.grid_size = { groupX, groupY, groupZ };
                 pushConsts.mode = 1; // weight gradient
+                uniform.kernel_type = 1;
                 conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
                 conv2dShader3x3Backward.execute(workgroup);
             }
@@ -1093,6 +1099,7 @@ struct TensorPool {
                 
                 pushConsts.grid_size = { groupX, groupY, groupZ };
                 pushConsts.mode = 2; // bias gradient
+                uniform.kernel_type = 2;
                 conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
                 conv2dShader3x3Backward.execute(workgroup);
             }
@@ -1147,6 +1154,7 @@ struct TensorPool {
                 
                 pushConsts.grid_size = { groupX, groupY, groupZ };
                 pushConsts.mode = 0; // input gradient
+                uniform.kernel_type = 0;
                 conv2dShaderBackward.loadUniform(uniform, pushConsts);
                 conv2dShaderBackward.execute(workgroup);
             }
@@ -1160,6 +1168,7 @@ struct TensorPool {
                 
                 pushConsts.grid_size = { groupX, groupY, groupZ };
                 pushConsts.mode = 1; // weight gradient
+                uniform.kernel_type = 1;
                 conv2dShaderBackward.loadUniform(uniform, pushConsts);
                 conv2dShaderBackward.execute(workgroup);
             }
@@ -1173,6 +1182,7 @@ struct TensorPool {
                 
                 pushConsts.grid_size = { groupX, groupY, groupZ };
                 pushConsts.mode = 2; // bias gradient
+                uniform.kernel_type = 2;
                 conv2dShaderBackward.loadUniform(uniform, pushConsts);
                 conv2dShaderBackward.execute(workgroup);
             }
@@ -1186,6 +1196,7 @@ struct TensorPool {
                 
                 pushConsts.grid_size = { groupX, groupY, groupZ };
                 pushConsts.mode = 3; // zero out upstream gradients
+                uniform.kernel_type = 3;
                 conv2dShaderBackward.loadUniform(uniform, pushConsts);
                 conv2dShaderBackward.execute(workgroup);
             }
@@ -1259,6 +1270,7 @@ struct TensorPool {
                 uint32_t workgroup[3] = { grid_x, grid_y, grid_z };
                 pushConsts.grid_size = { grid_x, grid_y, grid_z };
                 pushConsts.mode = 0; // input gradient
+                uniform.kernel_type = 0;
                 transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
                 transposedConv2dShaderBackward.execute(workgroup);
             }
@@ -1277,6 +1289,7 @@ struct TensorPool {
                 uint32_t workgroup[3] = { grid_x, grid_y, grid_z };
                 pushConsts.grid_size = { grid_x, grid_y, grid_z };
                 pushConsts.mode = 1; // weight gradient
+                uniform.kernel_type = 1;
                 transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
                 transposedConv2dShaderBackward.execute(workgroup);
             }
@@ -1287,6 +1300,7 @@ struct TensorPool {
                 uint32_t workgroup[3] = { C_out, 1u, 1u };
                 pushConsts.grid_size = { C_out, 1u, 1u };
                 pushConsts.mode = 2; // bias gradient
+                uniform.kernel_type = 2;
                 transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
                 transposedConv2dShaderBackward.execute(workgroup);
             }
@@ -1297,6 +1311,7 @@ struct TensorPool {
                 uint32_t workgroup[3] = { C_out, 1u, 1u };
                 pushConsts.grid_size = { C_out, 1u, 1u };
                 pushConsts.mode = 3; // zero upstream grads
+                uniform.kernel_type = 3;
                 transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
                 transposedConv2dShaderBackward.execute(workgroup);
             }
@@ -1724,6 +1739,7 @@ struct TensorPool {
         uniform.weight_tensor  = tensors[weight_tensor]->getTensorImpl();
         uniform.bias_tensor    = tensors[bias_tensor]->getTensorImpl();
         uniform.out_tensor     = tensors[out_tensor]->getTensorImpl();
+        uniform.batch_size = batch_size;
 
         if(!save_mean.empty()){
             uniform.save_mean      = tensors[save_mean]->getTensorImpl();
@@ -1749,7 +1765,7 @@ struct TensorPool {
         uint32_t workgroup[3] = { groupX, groupY, groupZ };
 
         tensor_push_const pushConsts{};
-        pushConsts.grid_size = { groupX, groupY, groupZ };
+        pushConsts.grid_size = { batch_size, groupY, groupZ };
 
         if (mode == 0) {
             pushConsts.mode = 0;

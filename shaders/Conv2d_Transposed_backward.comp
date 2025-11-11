@@ -70,6 +70,7 @@ struct TransposeConv2dContext {
     uint output_pad_w;
     uint groups;
     uint accumulate_grad;
+    uint kernel_type;
 };
 
 layout(buffer_reference, std430, scalar) buffer ContextBuffer {
@@ -503,13 +504,13 @@ void zero_grad_output() {
 }
 
 void main() {
-    if (push.kernel_type == 0) {
+    if (push.context.ctx.kernel_type == 0) {
         compute_input_grad();
-    } else if (push.kernel_type == 1) {
+    } else if (push.context.ctx.kernel_type == 1) {
         compute_weight_grad();
-    } else if (push.kernel_type == 2) {
+    } else if (push.context.ctx.kernel_type == 2) {
         compute_bias_grad();
-    } else if (push.kernel_type == 3) {
+    } else if (push.context.ctx.kernel_type == 3) {
         zero_grad_output();
     }
 }

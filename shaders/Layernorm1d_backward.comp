@@ -36,6 +36,7 @@ struct LayerNorm1DContext {
     uint mode;                  // 0 = train, 1 = eval
     uint normalized_size;       // N
     uint batch_stride;          // M * N
+    uint batch_size;
     uint accumulate_grad;
     float eps;
 };
@@ -142,6 +143,9 @@ void backward_kernel() {
 
     uint N = ctx.normalized_size;
     uint base_idx = sample_idx * N;
+    
+    // Calculate batch size for scaling weight/bias gradients
+    float inv_batch_size = 1.0 / ctx.batch_size;
 
     // tile params
     uint warp_tile_floats = WARP_SIZE * FLOATS_PER_THREAD;
@@ -220,12 +224,13 @@ void backward_kernel() {
             // Load weight
             vec4 weight = loadVec4Contig(ctx.weight_tensor.data, idx, remaining);
             
-            // Compute weight gradient (grad_out * norm_val)
-            vec4 grad_weight = grad_out * norm_val;
+            // Compute weight gradient (grad_out * norm_val), scaled by 1/batch_size
+            vec4 grad_weight = grad_out * norm_val * vec4(inv_batch_size);
             atomicAddVec4(ctx.weight_tensor.grad, idx, grad_weight, remaining);
             
-            // Compute bias gradient (just grad_out)
-            atomicAddVec4(ctx.bias_tensor.grad, idx, grad_out, remaining);
+            // Compute bias gradient (just grad_out), scaled by 1/batch_size
+            vec4 grad_bias = grad_out * vec4(inv_batch_size);
+            atomicAddVec4(ctx.bias_tensor.grad, idx, grad_bias, remaining);
             
             // Compute input gradient
             // grad_input = scale1 * (N * grad_norm - scale2 - norm_val * scale3)
@@ -238,6 +243,9 @@ void backward_kernel() {
             } else {
                 storeVec4ContigGrad(ctx.input_tensor.grad, base_idx + idx, grad_input, remaining);
             }
+            
+            // Zero out output gradient to clean up compute tree
+            storeVec4ContigGrad(ctx.out_tensor.grad, base_idx + idx, vec4(0.0), remaining);
         }
     }
 }

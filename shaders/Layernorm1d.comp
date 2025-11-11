@@ -36,6 +36,7 @@ struct LayerNorm1DContext {
     uint mode;                  // 0 = train, 1 = eval
     uint normalized_size;       // N
     uint batch_stride;          // M * N
+    uint batch_size;
     uint accumulate_grad;
     float eps;
 };

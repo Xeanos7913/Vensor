@@ -360,6 +360,7 @@ int main(void){
 */
 
 // Layernorm test
+/*
 int main(void) {
 	Init init;
 	device_initialization(init);
@@ -370,10 +371,6 @@ int main(void) {
 	tensorPool.tensor_fill_random("input", -1.0f, 1.0f);
 	auto linear = Linear<float>(&tensorPool, 512, 512, 5, "linear");
 	auto layernorm = Layernorm<float>(&tensorPool, {5, 1, 512}, {1, 512}, "layernorm");
-	
-	//std::vector<float> ones(512, 1.0f);
-	//layernorm.bias_tensor->gradientBuffer.get()->alloc(ones);
-
 	auto linear1 = Linear<float>(&tensorPool, 512, 10, 5, "linear1");
 	auto softmax = SoftmaxCrossEntropy<float>(&tensorPool, 10, 1, 5, "softmax");
 
@@ -399,6 +396,7 @@ int main(void) {
 	delete allocator;
 	return 0;
 }
+*/
 
 // Batchnorm2d test
 /*
@@ -452,14 +450,14 @@ int main(void){
 	TensorPool<float> tensorPool(allocator);
 
 	auto &inputImage = tensorPool.createTensor({5, 1, 28, 28}, "inputImage");
-	tensorPool.tensor_fill_random("inputImage", -1.0f, 1.0f); // make input image completely white
+	tensorPool.tensor_fill_random("inputImage", -1.0f, 1.0f);
 
-	auto conv = std::make_unique<Conv2d3x3<float>>(&tensorPool, 1, 2, 5, 28, 28, "conv1", 1, 1, 0, 0);
-	auto bn = std::make_unique<BatchNorm2d<float>>(&tensorPool, 2, 26, 26, 5, "batchnorm-2d");
-	auto flatten = std::make_unique<FlattenTo<float>>(&tensorPool, vec{5, 1, 2 * 26 * 26}, "flatten"); // output is (5, 1, 2 * 26 * 26)
-	auto linear = std::make_unique<Linear<float>>(&tensorPool, vec{1, 16, 2 * 26 * 26}, vec{5, 1, 16}, "linear"); // output is (5, 1, 16)
-	auto batchnorm = std::make_unique<BatchNorm1d<float>>(&tensorPool, 16, 1, 5, "batchnorm");
-	auto softmax = std::make_unique<SoftmaxCrossEntropy<float>>(&tensorPool, 16, 1, 5, "softmax");
+	Conv2d<float> conv(&tensorPool, 1, 2, 5, 28, 28, 3, 3, "conv1", 1, 1, 0, 0);
+	BatchNorm2d<float> bn(&tensorPool, 2, conv.output_width, conv.output_height, 5, "batchnorm-2d");
+	ShapeTo<float> flatten(&tensorPool, vec{5, 1, 2 * conv.output_height * conv.output_width}, "flatten"); // output is (5, 1, 2 * 26 * 26)
+	Linear<float> linear(&tensorPool, 2 * conv.output_height * conv.output_width, 16, 5, "linear"); // output is (5, 1, 16)
+	BatchNorm1d<float> batchnorm(&tensorPool, 16, 1, 5, "batchnorm");
+	SoftmaxCrossEntropy<float> softmax(&tensorPool, 16, 1, 5, "softmax");
 
 	// set all the labels to be class = 1
 	auto &target = tensorPool.createTensor({5, 1, 16}, "targets");
@@ -468,25 +466,18 @@ int main(void){
 	target.dataBuffer->set(off2or3(target.strides, 2, 0, 1), 1.0f);
 	target.dataBuffer->set(off2or3(target.strides, 3, 0, 1), 1.0f);
 	target.dataBuffer->set(off2or3(target.strides, 4, 0, 1), 1.0f);
-	softmax->target = &target;
+	softmax.target = &target;
 
-	auto model = Sequential<float>(&tensorPool, "model");
-	model.addLayer(std::move(conv));
-	model.addLayer(std::move(bn));
-	model.addLayer(std::move(flatten));
-	model.addLayer(std::move(linear));
-	model.addLayer(std::move(batchnorm));
+	softmax(batchnorm(linear(flatten(bn(conv(&inputImage))))));
 
-	// run one forward-backward pass
-	model.forward(&inputImage);
-	softmax->forward(model.output);
-	softmax->backward(model.output);
-	model.backward(&inputImage);
+	softmax.backward(batchnorm.output);
+	batchnorm.backward(linear.output);
+	linear.backward(flatten.output);
+	flatten.backward(bn.output);
+	bn.backward(conv.output);
+	conv.backward(&inputImage);
 
-	for (auto t : model.layers[1]->getTensors()){
-		std::cout << "Name: " << t->name << ": \n";
-		t->printGradient();
-	}
+	conv.weight_tensor->printGradient();
 
 	delete allocator;
 	return 0;
@@ -494,7 +485,6 @@ int main(void){
 */
 
 // A handwritten digit recognision neural network
-/*
 struct Trainer {
 	
 	// Vulkan stuff:
@@ -613,7 +603,6 @@ int main(void){
 
 	return 0;
 }
-*/
 
 // Handwritten image generation model using a VAE
 /*

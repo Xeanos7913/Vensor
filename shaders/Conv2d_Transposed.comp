@@ -71,6 +71,7 @@ struct TransposeConv2dContext {
     uint output_pad_w;
     uint groups;
     uint accumulate_grad;
+    uint kernel_type;
 };
 
 layout(buffer_reference, std430, scalar) buffer ContextBuffer {

@@ -60,6 +60,7 @@ struct Conv2dContext {
     uint dilation_w;
     uint groups;
     uint accumulate_grad;
+    uint kernel_type; // doesn't do anything in forward pass
 };
 
 layout(buffer_reference, std430, scalar) buffer ContextBuffer {
