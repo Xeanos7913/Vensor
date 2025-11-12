@@ -3,21 +3,19 @@
 #extension GL_EXT_buffer_reference : enable
 #extension GL_EXT_buffer_reference_uvec2 : enable
 #extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
 
-layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, scalar) buffer tensor_data {
     float data[];
 };
-
 layout(buffer_reference, std430, scalar) buffer tensor_grad {
     float grad[];
 };
-
 layout(buffer_reference, std430, scalar) buffer tensor_strides {
     int strides[];
 };
-
 layout(buffer_reference, std430, scalar) buffer tensor_shape {
     int dims[];
 };
@@ -30,82 +28,95 @@ struct TensorImpl {
     uint numel, ndim, requires_grad, is_leaf;
 };
 
-struct MataddInplaceContext {
-    TensorImpl input_a;      // [B?, M, N] - addend (read-only in forward)
-    TensorImpl input_b;      // [B?, M, N] - accumulator (in-place); input_b.grad holds dB
+struct ElementWiseAdd {
+    TensorImpl input_a;   // output tensor (result stored here)
+    TensorImpl input_b;   // input tensor to add
+    uint mode;            // 0 = tiled, 1 = simple
     uint batch_size;
     uint m, n;
-    uint accumulate_grad;    // 0: overwrite, 1: += for grads
+    uint accumulate_grad; // 0: overwrite, 1: += for grads
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
-    MataddInplaceContext ctx; 
+    ElementWiseAdd ctx; 
 };
 
 layout(push_constant) uniform PushConstants {
     ContextBuffer context;
     uvec3 grid_size;
+    uint  kernel_type; // 0=forward, 1=backward
 } push;
 
-// Convert multi-dimensional index to linear index
-uint compute_linear_index(uvec3 coords, TensorImpl tensor) {
-    uint linear_idx = 0;
-    uint batch_idx = coords.z;
-    uint row_idx = coords.y;
-    uint col_idx = coords.x;
-    
-    if (tensor.ndim == 2) {
-        // 2D tensor: [M, N]
-        linear_idx = row_idx * uint(tensor.strides.strides[0]) + col_idx * uint(tensor.strides.strides[1]);
-    } else if (tensor.ndim == 3) {
-        // 3D tensor: [B, M, N]
-        linear_idx = batch_idx * uint(tensor.strides.strides[0]) + 
-                     row_idx * uint(tensor.strides.strides[1]) + 
-                     col_idx * uint(tensor.strides.strides[2]);
+// Convert flat index to multi-dimensional indices
+void unravel_index(uint flat_idx, TensorImpl tensor, out int indices[8]) {
+    uint remaining = flat_idx;
+    for (int i = int(tensor.ndim) - 1; i >= 0; i--) {
+        indices[i] = int(remaining % uint(tensor.shape.dims[i]));
+        remaining /= uint(tensor.shape.dims[i]);
     }
-    
-    return linear_idx;
 }
 
-void main() {
-    MataddInplaceContext ctx = push.context.ctx;
+// Convert multi-dimensional indices to flat index with broadcasting
+uint ravel_index_with_broadcast(int indices[8], TensorImpl tensor, uint output_ndim) {
+    uint flat_idx = 0;
     
-    uvec3 global_id = gl_GlobalInvocationID;
-    uint col = global_id.x;
-    uint row = global_id.y;
-    uint batch = global_id.z;
+    // Handle broadcasting: align dimensions from the right
+    int offset = int(output_ndim) - int(tensor.ndim);
     
-    // Check bounds
-    if (col >= ctx.n || row >= ctx.m || batch >= ctx.batch_size) {
+    for (int i = 0; i < int(tensor.ndim); i++) {
+        int output_dim_idx = offset + i;
+        int idx = indices[output_dim_idx];
+        
+        // If this dimension is 1, broadcast (use index 0)
+        if (tensor.shape.dims[i] == 1) {
+            idx = 0;
+        }
+        
+        flat_idx += uint(idx * tensor.strides.strides[i]);
+    }
+    
+    return flat_idx;
+}
+
+void backward_pass() {
+    uint gid = gl_GlobalInvocationID.x;
+    ElementWiseAdd op = push.context.ctx;
+    
+    // Check bounds - iterate over output elements
+    if (gid >= op.input_a.numel) {
         return;
     }
     
-    uvec3 coords = uvec3(col, row, batch);
+    // Get the gradient from output (input_a)
+    float grad_output = op.input_a.grad.grad[gid];
     
-    // Backward pass for in-place addition: B = B + A
-    // Forward: B_out = B_in + A
-    // Backward: dB_in = dB_out, dA = dB_out
+    // Convert global index to multi-dimensional indices
+    int indices[8];
+    unravel_index(gid, op.input_a, indices);
     
-    uint idx_b = compute_linear_index(coords, ctx.input_b);
-    float db = ctx.input_b.grad.grad[idx_b]; // This is dB_out (gradient of output B)
+    // Get the corresponding index in input_b with broadcasting
+    uint idx_b = ravel_index_with_broadcast(indices, op.input_b, op.input_a.ndim);
     
-    // Compute gradients for input_a if it requires gradients
-    // dA = dB_out (since ∂B_out/∂A = 1)
-    if (ctx.input_a.requires_grad != 0) {
-        uint idx_a = compute_linear_index(coords, ctx.input_a);
-        if (ctx.accumulate_grad != 0) {
-            ctx.input_a.grad.grad[idx_a] += db;
+    // For c = a + b:
+    // dc/da = 1 (gradient passes through unchanged)
+    // dc/db = 1 (gradient passes through unchanged)
+    
+    // Accumulate gradient for input_a (d_a = grad_output * 1)
+    if (op.input_a.requires_grad != 0) {
+        if (op.accumulate_grad != 0) {
+            atomicAdd(op.input_a.grad.grad[gid], grad_output);
         } else {
-            ctx.input_a.grad.grad[idx_a] = db;
+            op.input_a.grad.grad[gid] = grad_output;
         }
     }
     
-    // For input_b, the gradient flows through unchanged
-    // dB_in = dB_out (since ∂B_out/∂B_in = 1)
-    // The gradient is already in input_b.grad, so we don't need to write it again
-    // unless we need to zero it out after use (but typically for in-place ops,
-    // the gradient stays in place for the next backward pass)
-    
-    // Note: We do NOT zero out input_b.grad here because input_b is the output
-    // and its gradient will be used by upstream operations
+    // Accumulate gradient for input_b (d_b = grad_output * 1)
+    // Need atomic operation because of broadcasting (multiple outputs may map to same input_b element)
+    if (op.input_b.requires_grad != 0) {
+        atomicAdd(op.input_b.grad.grad[idx_b], grad_output);
+    }
+}
+
+void main() {
+    backward_pass();
 }

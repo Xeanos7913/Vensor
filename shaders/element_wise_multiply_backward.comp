@@ -1,0 +1,131 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct ElementWiseMultiply {
+    TensorImpl input_a;   // output tensor (result stored here)
+    TensorImpl input_b;   // input tensor to multiply
+    uint mode;            // 0 = tiled, 1 = simple
+    uint batch_size;
+    uint m, n;
+    uint accumulate_grad; // 0: overwrite, 1: += for grads
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    ElementWiseMultiply ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint  kernel_type; // 0=forward, 1=backward
+} push;
+
+// Convert flat index to multi-dimensional indices
+void unravel_index(uint flat_idx, TensorImpl tensor, out int indices[8]) {
+    uint remaining = flat_idx;
+    for (int i = int(tensor.ndim) - 1; i >= 0; i--) {
+        indices[i] = int(remaining % uint(tensor.shape.dims[i]));
+        remaining /= uint(tensor.shape.dims[i]);
+    }
+}
+
+// Convert multi-dimensional indices to flat index with broadcasting
+uint ravel_index_with_broadcast(int indices[8], TensorImpl tensor, uint output_ndim) {
+    uint flat_idx = 0;
+    
+    // Handle broadcasting: align dimensions from the right
+    int offset = int(output_ndim) - int(tensor.ndim);
+    
+    for (int i = 0; i < int(tensor.ndim); i++) {
+        int output_dim_idx = offset + i;
+        int idx = indices[output_dim_idx];
+        
+        // If this dimension is 1, broadcast (use index 0)
+        if (tensor.shape.dims[i] == 1) {
+            idx = 0;
+        }
+        
+        flat_idx += uint(idx * tensor.strides.strides[i]);
+    }
+    
+    return flat_idx;
+}
+
+void backward_pass() {
+    uint gid = gl_GlobalInvocationID.x;
+    ElementWiseMultiply op = push.context.ctx;
+    
+    // Check bounds - iterate over output elements
+    if (gid >= op.input_a.numel) {
+        return;
+    }
+    
+    // Get the gradient from output (input_a)
+    float grad_output = op.input_a.grad.grad[gid];
+    
+    // Convert global index to multi-dimensional indices
+    int indices[8];
+    unravel_index(gid, op.input_a, indices);
+    
+    // Get the corresponding index in input_b with broadcasting
+    uint idx_b = ravel_index_with_broadcast(indices, op.input_b, op.input_a.ndim);
+    
+    // Get values for gradient computation
+    // For c = a * b:
+    // dc/da = b
+    // dc/db = a
+    float val_a_original = op.input_a.data.data[gid];
+    float val_b = op.input_b.data.data[idx_b];
+    
+    // Note: After forward pass, input_a contains result (a*b)
+    // We need original a value: a_original = (a*b) / b
+    float a_original = (abs(val_b) > 1e-10) ? (val_a_original / val_b) : 0.0;
+    
+    // Accumulate gradient for input_a (d_a = grad_output * b)
+    if (op.input_a.requires_grad != 0) {
+        float grad_a = grad_output * val_b;
+        if (op.accumulate_grad != 0) {
+            atomicAdd(op.input_a.grad.grad[gid], grad_a);
+        } else {
+            op.input_a.grad.grad[gid] = grad_a;
+        }
+    }
+    
+    // Accumulate gradient for input_b (d_b = grad_output * a)
+    // Need atomic operation because of broadcasting (multiple outputs may map to same input_b element)
+    if (op.input_b.requires_grad != 0) {
+        float grad_b = grad_output * a_original;
+        atomicAdd(op.input_b.grad.grad[idx_b], grad_b);
+    }
+}
+
+void main() {
+    backward_pass();
+}

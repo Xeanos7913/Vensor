@@ -265,6 +265,15 @@ struct mse_loss_context {
     uint32_t elements_per_batch;
 };
 
+struct kld_loss_context {
+    tensor_impl mu_tensor;
+    tensor_impl logvar_tensor;
+    tensor_impl loss_tensor;
+    uint batch_size;
+    uint elements_per_batch;
+    float beta;
+};
+
 struct tensor_conv2d_3x3_context {
     tensor_impl input_tensor;  // [N, C_in, H_in, W_in]
     tensor_impl weight_tensor; // [C_out, C_in, K_h, K_w]
@@ -843,6 +852,8 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/Fused_Cross_Entropy_backward.comp.spv"), alloc, nullptr),
             mseLossShader(
                 readShaderBytecode("compiled_shaders/MSE_loss.comp.spv"), alloc, nullptr),
+            kldLossShader(
+                readShaderBytecode("compiled_shaders/KLD_loss.comp.spv"), alloc, nullptr),
             mean_shader(
                 readShaderBytecode("compiled_shaders/find_mean.comp.spv"), alloc, nullptr),
             softmaxShader(
@@ -2398,6 +2409,27 @@ struct TensorPool {
         mseLossShader.execute(workgroup);
     }
 
+    void kld_loss(const std::string& mu_tensor, const std::string& logvar_tensor, const std::string& loss_tensor){
+        kld_loss_context uniform;
+        uniform.batch_size = tensors[mu_tensor]->shape[0];
+        uniform.logvar_tensor = tensors[logvar_tensor]->getTensorImpl();
+        uniform.mu_tensor = tensors[mu_tensor]->getTensorImpl();
+        uniform.elements_per_batch = std::accumulate(tensors[mu_tensor]->shape.begin() + 1, tensors[mu_tensor]->shape.end(), 1, std::multiplies<uint32_t>());
+        uniform.loss_tensor = tensors[loss_tensor];
+        uniform.beta = 1.0f;
+
+        uint32_t grpx = (uniform.elements_per_batch + (256 * 4) - 1)/(256 * 4);
+        uint32_t wrkgrp[3] = {grpx, 1, uniform.batch_size};
+
+        DEBUG_PRINT("KLD loss on tensor: " << mu_tensor << ", " << logvar_tensor << " with dispatch: (" << grpx << ", " << "1, " << uniform.batch_size << ")");
+
+        tensor_push_const push;
+        push.mode = 0;
+        push.uniformAddress = kldLossShader.uniformBuffer->getBufferAddress();
+        kldLossShader.loadUniform(uniform, push);
+        kldLossShader.execute(wrkgrp);
+    }
+
     void tensor_fill_random(const std::string& tensor, T min, T max) {
         tensor_fill_rand_uniform_address<T> uniform{};
 
@@ -2538,6 +2570,7 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShader; // computes B = B + A
     gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, mse_loss_context> mseLossShader; // computes Mean Squared Error (MSE) loss
+    gpuTaskNoDesc<T, tensor_push_const, kld_loss_context> kldLossShader; // computes the Kullback Liebler Divergence (KLD) loss
 	gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShader; // computes ReLU
     gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShaderBackward;
 	gpuTaskNoDesc<T, tensor_push_const, tensor_softmax_context> softmaxShader;  // computes softmax

@@ -299,9 +299,33 @@ struct MSEloss : public Module<T> {
 
 	MSEloss(){};
 
+	// forward already handles gradient computation directly
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(target == nullptr) throw std::runtime_error("Target tensor for MSE loss not set!");
 		tensorPool->mse_loss(input->name, target->name, this->output->name);
+		return this->output;
+	}
+
+	void backward(Tensor<T>* input) override {} // does nothing
+};
+
+template<typename T>
+struct KLDloss : public Module<T> {
+	TensorPool<T>* tensorPool;
+	Tensor<T>* mu_tensor;
+	Tensor<T>* logvar_tensor;
+	std::string name;
+
+	KLDloss(TensorPool<T>* pool, uint32_t batch_size, const std::string& name) : tensorPool(pool), name(name) {
+		this->output = &tensorPool->createTensor({batch_size}, name + "-loss");
+	}
+
+	KLDloss() {} // default empty ctor
+
+	// forward already handles gradient computation directly
+	Tensor<T>* forward(Tensor<T>* input) override {
+		if(logvar_tensor == nullptr || mu_tensor == nullptr) throw std::runtime_error("logvar and mu tensors need to be set for KLDloss to work!");
+		tensorPool->kld_loss(mu_tensor->name, logvar_tensor->name, this->output->name);
 		return this->output;
 	}
 
@@ -891,8 +915,8 @@ struct TransposedConv2d : public Module<T> {
                      const std::string& name,
                      uint32_t stride_w = 1,
                      uint32_t stride_h = 1,
-                     uint32_t pad_h = 0,
-                     uint32_t pad_w = 0,
+                     uint32_t pad_h = 1,
+                     uint32_t pad_w = 1,
                      uint32_t dilation_h = 1,
                      uint32_t dilation_w = 1,
                      uint32_t output_pad_h = 0,

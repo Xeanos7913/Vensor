@@ -484,6 +484,77 @@ int main(void){
 }
 */
 
+struct VAE {
+
+	Init init;
+	Allocator* allocator;
+
+	TensorPool<float> tensorPool;
+
+	Sequential<float> enc_conv;
+	Sequential<float> dec_conv;
+	Linear<float> fc_mu;
+	Linear<float> fc_logvar;
+
+	Sequential<float> model;
+
+	MSEloss<float> mseLoss;
+	KLDloss<float> kldLoss;
+
+	uint32_t latent_dim = 20;
+
+	VAE(){
+
+		device_initialization(init);
+		allocator = new Allocator(&init);
+
+		tensorPool = TensorPool<float>(allocator);
+
+		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
+		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2);
+		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
+		auto enc_fc = std::make_unique<Linear<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 512, 16, "enc_fc");
+		
+		fc_mu = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_mu");
+		fc_logvar = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
+
+		auto dec_fc = std::make_unique<Linear<float>>(&tensorPool, latent_dim, 64 * conv2->output_height * conv2->output_width, 16, "dec_fc");
+		auto reshape = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 64, conv2->output_height, conv2->output_width}, "reshape");
+		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 4, 4, "dec_conv1", 2, 2);
+		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2);
+
+		enc_conv = Sequential<float>(&tensorPool, "enc");
+
+		enc_conv.addLayer(std::move(conv1));
+		enc_conv.addLayer(std::move(conv2));
+		enc_conv.addLayer(std::move(flatten));
+		enc_conv.addLayer(std::move(enc_fc));
+
+		dec_conv = Sequential<float>(&tensorPool, "dec");
+
+		dec_conv.addLayer(std::move(dec_fc));
+		dec_conv.addLayer(std::move(reshape));
+		dec_conv.addLayer(std::move(dec_conv1));
+		dec_conv.addLayer(std::move(dec_conv2));
+
+		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
+		kldLoss = KLDloss<float>(&tensorPool, 16, "kld");
+	}
+
+	std::pair<Tensor<float>*, Tensor<float>*> encode(Tensor<float>* input) {
+		auto h = enc_conv(input);
+
+		auto mu = fc_mu(h);
+		auto logvar = fc_logvar(h);
+
+		return {mu, logvar};
+	}
+
+	void reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
+		
+	}
+};
+
 // A handwritten digit recognision neural network
 struct Trainer {
 	
