@@ -484,6 +484,7 @@ int main(void){
 }
 */
 
+// WIP vae for the MNIST dataset
 struct VAE {
 
 	Init init;
