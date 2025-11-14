@@ -27,6 +27,7 @@ A C++ machine learning library utilizing Vulkan for GPU acceleration. Developed 
 
 ## Dependencies
 - Vulkan SDK
+- volk
 - stb_image & stb_image_write
 - VKBootstrap
 - GLM
