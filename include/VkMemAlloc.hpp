@@ -3,8 +3,7 @@
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "VkBootstrap.h"
-#include <vulkan/vulkan.hpp>
-#include <vulkan/vulkan_core.h>
+#include "volk.h"
 #include <typeinfo>
 #include <iostream>
 #include <algorithm>

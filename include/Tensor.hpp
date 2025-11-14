@@ -381,6 +381,14 @@ struct tensor_fill_range_uniform_address {
 template<typename T>
 struct TensorPool;
 
+// Source - https://stackoverflow.com/a
+// Posted by Davide Cannizzo, modified by community. See post 'Timeline' for change history
+// Retrieved 2025-11-14, License - CC BY-SA 4.0
+// Some actual voodoo magic
+#define define const struct
+#define coperator(ReturnType, OperatorName, FirstOperandType, SecondOperandType) OperatorName ## _ {} OperatorName; template <typename T> struct OperatorName ## Proxy{public:OperatorName ## Proxy(const T& t) : t_(t){}const T& t_;static ReturnType _ ## OperatorName ## _(const FirstOperandType a, const SecondOperandType b);};template <typename T> OperatorName ## Proxy<T> operator<(const T& lhs, const OperatorName ## _& rhs){return OperatorName ## Proxy<T>(lhs);}ReturnType operator>(const OperatorName ## Proxy<FirstOperandType>& lhs, const SecondOperandType& rhs){return OperatorName ## Proxy<FirstOperandType>::_ ## OperatorName ## _(lhs.t_, rhs);}template <typename T> inline ReturnType OperatorName ## Proxy<T>::_ ## OperatorName ## _(const FirstOperandType a, const SecondOperandType b)
+// this monster allows me to have any custom operators, eg. the matmul operator '@'
+
 template<typename T>  
 struct Tensor {  
 
@@ -569,6 +577,9 @@ struct Tensor {
         stridesBuffer->alloc(strides);
         shapeBuffer->alloc(shape);
     }
+
+    Tensor<T>* operator *(Tensor<T>* other);
+    Tensor<T>* operator +(Tensor<T>* other);
 
     void save_to_file(const std::string& filename) const {
         std::ofstream outFile(filename, std::ios::binary);
@@ -926,7 +937,8 @@ struct TensorPool {
             return *tensors[name];
         }
         else {
-            throw std::runtime_error("Tensor with this name already exists");
+            DEBUG_PRINT("tensor with name: " << name << " already exists. Returning that tensor.");
+            return *tensors[name];
         }
     }
 
@@ -938,7 +950,8 @@ struct TensorPool {
             return *tensors[name];
         }
         else {
-            throw std::runtime_error("Tensor with this name already exists");
+            DEBUG_PRINT("tensor with name: " << name << " already exists. Returning that tensor.");
+            return *tensors[name];
         }
     }
 
@@ -2016,6 +2029,7 @@ struct TensorPool {
         }
 	}
 
+    // tensor_a = tensor_a + tensor_b
     void tensor_add_inplace(const std::string& tensor_b, const std::string& tensor_a, uint32_t mode = 0) {
         matadd_inplace_context uniform{};
         
@@ -2162,7 +2176,7 @@ struct TensorPool {
         };
 
         const auto& shapeA = tensors[logvar_tensor]->shape; // A[..., M, N]
-        const auto& shapeB = tensors[tensor_b]->shape; // B[..., M, N] (in-place output)
+        const auto& shapeB = tensors[std_tensor]->shape; // B[..., M, N] (in-place output)
         
         // last-2 dims
         uint32_t M = shapeB.size() >= 2 ? shapeB[shapeB.size() - 2] : 1;
@@ -2536,7 +2550,7 @@ struct TensorPool {
         uniform.logvar_tensor = tensors[logvar_tensor]->getTensorImpl();
         uniform.mu_tensor = tensors[mu_tensor]->getTensorImpl();
         uniform.elements_per_batch = std::accumulate(tensors[mu_tensor]->shape.begin() + 1, tensors[mu_tensor]->shape.end(), 1, std::multiplies<uint32_t>());
-        uniform.loss_tensor = tensors[loss_tensor];
+        uniform.loss_tensor = tensors[loss_tensor]->getTensorImpl();
         uniform.beta = 1.0f;
 
         uint32_t grpx = (uniform.elements_per_batch + (256 * 4) - 1)/(256 * 4);
@@ -2726,29 +2740,52 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, tensor_max_pool_context> maxPoolShaderBackward;     // computes maxPool2D's backward pass with any kernel shape
 };
 
-// not used at the moment
+// matmul operator only for floats
+define coperator(Tensor<float>*, matmul, Tensor<float>*, Tensor<float>*){
+
+    auto &shape_a = a->shape;
+    auto &shape_b = b->shape;
+
+    // Extract dimensions
+    // shape_a: [..., M, K]
+    // shape_b: [..., N, K] (transposed, so K is last)
+    // output: [..., M, N]
+
+    std::vector<uint32_t> output_shape;
+
+    // Copy batch dimensions (all dimensions except last 2)
+    // Use the larger of the two batch dimension sets
+    size_t batch_dims_a = shape_a.size() - 2;
+    size_t batch_dims_b = shape_b.size() - 2;
+    size_t max_batch_dims = std::max(batch_dims_a, batch_dims_b);
+
+    // Handle broadcasting for batch dimensions
+    for (size_t i = 0; i < max_batch_dims; ++i) {
+        size_t idx_a = i + batch_dims_a - max_batch_dims;
+        size_t idx_b = i + batch_dims_b - max_batch_dims;
+        
+        uint32_t dim_a = (i < max_batch_dims - batch_dims_a) ? 1 : shape_a[idx_a];
+        uint32_t dim_b = (i < max_batch_dims - batch_dims_b) ? 1 : shape_b[idx_b];
+        
+        output_shape.push_back(std::max(dim_a, dim_b));
+    }
+
+    // Add matrix dimensions: M from A, N from B
+    uint32_t M = shape_a[shape_a.size() - 2];
+    uint32_t N = shape_b[shape_b.size() - 2];  // N is at position -2 since B is transposed
+
+    output_shape.push_back(M);
+    output_shape.push_back(N);
+
+    auto *output = &a->pool->createTensor(output_shape, a->name + b->name + "-matmul_output");
+    a->pool->tensor_mult(output->name, a->name, b->name);
+    
+    return output;
+}
+
+#define matmul <matmul>
+
 template<typename T>
-struct BiOpNode {
-
-    TensorPool<T>* tensorPool;
-    Tensor<T>* right;
-    Tensor<T>* left;
-    Tensor<T>* output;
-    Operation operationType;
-
-    BiOpNode(Tensor<T>* left, Tensor<T>* right, Tensor<T>* output, Operation operationType)
-        : left(left), right(right), output(output), operationType(operationType) {
-    }
-    void execute() {
-        switch (operationType) {
-        case Operation::ADDITION:
-            std::cout << "not implemented yet" << "\n";
-            break;
-        case Operation::MULTIPLICATION:
-			tensorPool->tensor_mult(output->name, left->name, right->name);
-            break;
-        default:
-            throw std::invalid_argument("Unsupported operation type");
-        }
-    }
-};
+Tensor<T>* Tensor<T>::operator*(Tensor<T>* other) {
+    
+}

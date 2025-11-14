@@ -1,6 +1,6 @@
 ﻿#pragma once
 #include "VkBootstrap.h"
-#include <vulkan/vulkan.hpp>
+#include "volk.h"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -415,6 +415,11 @@ private:
 };
 
 int device_initialization(Init& init) {  
+
+    if(volkInitialize() != VK_SUCCESS){
+        throw std::runtime_error("Volk couldn't load the vulkan loader from system. It may be missing.");
+    }
+
     vkb::InstanceBuilder instance_builder;  
     auto instance_ret = instance_builder.use_default_debug_messenger()  
         .request_validation_layers()  
@@ -427,6 +432,9 @@ int device_initialization(Init& init) {
         return -1;  
     }  
     init.instance = instance_ret.value();  
+
+    volkLoadInstance(init.instance.instance);
+
     std::cout << "Vulkan Instance created\n";
     init.inst_disp = init.instance.make_table();  
     std::cout << "Instance Dispatch Table created\n";

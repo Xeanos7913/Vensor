@@ -1,7 +1,7 @@
 /*
 This main file contains some testing code (in the commented out parts) and an example MNIST handwritten digit recognision neural network training loop.
 */
-
+#define VOLK_IMPLEMENTATION
 #include <iostream>
 #include <fstream>
 //#define DEBUG
@@ -540,6 +540,10 @@ struct VAE {
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
 		kldLoss = KLDloss<float>(&tensorPool, 16, "kld");
+
+		// intermediate tensors
+		tensorPool.createTensor({16, 1, latent_dim}, "std");
+		tensorPool.createTensor({16, 1, latent_dim}, "eps");
 	}
 
 	std::pair<Tensor<float>*, Tensor<float>*> encode(Tensor<float>* input) {
@@ -551,9 +555,29 @@ struct VAE {
 		return {mu, logvar};
 	}
 
-	void reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		
+	// does the same as:
+	// std = (0.5 * logvar).exp()
+	// eps = random gaussian
+	// mu + eps * std (in-place operations onto mu)
+	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
+		tensorPool.tensor_logvar_to_std(logvar->name, "std");
+		tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
+		tensorPool.tensor_multiply_elementwise_inplace("eps", "std");
+		tensorPool.tensor_add_inplace("std", mu->name);
+
+		return mu;
 	}
+
+	Tensor<float>* decode(Tensor<float>* z){
+		return dec_conv(z);
+	}
+
+	void forward(Tensor<float>* input){
+		auto [mu, logvar] = encode(input);
+		auto z = reparameterize(mu, logvar);
+		auto recon = decode(z);
+	}
+
 };
 
 // A handwritten digit recognision neural network
@@ -666,12 +690,11 @@ int main(void){
 	
 	Trainer t = Trainer();
 
-	for (int i = 0; i < 60; i++){
-		t.train_epoch();
-		//t.test_epoch();
-	}
-
-	t.save_model();
+	//for (int i = 0; i < 60; i++){
+	//	t.train_epoch();
+	//	//t.test_epoch();
+	//}
+	//t.save_model();
 
 	return 0;
 }
