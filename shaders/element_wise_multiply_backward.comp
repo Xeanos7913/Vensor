@@ -10,12 +10,15 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(buffer_reference, std430, scalar) buffer tensor_data {
     float data[];
 };
+
 layout(buffer_reference, std430, scalar) buffer tensor_grad {
     float grad[];
 };
+
 layout(buffer_reference, std430, scalar) buffer tensor_strides {
     int strides[];
 };
+
 layout(buffer_reference, std430, scalar) buffer tensor_shape {
     int dims[];
 };
@@ -29,9 +32,10 @@ struct TensorImpl {
 };
 
 struct ElementWiseMultiply {
-    TensorImpl input_a;   // output tensor (result stored here)
-    TensorImpl input_b;   // input tensor to multiply
-    uint mode;            // 0 = tiled, 1 = simple
+    TensorImpl input_a;   // first input tensor (also output if mode = 0)
+    TensorImpl input_b;   // second input tensor to multiply
+    TensorImpl input_c;   // output tensor (used if mode = 1)
+    uint mode;            // 0 = in-place (a = a * b), 1 = separate output (c = a * b)
     uint batch_size;
     uint m, n;
     uint accumulate_grad; // 0: overwrite, 1: += for grads
@@ -82,46 +86,61 @@ void backward_pass() {
     uint gid = gl_GlobalInvocationID.x;
     ElementWiseMultiply op = push.context.ctx;
     
+    // Determine which tensor holds the output gradient based on mode
+    TensorImpl output_tensor = (op.mode == 0u) ? op.input_a : op.input_c;
+    
     // Check bounds - iterate over output elements
-    if (gid >= op.input_a.numel) {
+    if (gid >= output_tensor.numel) {
         return;
     }
     
-    // Get the gradient from output (input_a)
-    float grad_output = op.input_a.grad.grad[gid];
+    // Get the gradient from the output tensor
+    float grad_output = output_tensor.grad.grad[gid];
     
-    // Convert global index to multi-dimensional indices
+    // Convert global index to multi-dimensional indices based on output shape
     int indices[8];
-    unravel_index(gid, op.input_a, indices);
+    unravel_index(gid, output_tensor, indices);
     
-    // Get the corresponding index in input_b with broadcasting
-    uint idx_b = ravel_index_with_broadcast(indices, op.input_b, op.input_a.ndim);
+    // Get the corresponding indices in input_a and input_b with broadcasting
+    uint idx_a = ravel_index_with_broadcast(indices, op.input_a, output_tensor.ndim);
+    uint idx_b = ravel_index_with_broadcast(indices, op.input_b, output_tensor.ndim);
     
     // Get values for gradient computation
     // For c = a * b:
     // dc/da = b
     // dc/db = a
-    float val_a_original = op.input_a.data.data[gid];
     float val_b = op.input_b.data.data[idx_b];
+    float val_a;
     
-    // Note: After forward pass, input_a contains result (a*b)
-    // We need original a value: a_original = (a*b) / b
-    float a_original = (abs(val_b) > 1e-10) ? (val_a_original / val_b) : 0.0;
+    if (op.mode == 0u) {
+        // Mode 0: In-place operation
+        // After forward pass, input_a contains result (a*b)
+        // We need original a value: a_original = (a*b) / b
+        float val_a_result = op.input_a.data.data[idx_a];
+        val_a = (abs(val_b) > 1e-10) ? (val_a_result / val_b) : 0.0;
+    } else {
+        // Mode 1: Separate output
+        // input_a still contains original value
+        val_a = op.input_a.data.data[idx_a];
+    }
     
     // Accumulate gradient for input_a (d_a = grad_output * b)
+    // Need atomic operation because of broadcasting (multiple outputs may map to same input_a element)
     if (op.input_a.requires_grad != 0) {
         float grad_a = grad_output * val_b;
         if (op.accumulate_grad != 0) {
-            atomicAdd(op.input_a.grad.grad[gid], grad_a);
+            atomicAdd(op.input_a.grad.grad[idx_a], grad_a);
         } else {
-            op.input_a.grad.grad[gid] = grad_a;
+            // For non-accumulate mode, we still need atomics for broadcasting
+            // This is only safe if we know no broadcasting occurs for input_a
+            atomicAdd(op.input_a.grad.grad[idx_a], grad_a);
         }
     }
     
     // Accumulate gradient for input_b (d_b = grad_output * a)
     // Need atomic operation because of broadcasting (multiple outputs may map to same input_b element)
     if (op.input_b.requires_grad != 0) {
-        float grad_b = grad_output * a_original;
+        float grad_b = grad_output * val_a;
         atomicAdd(op.input_b.grad.grad[idx_b], grad_b);
     }
 }

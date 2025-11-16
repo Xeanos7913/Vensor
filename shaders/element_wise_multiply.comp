@@ -10,12 +10,15 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 layout(buffer_reference, std430, scalar) buffer tensor_data {
     float data[];
 };
+
 layout(buffer_reference, std430, scalar) buffer tensor_grad {
     float grad[];
 };
+
 layout(buffer_reference, std430, scalar) buffer tensor_strides {
     int strides[];
 };
+
 layout(buffer_reference, std430, scalar) buffer tensor_shape {
     int dims[];
 };
@@ -29,9 +32,10 @@ struct TensorImpl {
 };
 
 struct ElementWiseMultiply {
-    TensorImpl input_a;   // output tensor (result stored here)
-    TensorImpl input_b;   // input tensor to multiply
-    uint mode;            // 0 = tiled, 1 = simple
+    TensorImpl input_a;   // first input tensor (also output if mode = 0)
+    TensorImpl input_b;   // second input tensor to multiply
+    TensorImpl input_c;   // output tensor (used if mode = 1)
+    uint mode;            // 0 = in-place (a = a * b), 1 = separate output (c = a * b)
     uint batch_size;
     uint m, n;
     uint accumulate_grad; // 0: overwrite, 1: += for grads
@@ -59,7 +63,6 @@ void unravel_index(uint flat_idx, TensorImpl tensor, out int indices[8]) {
 // Convert multi-dimensional indices to flat index with broadcasting
 uint ravel_index_with_broadcast(int indices[8], TensorImpl tensor, uint output_ndim) {
     uint flat_idx = 0;
-    
     // Handle broadcasting: align dimensions from the right
     int offset = int(output_ndim) - int(tensor.ndim);
     
@@ -82,26 +85,40 @@ void main() {
     uint gid = gl_GlobalInvocationID.x;
     ElementWiseMultiply op = push.context.ctx;
     
-    // Check bounds
-    if (gid >= op.input_a.numel) {
+    // Determine which tensor defines the output shape
+    TensorImpl output_tensor = (op.mode == 0u) ? op.input_a : op.input_c;
+    
+    // Check bounds based on output tensor
+    if (gid >= output_tensor.numel) {
         return;
     }
     
-    // Determine the output shape (use input_a as reference)
-    uint output_ndim = op.input_a.ndim;
+    // Get output dimensions
+    uint output_ndim = output_tensor.ndim;
     
     // Convert global index to multi-dimensional indices based on output shape
     int indices[8];
-    unravel_index(gid, op.input_a, indices);
+    unravel_index(gid, output_tensor, indices);
     
-    // Get flat indices for both tensors with broadcasting
-    uint idx_a = gid; // input_a is the output, no broadcasting needed
+    // Get flat indices for both input tensors with broadcasting
+    uint idx_a = ravel_index_with_broadcast(indices, op.input_a, output_ndim);
     uint idx_b = ravel_index_with_broadcast(indices, op.input_b, output_ndim);
     
-    // Perform element-wise multiplication
+    // Read input values
     float val_a = op.input_a.data.data[idx_a];
     float val_b = op.input_b.data.data[idx_b];
     
-    // Store result back to input_a (in-place operation: b = b * a)
-    op.input_a.data.data[idx_a] = val_a * val_b;
+    // Compute result
+    float result = val_a * val_b;
+    
+    // Store result based on mode
+    if (op.mode == 0u) {
+        // Mode 0: In-place operation (a = a * b)
+        // Output goes to input_a at the same index as we read from
+        op.input_a.data.data[idx_a] = result;
+    } else {
+        // Mode 1: Separate output (c = a * b)
+        // Output goes to input_c at the current global index
+        op.input_c.data.data[gid] = result;
+    }
 }

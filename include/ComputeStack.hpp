@@ -494,6 +494,7 @@ int device_initialization(Init& init) {
     }  
     init.device = device_ret.value();  
     std::cout << "Logical Device created\n";
+    volkLoadDevice(init.device.device);
 
     init.disp = init.device.make_table();  
     std::cout << "Device Dispatch Table created\n";

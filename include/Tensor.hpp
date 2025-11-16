@@ -169,17 +169,20 @@ struct matadd_context {
 };
 
 struct matadd_inplace_context {
-    tensor_impl input_a;      // [B?, M, N] - addend (read-only)
-    tensor_impl input_b;      // [B?, M, N] - accumulator (read-write, in-place)
+    tensor_impl input_a;   // first input tensor (also output if mode = 0)
+    tensor_impl input_b;   // second input tensor to add
+    tensor_impl input_c;   // output tensor (used if mode = 1)
+    uint mode;            // 0 = in-place (a = a + b), 1 = separate output (c = a + b)
     uint batch_size;
     uint m, n;
-    uint accumulate_grad;    // 0: overwrite, 1: += for grads
+    uint accumulate_grad; // 0: overwrite, 1: += for grads
 };
 
 struct matmul_elementwise_context {
-    tensor_impl input_a;
-    tensor_impl input_b;
-    uint mode;            // doesn't do anything
+    tensor_impl input_a;   // first input tensor (also output if mode = 0)
+    tensor_impl input_b;   // second input tensor to multiply
+    tensor_impl input_c;   // output tensor (used if mode = 1)
+    uint mode;            // 0 = in-place (a = a * b), 1 = separate output (c = a * b)
     uint batch_size;
     uint m, n;
     uint accumulate_grad; // 0: overwrite, 1: += for grads
@@ -580,7 +583,9 @@ struct Tensor {
 
     Tensor<T>* operator *(Tensor<T>* other);
     Tensor<T>* operator +(Tensor<T>* other);
-
+    void elementwise_multiply(Tensor<T>* other);
+    void elementwise_add(Tensor<T>* other);
+    
     void save_to_file(const std::string& filename) const {
         std::ofstream outFile(filename, std::ios::binary);
         if (!outFile) {
@@ -2029,8 +2034,8 @@ struct TensorPool {
         }
 	}
 
-    // tensor_a = tensor_a + tensor_b
-    void tensor_add_inplace(const std::string& tensor_b, const std::string& tensor_a, uint32_t mode = 0) {
+    // tensor_c = tensor_a + tensor_b or tensor_a = tensor_a + tensor_b
+    void tensor_add_inplace(const std::string& tensor_b, const std::string& tensor_a, const std::string& tensor_c = "", uint32_t mode = 0) {
         matadd_inplace_context uniform{};
         
         // Helpers
@@ -2054,6 +2059,13 @@ struct TensorPool {
         // uniforms
         uniform.input_a = tensors[tensor_a]->getTensorImpl();
         uniform.input_b = tensors[tensor_b]->getTensorImpl(); // in-place output
+        if(!tensor_c.empty()){
+            if(tensors[tensor_a]->shape != tensors[tensor_c]->shape) throw std::invalid_argument("Only tensor_b can be broadcasted. Tensor_a and c must have the same shapes");
+            uniform.input_c = tensors[tensor_c]->getTensorImpl();
+            uniform.mode = 1;
+        }else {
+            uniform.mode = 0;
+        }
         uniform.batch_size = batch_size;
         uniform.m = M;
         uniform.n = N;
@@ -2096,8 +2108,8 @@ struct TensorPool {
         }
     }
 
-    // tensor_a = tensor_a * tensor_b
-    void tensor_multiply_elementwise_inplace(const std::string& tensor_b, const std::string& tensor_a, uint32_t mode = 0) {
+    // tensor_c = tensor_a * tensor_b or tensor_a = tensor_a * tensor_b
+    void tensor_multiply_elementwise(const std::string& tensor_b, const std::string& tensor_a, const std::string& tensor_c = "", uint32_t mode = 0) {
         matmul_elementwise_context uniform{};
         
         // Helpers
@@ -2109,7 +2121,7 @@ struct TensorPool {
         };
 
         const auto& shapeA = tensors[tensor_a]->shape; // A[..., M, N]
-        const auto& shapeB = tensors[tensor_b]->shape; // B[..., M, N] (in-place output)
+        const auto& shapeB = tensors[tensor_b]->shape; // B[..., M, N]
         
         // last-2 dims
         uint32_t M = shapeB.size() >= 2 ? shapeB[shapeB.size() - 2] : 1;
@@ -2120,7 +2132,14 @@ struct TensorPool {
         
         // uniforms
         uniform.input_a = tensors[tensor_a]->getTensorImpl();
-        uniform.input_b = tensors[tensor_b]->getTensorImpl(); // in-place output
+        uniform.input_b = tensors[tensor_b]->getTensorImpl();
+        if(!tensor_c.empty()){
+            if(tensors[tensor_a]->shape != tensors[tensor_c]->shape) throw std::invalid_argument("Only tensor_b can be broadcasted. Tensor_a and c must have the same shapes");
+            uniform.input_c = tensors[tensor_c]->getTensorImpl();
+            uniform.mode = 1;
+        }else {
+            uniform.mode = 0;
+        }
         uniform.batch_size = batch_size;
         uniform.m = M;
         uniform.n = N;
@@ -2787,5 +2806,24 @@ define coperator(Tensor<float>*, matmul, Tensor<float>*, Tensor<float>*){
 
 template<typename T>
 Tensor<T>* Tensor<T>::operator*(Tensor<T>* other) {
-    
+    auto* output = &pool->createTensor(this->shape, name + other->name + "-elementwise_multiply_output");
+    pool->tensor_multiply_elementwise(other->name, name, output->name);
+    return output;
+}
+
+template<typename T>
+Tensor<T>* Tensor<T>::operator+(Tensor<T>* other) {
+    auto* output = &pool->createTensor(this->shape, name + other->name + "-elementwise_addition_output");
+    pool->tensor_add_inplace(other->name, name, output->name);
+    return output;
+}
+
+template<typename T>
+void Tensor<T>::elementwise_add(Tensor<T>* other) {
+    pool->tensor_add_inplace(other->name, name);
+}
+
+template<typename T>
+void Tensor<T>::elementwise_multiply(Tensor<T>* other) {
+    pool->tensor_multiply_elementwise(other->name, name);
 }
