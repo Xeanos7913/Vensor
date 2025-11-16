@@ -2183,7 +2183,7 @@ struct TensorPool {
     }
 
     // computes std = exp(0.5 * logvar)
-    void tensor_logvar_to_std(const std::string& logvar_tensor, const std::string& std_tensor, uint32_t mode = 0) {
+    Tensor<T>* tensor_logvar_to_std(const std::string& logvar_tensor, std::string std_tensor = "", uint32_t mode = 0) {
         logvar_to_std_context uniform{};
         
         // Helpers
@@ -2194,8 +2194,15 @@ struct TensorPool {
             return (uint32_t)p;
         };
 
+        // if no output is given, create output. If created output already exists, use that
+        Tensor<T>* output;
+        if(std_tensor.empty()){
+            output = &createTensor(tensors[logvar_tensor]->shape, logvar_tensor + "-std_dev_tensor");
+            std_tensor = logvar_tensor + "-std_dev_tensor";
+        }
+
         const auto& shapeA = tensors[logvar_tensor]->shape; // A[..., M, N]
-        const auto& shapeB = tensors[std_tensor]->shape; // B[..., M, N] (in-place output)
+        const auto& shapeB = tensors[std_tensor]->shape; // B[..., M, N]
         
         // last-2 dims
         uint32_t M = shapeB.size() >= 2 ? shapeB[shapeB.size() - 2] : 1;
@@ -2233,6 +2240,7 @@ struct TensorPool {
             pushConsts.uniformAddress = logvarToStdShader.uniformBuffer->getBufferAddress();
             logvarToStdShader.loadUniform(uniform, pushConsts);
             logvarToStdShader.execute(workgroup);
+            return output;
         }
         else if (mode == 1) {
             // Backward pass
@@ -2240,6 +2248,7 @@ struct TensorPool {
             pushConsts.uniformAddress = logvarToStdShaderBackward.uniformBuffer->getBufferAddress();
             logvarToStdShaderBackward.loadUniform(uniform, pushConsts);
             logvarToStdShaderBackward.execute(workgroup);
+
         }
     }
 

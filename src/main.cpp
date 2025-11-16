@@ -540,10 +540,6 @@ struct VAE {
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
 		kldLoss = KLDloss<float>(&tensorPool, 16, "kld");
-
-		// intermediate tensors
-		tensorPool.createTensor({16, 1, latent_dim}, "std");
-		tensorPool.createTensor({16, 1, latent_dim}, "eps");
 	}
 
 	std::pair<Tensor<float>*, Tensor<float>*> encode(Tensor<float>* input) {
@@ -560,12 +556,13 @@ struct VAE {
 	// eps = random gaussian
 	// mu + eps * std (in-place operations onto mu)
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		tensorPool.tensor_logvar_to_std(logvar->name, "std");
+		auto std_tensor = tensorPool.tensor_logvar_to_std(logvar->name);
+		auto eps_tensor = &tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
-		tensorPool.tensor_multiply_elementwise_inplace("eps", "std");
-		tensorPool.tensor_add_inplace("std", mu->name);
+		auto o = std_tensor->operator*(eps_tensor);
+		auto ret = mu->operator+(o);
 
-		return mu;
+		return ret;
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
