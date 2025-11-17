@@ -403,7 +403,7 @@ void compute_bias_grad() {
         
         for (int idx = local_id; idx < H_out * W_out; idx += local_size) {
             sum += ctx.out_tensor.grad.grad[grad_out_offset + idx];
-            ctx.out_tensor.grad.grad[grad_out_offset + idx] = 0.0f; // make sure to zero out the intermediate tensor's gradient at the end here
+            //ctx.out_tensor.grad.grad[grad_out_offset + idx] = 0.0f; // make sure to zero out the intermediate tensor's gradient at the end here
         }
     }
     

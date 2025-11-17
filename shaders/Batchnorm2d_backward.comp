@@ -240,10 +240,10 @@ void backward_kernel() {
         
         if (ctx.accumulate_grad == 1) {
             atomicAdd(ctx.input_tensor.grad.grad[idx], grad_input);
-            ctx.out_tensor.grad.grad[idx] = 0.0f;
+            //ctx.out_tensor.grad.grad[idx] = 0.0f;
         } else {
             ctx.input_tensor.grad.grad[idx] = grad_input;
-            ctx.out_tensor.grad.grad[idx] = 0.0f;
+            //ctx.out_tensor.grad.grad[idx] = 0.0f;
         }
     }
 }

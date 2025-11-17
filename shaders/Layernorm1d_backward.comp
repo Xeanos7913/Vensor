@@ -245,7 +245,7 @@ void backward_kernel() {
             }
             
             // Zero out output gradient to clean up compute tree
-            storeVec4ContigGrad(ctx.out_tensor.grad, base_idx + idx, vec4(0.0), remaining);
+            //storeVec4ContigGrad(ctx.out_tensor.grad, base_idx + idx, vec4(0.0), remaining);
         }
     }
 }

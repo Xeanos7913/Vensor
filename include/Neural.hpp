@@ -96,6 +96,10 @@ struct LinearReLU : public Module<T>{
 		}
 		tensorPool->tensor_linear_ReLU(output_name, input->name, weights_name, bias_name, 0);
 		input->view(o);
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_linear_ReLU(this->output_name, input->name, this->weights_name, this->bias_name, 1);
+			input->backward();
+		};
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
@@ -173,6 +177,10 @@ struct Linear : public Module<T> {
 		}
 		tensorPool->tensor_linear(output_name, input->name, weights_name, bias_name, 0);
 		input->view(o); // return the tensor's original dims
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_linear(this->output_name, input->name, this->weights_name, this->bias_name, 1);
+			input->backward();
+		};
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
@@ -210,6 +218,10 @@ struct ReLU : public Module<T> {
 		}
 		// Apply ReLU activation function
 		tensorPool->tensor_ReLU(output_name, input->name);
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_ReLU(this->output_name, input->name, 1);
+			input->backward();
+		};
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
@@ -274,6 +286,10 @@ struct SoftmaxCrossEntropy : public Module<T> {
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		tensorPool->tensor_cross_entropy(output_name, input->name, target->name, softmax_output->name, 0);
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_cross_entropy(this->output_name, input->name, this->target->name, this->softmax_output->name, 1);
+			input->backward();
+		};
 		return this->output;
 	}
 
@@ -415,6 +431,10 @@ struct BatchNorm1d : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if (mode == 0){
 			tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
+			this->output->back = [this, input](){
+				this->tensorPool->tensor_batchnorm_1d(input->name, this->weight_tensor, this->bias_tensor, this->running_mean, this->running_var, this->output_name, this->save_mean->name, this->save_var->name, 1);
+				input->backward();
+			};
 		}else {
 			tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, "", "", 0);
 		}
@@ -510,6 +530,10 @@ struct BatchNorm2d : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(mode == 0){
 			tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
+			this->output->back = [this, input](){
+				this->tensorPool->tensor_batchnorm_2d(input->name, this->weight_tensor, this->bias_tensor, this->running_mean, this->running_var, this->output_name, this->save_mean->name, this->save_var->name, 1);
+				input->backward();
+			};
 		} else {
 			tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, "", "", 0);
 		}
@@ -538,8 +562,7 @@ struct ResidualConnect : public Module<T>{
 	}
 
 	Tensor<T>* forward(Tensor<T>* input) override {
-		tensorPool->tensor_add_inplace(input_b->name, input_a->name, 0);
-		return input_b;
+		return input_a->operator+(input_b);
 	}
 
 	void backward(Tensor<T>* input) override {
@@ -606,6 +629,10 @@ struct Layernorm : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(mode == 0){
 			tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 0);
+			this->output->back = [this, input](){
+				this->tensorPool->tensor_layernorm(input->name, this->weight_tensor, this->bias_tensor, this->output_name, this->save_mean->name, this->save_rstd->name, 1);
+				input->backward();
+			};
 		}
 		else {
 			tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, "", "", 0);
@@ -729,6 +756,11 @@ struct Conv2d3x3 : public Module<T> {
 		}
 
 		tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups, 1);
+			input->backward();
+		};
+		
 		return this->output;
 	}
 
@@ -863,6 +895,11 @@ struct Conv2d : public Module<T> {
 		}
 
 		tensorPool->tensor_conv2d(output_name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_conv2d(output_name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
+			input->backward();
+		};
+		
 		return this->output;
 	}
 
@@ -1020,6 +1057,23 @@ struct TransposedConv2d : public Module<T> {
             output_pad_h, output_pad_w,
             groups
         );
+
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_transposed_conv2d(
+				output_name,
+				input->name,
+				weight_tensor->name,
+				bias_tensor->name,
+				kernel_h, kernel_w,
+				1, // mode = backward
+				stride_w, stride_h,
+				pad_h, pad_w,
+				dilation_h, dilation_w,
+				output_pad_h, output_pad_w,
+				groups
+        	);
+			input->backward();
+		};
         return this->output;
     }
 
@@ -1091,6 +1145,10 @@ struct MaxPool : public Module<T> {
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		tensorPool->tensor_max_pool(input->name, this->output->name, kernel_h, kernel_w, stride_h, stride_w, 0);
+		this->output->back = [this,input](){
+			this->tensorPool->tensor_max_pool(input->name, this->output->name, kernel_h, kernel_w, stride_h, stride_w, 1);
+			input->backward();
+		};
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {
@@ -1125,6 +1183,9 @@ struct EmbeddingTable : public Module<T> {
 	// input tensor contains token indices (B, token_count)
 	Tensor<T>* forward(Tensor<T>* input) override {
 		tensorPool->tensor_embed_lookup(this->output->name, embedding_tensor->name, input->name, 0);
+		this->output->back = [this, input](){
+			this->tensorPool->tensor_embed_lookup(this->output->name, this->embedding_tensor->name, input->name, 1);
+		};
 		return this->output;
 	}
 	void backward(Tensor<T>* input) override {

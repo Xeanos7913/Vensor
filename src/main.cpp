@@ -554,15 +554,13 @@ struct VAE {
 	// does the same as:
 	// std = (0.5 * logvar).exp()
 	// eps = random gaussian
-	// mu + eps * std (in-place operations onto mu)
+	// mu + eps * std
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
 		auto std_tensor = tensorPool.tensor_logvar_to_std(logvar->name);
 		auto eps_tensor = &tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
-		auto o = std_tensor->operator*(eps_tensor);
-		auto ret = mu->operator+(o);
 
-		return ret;
+		return mu->operator+(std_tensor->operator*(eps_tensor));
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){

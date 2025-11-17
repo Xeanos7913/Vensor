@@ -413,6 +413,8 @@ struct Tensor {
 
    std::string name;
 
+   std::function<void()> back;
+
    Tensor(std::initializer_list<uint32_t> dims, Allocator* allocator)
        : shape(dims),
        allocator(allocator),
@@ -503,6 +505,10 @@ struct Tensor {
            strides[i] = strides[i + 1] * shape[i + 1];  
        }  
     }  
+
+    void backward(){
+        if (back) back();
+    }
 
     void view(std::initializer_list<uint32_t> dims) {
         std::vector<uint32_t> new_shape(dims);
@@ -1230,20 +1236,6 @@ struct TensorPool {
                 conv2dShaderBackward.loadUniform(uniform, pushConsts);
                 conv2dShaderBackward.execute(workgroup);
             }
-            
-            // Kernel 3: Zero out upstream gradient
-            {
-                uint32_t groupX = tensors[weight_tensor]->shape[0]; // F (num filters)
-                uint32_t groupY = 1;
-                uint32_t groupZ = 1;
-                uint32_t workgroup[3] = { groupX, groupY, groupZ };
-                
-                pushConsts.grid_size = { groupX, groupY, groupZ };
-                pushConsts.mode = 3; // zero out upstream gradients
-                uniform.kernel_type = 3;
-                conv2dShaderBackward.loadUniform(uniform, pushConsts);
-                conv2dShaderBackward.execute(workgroup);
-            }
         }
     };
 
@@ -1345,17 +1337,6 @@ struct TensorPool {
                 pushConsts.grid_size = { C_out, 1u, 1u };
                 pushConsts.mode = 2; // bias gradient
                 uniform.kernel_type = 2;
-                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
-                transposedConv2dShaderBackward.execute(workgroup);
-            }
-
-            // Kernel 3: Zero out upstream gradient
-            {
-                uint32_t C_out = tensors[weight_tensor]->shape[1]; // C_out
-                uint32_t workgroup[3] = { C_out, 1u, 1u };
-                pushConsts.grid_size = { C_out, 1u, 1u };
-                pushConsts.mode = 3; // zero upstream grads
-                uniform.kernel_type = 3;
                 transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
                 transposedConv2dShaderBackward.execute(workgroup);
             }
@@ -2807,6 +2788,11 @@ define coperator(Tensor<float>*, matmul, Tensor<float>*, Tensor<float>*){
 
     auto *output = &a->pool->createTensor(output_shape, a->name + b->name + "-matmul_output");
     a->pool->tensor_mult(output->name, a->name, b->name);
+    output->back = [a, b, output](){
+        a->pool->tensor_mult(output->name, a->name, b->name, 1);
+        a->backward();
+        b->backward();
+    };
     
     return output;
 }
@@ -2816,6 +2802,11 @@ define coperator(Tensor<float>*, matmul, Tensor<float>*, Tensor<float>*){
 template<typename T>
 Tensor<T>* Tensor<T>::operator*(Tensor<T>* other) {
     auto* output = &pool->createTensor(this->shape, name + other->name + "-elementwise_multiply_output");
+    output->back = [this, other, output](){
+        pool->tensor_multiply_elementwise(other->name, this->name, output->name, 1);
+        this->backward();
+        other->backward();
+    };
     pool->tensor_multiply_elementwise(other->name, name, output->name);
     return output;
 }
@@ -2823,6 +2814,11 @@ Tensor<T>* Tensor<T>::operator*(Tensor<T>* other) {
 template<typename T>
 Tensor<T>* Tensor<T>::operator+(Tensor<T>* other) {
     auto* output = &pool->createTensor(this->shape, name + other->name + "-elementwise_addition_output");
+    output->back = [this, other, output](){
+        pool->tensor_add_inplace(other->name, this->name, output->name, 1);
+        this->backward();
+        other->backward();
+    };
     pool->tensor_add_inplace(other->name, name, output->name);
     return output;
 }

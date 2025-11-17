@@ -81,5 +81,5 @@ void main() {
     uint emb_off = off2or3(ctx.embedding_tensor, 0u, token_idx, e);
     // atomicAdd the gradient
     atomicAdd(ctx.embedding_tensor.grad.grad[emb_off], g);
-    ctx.output_tensor.grad.grad[out_grad_off] = 0.0f; // zero out upstream gradient after calculation
+    //ctx.output_tensor.grad.grad[out_grad_off] = 0.0f; // zero out upstream gradient after calculation
 }

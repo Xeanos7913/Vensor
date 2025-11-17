@@ -436,7 +436,7 @@ void computeBiasGradient(uint B, uint M, uint N) {
                         } else {
                             atomicAdd(c.bias_tensor.grad.grad[biasIdx], grad_val);
                         }
-                        c.out_tensor.grad.grad[idxOut] = 0.0f; // make sure to zero out upstream gradient after everything is done
+                        //c.out_tensor.grad.grad[idxOut] = 0.0f; // make sure to zero out upstream gradient after everything is done
                     }
                 }
             }
