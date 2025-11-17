@@ -531,7 +531,7 @@ struct BatchNorm2d : public Module<T> {
 		if(mode == 0){
 			tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
 			this->output->back = [this, input](){
-				this->tensorPool->tensor_batchnorm_2d(input->name, this->weight_tensor, this->bias_tensor, this->running_mean, this->running_var, this->output_name, this->save_mean->name, this->save_var->name, 1);
+				this->tensorPool->tensor_batchnorm_2d(input->name, this->weight_tensor->name, this->bias_tensor->name, this->running_mean->name, this->running_var->name, this->output_name, this->save_mean->name, this->save_var->name, 1);
 				input->backward();
 			};
 		} else {
@@ -630,7 +630,7 @@ struct Layernorm : public Module<T> {
 		if(mode == 0){
 			tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 0);
 			this->output->back = [this, input](){
-				this->tensorPool->tensor_layernorm(input->name, this->weight_tensor, this->bias_tensor, this->output_name, this->save_mean->name, this->save_rstd->name, 1);
+				this->tensorPool->tensor_layernorm(input->name, this->weight_tensor->name, this->bias_tensor->name, this->output_name, this->save_mean->name, this->save_rstd->name, 1);
 				input->backward();
 			};
 		}

@@ -506,7 +506,7 @@ struct Tensor {
        }  
     }  
 
-    void backward(){
+    void backward() const {
         if (back) back();
     }
 
