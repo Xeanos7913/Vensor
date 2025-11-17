@@ -37,9 +37,10 @@ A C++ machine learning library utilizing Vulkan for GPU acceleration. Developed 
 ## Roadmap
 - Model weight import/export functionality
 - PyTorch model compatibility
-- Enhanced compute graph representation
+- Enhanced compute graph representation (currently working on building a robust autograd engine)
 - Additional optimizers and layers
 - Improved random number generation
 
 ## Notes
 The project is under active development. Current implementation focuses on core functionality and shader kernel implementations.
+The autograd engine is under heavy development. I'd not recommend actually using this library for anything serious right now. It's no more than some learning material as it is now.
