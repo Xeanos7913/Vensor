@@ -139,6 +139,7 @@ struct matmul_context {
     uint32_t batch_size;
     uint32_t m, n, k;           // Matrix dimensions: A(m,k) @ B(k,n) = C(m,n)
     uint32_t accumulate_grad = 1;   // Whether to accumulate or overwrite gradients
+    uint32_t use_bias = 0;
 };
 
 struct mean_context {
@@ -587,8 +588,9 @@ struct Tensor {
         shapeBuffer->alloc(shape);
     }
 
-    Tensor<T>& operator *(Tensor<T>&other);
-    Tensor<T>& operator +(Tensor<T>& other);
+    Tensor<T>& operator*(Tensor<T>&other);
+    Tensor<T>& operator+(Tensor<T>& other);
+    Tensor<T>& matmul(Tensor<T>& other); // matmul operator
     void elementwise_multiply(Tensor<T>& other);
     void elementwise_add(Tensor<T>& other);
     
@@ -845,10 +847,6 @@ struct TensorPool {
     uint32_t tile_size[3] = { 16, 16, 1 };
     TensorPool(Allocator* alloc)
             : allocator(alloc),
-            multiplicationShader(
-                readShaderBytecode("compiled_shaders/tensor_multiply.comp.spv"), alloc, tile_size),
-            multiplicationShaderBackward(
-                readShaderBytecode("compiled_shaders/tensor_multiply_backward.comp.spv"), alloc, tile_size),
             additionShader(
                 readShaderBytecode("compiled_shaders/tensor_addition.comp.spv"), alloc, tile_size),
             additionShaderBackward(
@@ -1809,141 +1807,6 @@ struct TensorPool {
         }
     }
 
-    void tensor_mult(const std::string& output_tensor, const std::string& input_tensor, const std::string& weight_tensor, uint32_t mode = 0) {
-
-        try {
-            broadcastShapes(tensors[input_tensor]->shape, tensors[weight_tensor]->shape, Operation::MULTIPLICATION);
-        }
-        catch (const std::invalid_argument& e) {
-            std::cerr << "Error in tensor_mult: " << e.what() << "\n";
-            throw;
-        }
-
-        matmul_context uniform{};
-
-        // Helpers
-        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
-            uint64_t p = 1;
-            for (size_t i = l; i < r; ++i) p *= v[i];
-            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
-            return static_cast<uint32_t>(p);
-        };
-
-        // Input shape X[..., M, K]
-        const auto& shape = tensors[input_tensor]->shape;
-        if (shape.size() < 2)
-            throw std::invalid_argument("Rank must be >= 2");
-        uint32_t M = shape[shape.size() - 2];
-        uint32_t K = shape.back();
-
-        // Weight shape W[..., N, K] (transposed)
-        const auto& weight_shape = tensors[weight_tensor]->shape;
-        if (weight_shape.size() < 2)
-            throw std::invalid_argument("Weight rank must be >= 2");
-        uint32_t KB = weight_shape.back();
-        uint32_t N = weight_shape[weight_shape.size() - 2];
-        if (KB != K)
-            throw std::invalid_argument("Inner dims mismatch: X[...,M,K] @ W[...,N,K] (transposed)");
-
-        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
-
-        DEBUG_PRINT("Multiplying tensor " << input_tensor << " of shape "
-            << shapeToString(shape) << " with transposed weights " << weight_tensor
-            << " of shape " << shapeToString(weight_shape));
-
-        // --- Warp-tiling parameters (must match shader) ---
-        constexpr uint32_t BM = 128;  // Block tile size M
-        constexpr uint32_t BN = 128;  // Block tile size N
-        constexpr uint32_t BK = 8;    // Block tile size K
-        constexpr uint32_t NUM_THREADS = 256;  // Threads per workgroup
-
-        // --- Compute dispatch grid based on mode ---
-        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
-
-        // uniforms
-        uniform.m = M;
-        uniform.n = N;
-        uniform.k = K;
-        uniform.batch_size = batch_size;
-        uniform.accumulate_grad = 1; // add
-
-        uint32_t dispatchM, dispatchN, dispatchBatch;
-
-        if (mode == 0) {
-            // Mode 0: Use output tensor dimensions
-            const auto& output_shape = tensors[output_tensor]->shape;
-            if (output_shape.size() < 2)
-                throw std::invalid_argument("Output rank must be >= 2");
-
-            dispatchM = output_shape[output_shape.size() - 2];
-            dispatchN = output_shape[output_shape.size() - 1];
-            dispatchBatch = prod(output_shape, 0, output_shape.size() - 2);
-
-            DEBUG_PRINT("Dispatch (output dims): ");
-        }
-        else {
-            // Mode 1: Use max dimensions of all tensors
-            auto maxDim = [](const std::vector<uint32_t>& a,
-                const std::vector<uint32_t>& b) {
-                    size_t L = std::max(a.size(), b.size());
-                    std::vector<uint32_t> res(L, 1);
-                    for (size_t i = 0; i < L; i++) {
-                        uint32_t av = (i < a.size() ? a[i] : 1);
-                        uint32_t bv = (i < b.size() ? b[i] : 1);
-                        res[i] = std::max(av, bv);
-                    }
-                    return res;
-                };
-
-            std::vector<uint32_t> maxShape = tensors[input_tensor]->shape;
-            auto transposedWeightShape = tensors[weight_tensor]->shape;
-            if (transposedWeightShape.size() >= 2) {
-                std::swap(transposedWeightShape[transposedWeightShape.size() - 1], 
-                         transposedWeightShape[transposedWeightShape.size() - 2]);
-            }
-            maxShape = maxDim(maxShape, transposedWeightShape);
-            
-            if (maxShape.size() < 2)
-                throw std::invalid_argument("Max rank must be >= 2");
-
-            dispatchM = maxShape[maxShape.size() - 2];
-            dispatchN = maxShape[maxShape.size() - 1];
-            dispatchBatch = prod(maxShape, 0, maxShape.size() - 2);
-
-            DEBUG_PRINT("Dispatch (max dims): ");
-        }
-
-        // Calculate workgroup dimensions based on warp-tiling parameters
-        // Each workgroup processes a BM x BN tile with NUM_THREADS threads
-        uint32_t groupX = ceilDiv(dispatchN, BN);
-        uint32_t groupY = ceilDiv(dispatchM, BM);
-        uint32_t groupZ = dispatchBatch;
-
-        DEBUG_PRINT(groupX << " × " << groupY
-            << " × " << groupZ << " workgroups (covering " << dispatchM << "×"
-            << dispatchN << " per batch)");
-        DEBUG_PRINT("Workgroup size: " << NUM_THREADS << " threads (" 
-            << BM << "×" << BN << " tile)");
-
-        uint32_t workgroup[3] = { groupX, groupY, groupZ };
-
-        tensor_push_const pushConsts{};
-        pushConsts.grid_size = { groupX, groupY, groupZ };
-
-        if (mode == 0) {
-            pushConsts.mode = mode;
-            pushConsts.uniformAddress = multiplicationShader.uniformBuffer->getBufferAddress();
-            multiplicationShader.loadUniform(uniform, pushConsts);
-            multiplicationShader.execute(workgroup);
-        }
-        else if (mode == 1) {
-            pushConsts.mode = mode;
-            pushConsts.uniformAddress = multiplicationShaderBackward.uniformBuffer->getBufferAddress();
-            multiplicationShaderBackward.loadUniform(uniform, pushConsts);
-            multiplicationShaderBackward.execute(workgroup);
-        }
-    }
-
     void tensor_add(const std::string& output_tensor, const std::string& tensor_a, const std::string& tensor_b, uint32_t mode = 0) {
         try {
             broadcastShapes(tensors[tensor_a]->shape, tensors[tensor_b]->shape, Operation::ADDITION);
@@ -2711,8 +2574,6 @@ struct TensorPool {
 
 private:
     // tensor operation shaders
-    gpuTaskNoDesc<T, tensor_push_const, matmul_context> multiplicationShader; // computes C = A @ B
-    gpuTaskNoDesc<T, tensor_push_const, matmul_context> multiplicationShaderBackward;
 	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShader; // computes C = A + B
 	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShader; // computes B = B + A
@@ -2753,11 +2614,34 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, tensor_max_pool_context> maxPoolShaderBackward;     // computes maxPool2D's backward pass with any kernel shape
 };
 
-// matmul operator only for floats
-define coperator(Tensor<float>*, matmul, Tensor<float>*, Tensor<float>*){
+template<typename T>
+Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
+    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_multiply_output");
+    output.back = [this, &other, &output](){
+        this->pool->tensor_multiply_elementwise(other.name, this->name, output.name, 1);
+        this->backward();
+        other.backward();
+    };
+    pool->tensor_multiply_elementwise(other.name, name, output.name);
+    return output;
+}
 
-    auto &shape_a = a->shape;
-    auto &shape_b = b->shape;
+template<typename T>
+Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
+    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_addition_output");
+    output.back = [this, &other, &output](){
+        this->pool->tensor_add_inplace(other.name, this->name, output.name, 1);
+        this->backward();
+        other.backward();
+    };
+    pool->tensor_add_inplace(other.name, name, output.name);
+    return output;
+}
+
+template<typename T>
+Tensor<T>& Tensor<T>::matmul(Tensor<T>& other){
+    auto &shape_a = this->shape;
+    auto &shape_b = other.shape;
 
     // Extract dimensions
     // shape_a: [..., M, K]
@@ -2790,40 +2674,14 @@ define coperator(Tensor<float>*, matmul, Tensor<float>*, Tensor<float>*){
     output_shape.push_back(M);
     output_shape.push_back(N);
 
-    auto *output = &a->pool->createTensor(output_shape, a->name + b->name + "-matmul_output");
-    a->pool->tensor_mult(output->name, a->name, b->name);
-    output->back = [a, b, output](){
-        a->pool->tensor_mult(output->name, a->name, b->name, 1);
-        a->backward();
-        b->backward();
+    auto &output = pool->createTensor(output_shape, name + other.name + "-matmul_output");
+    pool->tensor_linear(output.name, name, other.name);
+    output.back = [this, &other, &output](){
+        pool->tensor_linear(output.name, this->name, other.name, "", 1);
+        this->backward();
+        other.backward();
     };
     
-    return output;
-}
-
-#define matmul <matmul>
-
-template<typename T>
-Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
-    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_multiply_output");
-    output.back = [this, &other, &output](){
-        this->pool->tensor_multiply_elementwise(other.name, this->name, output.name, 1);
-        this->backward();
-        other.backward();
-    };
-    pool->tensor_multiply_elementwise(other.name, name, output.name);
-    return output;
-}
-
-template<typename T>
-Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
-    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_addition_output");
-    output.back = [this, &other, &output](){
-        this->pool->tensor_add_inplace(other.name, this->name, output.name, 1);
-        this->backward();
-        other.backward();
-    };
-    pool->tensor_add_inplace(other.name, name, output.name);
     return output;
 }
 

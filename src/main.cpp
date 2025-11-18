@@ -701,14 +701,14 @@ int main(void) {
 	Allocator* allocator = new Allocator(&init);
 	TensorPool<float> pool(allocator);
 
-	auto &a = pool.createTensor({1, 32, 32}, "a");
+	auto &a = pool.createTensor({5, 167, 267}, "a");
 	pool.tensor_fill_random("a", 1.0f, 1.0f);
-	auto &b = pool.createTensor({5, 32, 32}, "b");
+	auto &b = pool.createTensor({1, 167, 267}, "b");
 	pool.tensor_fill_random("b", 1.0f, 1.0f);
 
-	auto &e = a + b;
+	auto &out = a.matmul(b);
 
-	e.print();
+	out.print();
 
 	delete allocator;
 	return 0;
