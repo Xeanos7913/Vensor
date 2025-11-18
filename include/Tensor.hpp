@@ -508,7 +508,7 @@ struct Tensor {
     }  
 
     void backward() const {
-        if (back) back();
+        if (back) {back(); std::cout << "calling backward for tensor " << name << "\n";}
     }
 
     void view(std::initializer_list<uint32_t> dims) {
@@ -2075,7 +2075,7 @@ struct TensorPool {
 
         DEBUG_PRINT("Dispatch (in-place, broadcasting): ");
         DEBUG_PRINT(groupX << " × " << groupY
-                    << " × " << groupZ << " (covering max elements " << max_elements << ")");
+                    << " × " << groupZ << " (covering max elements " << num_elements_a << ")");
 
         uint32_t workgroup[3] = { groupX, groupY, groupZ };
         

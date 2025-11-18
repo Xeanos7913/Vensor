@@ -701,14 +701,43 @@ int main(void) {
 	Allocator* allocator = new Allocator(&init);
 	TensorPool<float> pool(allocator);
 
-	auto &a = pool.createTensor({5, 167, 267}, "a");
-	pool.tensor_fill_random("a", 1.0f, 1.0f);
-	auto &b = pool.createTensor({1, 167, 267}, "b");
-	pool.tensor_fill_random("b", 1.0f, 1.0f);
+	auto &input = pool.createTensor({16, 1, 256}, "input");
+	pool.tensor_fill_random("input", -2.5f, 2.5f);
 
-	auto &out = a.matmul(b);
+	auto linear1 = LinearReLU<float>(&pool, 256, 256, 16, "linear1");
+	auto bn1 = Layernorm<float>(&pool, {16, 1, 256}, {1, 256}, "bn1");
+	auto linear2 = LinearReLU<float>(&pool, 256, 256, 16, "linear2");
+	auto bn2 = BatchNorm1d<float>(&pool, 256, 1, 16, "bn2");
+	auto linear3 = LinearReLU<float>(&pool, 256, 16, 16, "linear3");
+	auto softmax = SoftmaxCrossEntropy<float>(&pool, 16, 1, 16, "softmax");
 
-	out.print();
+	auto &targets = pool.createTensor({16, 1, 16}, "targets");
+	targets.setElement(1.0f, {0, 0, 1});
+	targets.setElement(1.0f, {1, 0, 2});
+	targets.setElement(1.0f, {2, 0, 3});
+	targets.setElement(1.0f, {3, 0, 4});
+	targets.setElement(1.0f, {4, 0, 5});
+	targets.setElement(1.0f, {5, 0, 5});
+	targets.setElement(1.0f, {6, 0, 6});
+	targets.setElement(1.0f, {7, 0, 7});
+	targets.setElement(1.0f, {8, 0, 8});
+	targets.setElement(1.0f, {9, 0, 9});
+	targets.setElement(1.0f, {10, 0, 0});
+	targets.setElement(1.0f, {12, 0, 10});
+	targets.setElement(1.0f, {13, 0, 11});
+	targets.setElement(1.0f, {14, 0, 12});
+	targets.setElement(1.0f, {15, 0, 13});
+
+	softmax.target = &targets;
+
+	// residual connection
+	auto &o = input + *bn1(linear1(&input));
+
+	auto loss = softmax(linear3(bn2(linear2(&o))));
+
+	loss->backward();
+
+	input.printGradient();
 
 	delete allocator;
 	return 0;
