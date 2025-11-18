@@ -587,10 +587,10 @@ struct Tensor {
         shapeBuffer->alloc(shape);
     }
 
-    Tensor<T>* operator *(Tensor<T>* other);
-    Tensor<T>* operator +(Tensor<T>* other);
-    void elementwise_multiply(Tensor<T>* other);
-    void elementwise_add(Tensor<T>* other);
+    Tensor<T>& operator *(Tensor<T>&other);
+    Tensor<T>& operator +(Tensor<T>& other);
+    void elementwise_multiply(Tensor<T>& other);
+    void elementwise_add(Tensor<T>& other);
     
     void save_to_file(const std::string& filename) const {
         std::ofstream outFile(filename, std::ios::binary);
@@ -857,6 +857,10 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/tensor_inplace_addition.comp.spv"), alloc, tile_size),
             inplaceAdditionShaderBackward(
                 readShaderBytecode("compiled_shaders/tensor_inplace_addition_backward.comp.spv"), alloc, tile_size),
+            elementwiseMultiplicationShader(
+                readShaderBytecode("compiled_shaders/element_wise_multiply.comp.spv"), alloc, nullptr),
+            elementwiseMultiplicationShaderBackward(
+                readShaderBytecode("compiled_shaders/element_wise_multiply_backward.comp.spv"), alloc, nullptr),
             batchnormShader(
                 readShaderBytecode("compiled_shaders/Batchnorm.comp.spv"), alloc, nullptr),
             batchnormShaderBackward(
@@ -2800,35 +2804,35 @@ define coperator(Tensor<float>*, matmul, Tensor<float>*, Tensor<float>*){
 #define matmul <matmul>
 
 template<typename T>
-Tensor<T>* Tensor<T>::operator*(Tensor<T>* other) {
-    auto* output = &pool->createTensor(this->shape, name + other->name + "-elementwise_multiply_output");
-    output->back = [this, other, output](){
-        pool->tensor_multiply_elementwise(other->name, this->name, output->name, 1);
+Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
+    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_multiply_output");
+    output.back = [this, &other, &output](){
+        this->pool->tensor_multiply_elementwise(other.name, this->name, output.name, 1);
         this->backward();
-        other->backward();
+        other.backward();
     };
-    pool->tensor_multiply_elementwise(other->name, name, output->name);
+    pool->tensor_multiply_elementwise(other.name, name, output.name);
     return output;
 }
 
 template<typename T>
-Tensor<T>* Tensor<T>::operator+(Tensor<T>* other) {
-    auto* output = &pool->createTensor(this->shape, name + other->name + "-elementwise_addition_output");
-    output->back = [this, other, output](){
-        pool->tensor_add_inplace(other->name, this->name, output->name, 1);
+Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
+    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_addition_output");
+    output.back = [this, &other, &output](){
+        this->pool->tensor_add_inplace(other.name, this->name, output.name, 1);
         this->backward();
-        other->backward();
+        other.backward();
     };
-    pool->tensor_add_inplace(other->name, name, output->name);
+    pool->tensor_add_inplace(other.name, name, output.name);
     return output;
 }
 
 template<typename T>
-void Tensor<T>::elementwise_add(Tensor<T>* other) {
-    pool->tensor_add_inplace(other->name, name);
+void Tensor<T>::elementwise_add(Tensor<T>& other) {
+    pool->tensor_add_inplace(other.name, name);
 }
 
 template<typename T>
-void Tensor<T>::elementwise_multiply(Tensor<T>* other) {
-    pool->tensor_multiply_elementwise(other->name, name);
+void Tensor<T>::elementwise_multiply(Tensor<T>& other) {
+    pool->tensor_multiply_elementwise(other.name, name);
 }

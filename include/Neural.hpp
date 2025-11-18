@@ -78,6 +78,10 @@ struct LinearReLU : public Module<T>{
 		return {weights, bias};
 	}
 
+	std::vector<Tensor<T>*> getIntermediateTensors() override {
+		return {this->output};
+	}
+
 	void serializeTrainableTensors(std::ofstream& filestream) override {
 		weights->save_to_stream(filestream);
 		bias->save_to_stream(filestream);
@@ -319,6 +323,9 @@ struct MSEloss : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(target == nullptr) throw std::runtime_error("Target tensor for MSE loss not set!");
 		tensorPool->mse_loss(input->name, target->name, this->output->name);
+		this->output->back = [this, input](){
+			input->backward();
+		};
 		return this->output;
 	}
 
@@ -342,6 +349,9 @@ struct KLDloss : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(logvar_tensor == nullptr || mu_tensor == nullptr) throw std::runtime_error("logvar and mu tensors need to be set for KLDloss to work!");
 		tensorPool->kld_loss(mu_tensor->name, logvar_tensor->name, this->output->name);
+		this->output->back = [this, input](){
+			input->backward();
+		};
 		return this->output;
 	}
 

@@ -115,11 +115,11 @@ void forward_pass() {
     if (op.mode == 0u) {
         // Mode 0: In-place operation (a = a + b)
         // Output goes to input_a at the same index as we read from
-        op.input_a.data.data[idx_a] = result;
+        atomicAdd(op.input_a.data.data[idx_a], result);
     } else {
         // Mode 1: Separate output (c = a + b)
         // Output goes to input_c at the current global index
-        op.input_c.data.data[gid] = result;
+        op.input_c.data.data[gid] += result;
     }
 }
 

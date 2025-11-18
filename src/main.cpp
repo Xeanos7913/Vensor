@@ -560,7 +560,7 @@ struct VAE {
 		auto eps_tensor = &tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
 
-		return mu->operator+(std_tensor->operator*(eps_tensor));
+		return &(*mu + *std_tensor * *eps_tensor);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -680,7 +680,7 @@ struct Trainer {
 		delete allocator;
 	}
 };
-
+/*
 int main(void){
 	
 	Trainer t = Trainer();
@@ -691,6 +691,26 @@ int main(void){
 	//}
 	//t.save_model();
 
+	return 0;
+}
+*/
+
+int main(void) {
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
+	TensorPool<float> pool(allocator);
+
+	auto &a = pool.createTensor({1, 32, 32}, "a");
+	pool.tensor_fill_random("a", 1.0f, 1.0f);
+	auto &b = pool.createTensor({5, 32, 32}, "b");
+	pool.tensor_fill_random("b", 1.0f, 1.0f);
+
+	auto &e = a + b;
+
+	e.print();
+
+	delete allocator;
 	return 0;
 }
 
