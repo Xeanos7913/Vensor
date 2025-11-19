@@ -7,6 +7,7 @@
 #include <typeinfo>
 #include <iostream>
 #include <algorithm>
+#include <memory>
 #include "signal.hpp"
 #include "stb_image.h"
 #include "stb_image_write.h"
@@ -1410,6 +1411,7 @@ struct MemPool {
 
     std::vector<Buffer<T>> buffers; // Track all allocated buffers
     VkDeviceSize deadMemory = 0;
+    std::vector<std::pair<VkDeviceSize, VkDeviceSize>> gaps; // track all gaps in the memory
 
     Allocator* allocator;           // The allocator has all the vulkan context stuff and it handles buffer creation, destruction, manipulation, etc.
 
@@ -1483,8 +1485,29 @@ struct MemPool {
         const VkDeviceSize dataSize = data.size() * sizeof(T);
         const VkDeviceSize alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
         occupied += alignedSize;
+        
+        // try to find a gap in which we could insert this buffer into, then either update that gap or destroy it
+        uint32_t allocationOffset = offset;
+        bool used_gap = false;
+        for (uint32_t i = 0; i < gaps.size(); i++){
+            auto& [ofse, siz] = gaps[i];
+            if (siz >= dataSize){
+                used_gap = true;
+                allocationOffset = ofse;
+                uint32_t remaining_size = dataSize - siz;
+                deadMemory -= dataSize;
+                if(remaining_size > 0){
+                    gaps[i].first = ofse + dataSize;
+                    gaps[i].second = remaining_size;
+                }else {
+                    gaps.erase(gaps.begin() + i);
+                }
+                break;
+            }
+        }
+
         // Check if there's enough space
-        if (offset + alignedSize > capacity) {
+        if (offset + alignedSize > capacity && !used_gap) {
             growUntil(2, offset + alignedSize);
         }
 
@@ -1503,52 +1526,83 @@ struct MemPool {
 			allocator->init->disp.mapMemory(stagingMemory, 0, alignedSize, 0, &mapped);
 		}
         std::memcpy(mapped, data.data(), dataSize);
+
         // Copy Staging Buffer to GPU Buffer
-        allocator->copyBuffer(stagingBuffer, buffer, alignedSize, 0, offset, true);
+        allocator->copyBuffer(stagingBuffer, buffer, alignedSize, 0, allocationOffset, true);
         // Clear the staging buffer memory
         std::memset(mapped, 0, dataSize);
 
         // Create a Buffer entry (Created on the heap, because stack memory apparently overflows)
         auto newBuffer = new Buffer<T>();
         newBuffer->buffer = buffer;
-        newBuffer->offset = offset;
-		newBuffer->elementOffset = elementOffset;
+        newBuffer->offset = allocationOffset;
+		newBuffer->elementOffset = static_cast<uint32_t>(allocationOffset / sizeof(T));
         newBuffer->numElements = static_cast<uint32_t>(data.size());
         newBuffer->createDescriptors(bindingIndex, flags);
         // dereference ptr and push copy into the vector
         buffers.push_back(*newBuffer);
 		delete newBuffer; // Free the heap memory
 
-        // Update offset for next allocation
-        offset += alignedSize;
-		elementOffset += static_cast<uint32_t>(data.size());
+        // Update offset for next allocation, if we didn't allocate inside a gap
+        if(!used_gap){
+            offset += alignedSize;
+            elementOffset += static_cast<uint32_t>(data.size());
+        }
+
         return true;
     }
 
     // the standaloneBuffer still lives after this. If you want to dispose of it, you'll have to call its destructor manually
     bool push_back(StandaloneBuffer<T>& data) {
         auto bindingIndex = buffers.size();
+        const VkDeviceSize dataSize = data.capacity;
+        const VkDeviceSize alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
+        occupied += alignedSize;
+        
+        // try to find a gap in which we could insert this buffer into, then either update that gap or destroy it
+        uint32_t allocationOffset = offset;
+        bool used_gap = false;
+        for (uint32_t i = 0; i < gaps.size(); i++){
+            auto& [ofse, siz] = gaps[i];
+            if (siz >= dataSize){
+                used_gap = true;
+                allocationOffset = ofse;
+                uint32_t remaining_size = siz - dataSize;
+                deadMemory -= dataSize;
+                if(remaining_size > 0){
+                    gaps[i].first = ofse + dataSize;
+                    gaps[i].second = remaining_size;
+                }else {
+                    gaps.erase(gaps.begin() + i);
+                }
+                break;
+            }
+        }
 
         // Check if there's enough space
-        if (offset + data.capacity > capacity) {
-            growUntil(2, offset + data.capacity);
+        if (offset + alignedSize > capacity && !used_gap) {
+            growUntil(2, offset + alignedSize);
         }
 
         // Copy given buffer to GPU Buffer
-        allocator->copyBuffer(data.buffer, buffer, data.capacity, 0, offset, true);
+        allocator->copyBuffer(data.buffer, buffer, dataSize, 0, allocationOffset, true);
 
         // Create a Buffer entry
         auto newBuffer = new Buffer<T>();
         newBuffer->buffer = buffer;
-        newBuffer->offset = offset;
+        newBuffer->offset = allocationOffset;
+        newBuffer->elementOffset = static_cast<uint32_t>(allocationOffset / sizeof(T));
         newBuffer->numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
         newBuffer->createDescriptors(bindingIndex, flags);
         buffers.push_back(*newBuffer);
-		delete newBuffer; // Free the heap memory
-        // Update offset for next allocation
-        offset += data.capacity;
-        elementOffset += data.numElements;
-        occupied += data.capacity;
+        delete newBuffer; // Free the heap memory
+        
+        // Update offset for next allocation, if we didn't allocate inside a gap
+        if(!used_gap){
+            offset += alignedSize;
+            elementOffset += static_cast<uint32_t>(data.capacity / sizeof(T));
+        }
+        
         return true;
     }
 
@@ -1702,6 +1756,7 @@ struct MemPool {
         // just record the gap and leave it there. The record of the gaps can be cleaned up later. Kind of like a garbage collector.
         else {
             deadMemory += alignedSize;
+            gaps.push_back({buffers[i].offset, alignedSize});
         }
         // Remove the buffer from the vector
         buffers.erase(buffers.begin() + index);
@@ -1728,7 +1783,7 @@ struct MemPool {
         }
         // defragment the memory
         allocator->defragment(buffer, memory, alive);
-
+        gaps.clear();
         // update the offset of the remaining buffers
         VkDeviceSize runningOffset = 0;
         uint32_t runningElementOffset = 0;
@@ -1756,38 +1811,54 @@ struct MemPool {
 
         const VkDeviceSize dataSize = data.size() * sizeof(T);
         const VkDeviceSize alignedSize = (dataSize + alignment - 1) & ~(alignment - 1);
+        const VkDeviceSize oldAlignedSize = buffers[index].alignedSize(alignment);
+        const auto oldOffset = buffers[index].offset;
+        const auto oldNumElements = buffers[index].numElements;
+        const VkDeviceSize sizeDelta = alignedSize - oldAlignedSize;
 
         // Check if there's enough space
-        if ((offset + alignedSize) - buffers[index].alignedSize(alignment) > capacity) {
-            growUntil(2, (offset + alignedSize) - buffers[index].alignedSize(alignment));
+        if ((offset + sizeDelta) > capacity) {
+            growUntil(2, offset + sizeDelta);
         }
 
-        auto alignedOffset = buffers[index].offset;
-        auto deadBufferSize = buffers[index].alignedSize(alignment);
-        auto deadBufferElementSize = buffers[index].numElements;
+        // Update gaps that lay beyond the buffer being replaced
+        for (auto& [ofse, rnge] : gaps) {
+            if (ofse > oldOffset) {
+                ofse += sizeDelta;
+            }
+        }
 
-        // decrement the offset by the buffer we're replacing
-        offset -= deadBufferSize;
-        occupied -= deadBufferSize;
+        // Adjust offset and occupied by the size change
+        offset += sizeDelta;
+        occupied += sizeDelta;
 
-        // we're using the staging buffer to hold the toReplace memory
+        // Prepare staging buffer
+        VkMemoryRequirements memRequirements{};
+        allocator->init->disp.getBufferMemoryRequirements(stagingBuffer, &memRequirements);
+        auto stagingBufferSize = memRequirements.size;
+
+        if (stagingBufferSize < alignedSize) {
+            allocator->init->disp.unmapMemory(stagingMemory);
+            allocator->killMemory(stagingBuffer, stagingMemory);
+            auto stageBuff = allocator->createBuffer(alignedSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            stagingBuffer = stageBuff.first;
+            stagingMemory = stageBuff.second;
+            allocator->init->disp.mapMemory(stagingMemory, 0, alignedSize, 0, &mapped);
+        }
+
         std::memcpy(mapped, data.data(), dataSize);
-        allocator->replaceMemory(buffer, memory, stagingBuffer, alignedSize, alignedOffset);
-        std::memset(mapped, 0, data.size() * sizeof(T));
+        allocator->replaceMemory(buffer, memory, stagingBuffer, alignedSize, oldOffset);
+        std::memset(mapped, 0, dataSize);
 
         // Edit the buffer element to reflect the new data it now represents
         buffers[index].numElements = static_cast<uint32_t>(data.size());
 
-        // increment the offset by the buffer we've replaced
-        offset += alignedSize;
-        occupied += alignedSize;
-
+        // Update offsets of all subsequent buffers
         for (size_t i = index + 1; i < buffers.size(); ++i) {
-            buffers[i].offset -= deadBufferSize; // decrement the offset of the remaining buffers by the dead buffer's size
-			buffers[i].elementOffset -= deadBufferElementSize;
-            buffers[i].offset += alignedSize;    // increment the offset of the remaining buffers by the new buffer's size
-			buffers[i].elementOffset += static_cast<uint32_t>(data.size());
-            buffers[i].createDescriptors(static_cast<uint32_t>(i), flags); // assign correct binding
+            buffers[i].offset += sizeDelta;
+            buffers[i].elementOffset += static_cast<uint32_t>((alignedSize - oldAlignedSize) / sizeof(T));
+            buffers[i].createDescriptors(static_cast<uint32_t>(i), flags);
         }
 
         // internal offsets were changed. We need descriptor updates
@@ -1800,34 +1871,37 @@ struct MemPool {
         }
 
         const VkDeviceSize alignedSize = data.capacity;
+        const VkDeviceSize oldAlignedSize = buffers[index].alignedSize(alignment);
+        const auto oldOffset = buffers[index].offset;
+        const auto oldNumElements = buffers[index].numElements;
+        const VkDeviceSize sizeDelta = alignedSize - oldAlignedSize;
 
         // Check if there's enough space
-        if (((offset + alignedSize) - buffers[index].alignedSize(alignment)) > capacity) {
-            growUntil(2, (offset + alignedSize) - buffers[index].alignedSize(alignment));
+        if ((offset + sizeDelta) > capacity) {
+            growUntil(2, offset + sizeDelta);
         }
 
-        auto alignedOffset = buffers[index].offset;
-        auto deadBufferSize = buffers[index].alignedSize(alignment);
-		auto deadBufferElementSize = buffers[index].numElements;
-        // decrement the offset by the buffer we're replacing
-        offset -= deadBufferSize;
-        occupied -= deadBufferSize;
+        // Update gaps that lay beyond the buffer being replaced
+        for (auto& [ofse, rnge] : gaps) {
+            if (ofse > oldOffset) {
+                ofse += sizeDelta;
+            }
+        }
 
-        allocator->replaceMemory(buffer, memory, data.buffer, alignedSize, alignedOffset);
+        // Adjust offset and occupied by the size change
+        offset += sizeDelta;
+        occupied += sizeDelta;
+
+        allocator->replaceMemory(buffer, memory, data.buffer, alignedSize, oldOffset);
 
         // Edit the buffer element to reflect the new data it now represents
-        buffers[index].numElements = static_cast<uint32_t>(data.size());
+        buffers[index].numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
 
-        // Update offset for next allocation
-        offset += alignedSize;
-        occupied += alignedSize;
-
+        // Update offsets of all subsequent buffers
         for (size_t i = index + 1; i < buffers.size(); ++i) {
-            buffers[i].offset -= deadBufferSize; // decrement the offset of the remaining buffers by the dead buffer's size
-			buffers[i].elementOffset -= deadBufferElementSize;
-            buffers[i].offset += alignedSize;    // increment the offset of the remaining buffers by the new buffer's size
-			buffers[i].elementOffset += static_cast<uint32_t>(data.size());
-            buffers[i].createDescriptors(static_cast<uint32_t>(i), flags); // assign correct binding
+            buffers[i].offset += sizeDelta;
+            buffers[i].elementOffset += static_cast<uint32_t>((alignedSize - oldAlignedSize) / sizeof(T));
+            buffers[i].createDescriptors(static_cast<uint32_t>(i), flags);
         }
 
         // internal offsets were changed. We need descriptor updates
@@ -1850,7 +1924,15 @@ struct MemPool {
         std::memcpy(mapped, data.data(), data.size() * sizeof(T));
         allocator->insertMemory(buffer, stagingBuffer, buffers[index].offset, alignedSize);
         std::memset(mapped, 0, data.size() * sizeof(T));
-
+        
+        // update all the gaps whose offset is greater than the offset at which we just inserted the data
+        for (uint32_t i = 0; i < gaps.size(); i++){
+            if(gaps[i].first >= buffers[index].offset){
+                auto& [ofse, siz] = gaps[i];
+                ofse += alignedSize;
+            }
+        }
+        
         // Create a Buffer entry
         auto newBuffer = new Buffer<T>();
         newBuffer->buffer = buffer;
@@ -1875,37 +1957,44 @@ struct MemPool {
     }
 
     void insert(uint32_t index, StandaloneBuffer<T>& data) {
-
         if (index > buffers.size() || index < 0) {
             throw std::out_of_range("Index out of range");
         }
-
         auto alignedSize = data.capacity;
-
         if (capacity < occupied + alignedSize) {
             growUntil(2, occupied + alignedSize);
         }
-
+        
         allocator->insertMemory(buffer, data.buffer, buffers[index].offset, alignedSize);
-
+        
+        // update all the gaps whose offset is greater than the offset at which we just inserted the data
+        for (uint32_t i = 0; i < gaps.size(); i++){
+            if(gaps[i].first >= buffers[index].offset){
+                auto& [ofse, siz] = gaps[i];
+                ofse += alignedSize;
+            }
+        }
+        
         // Create a Buffer entry
         auto newBuffer = new Buffer<T>();
         newBuffer->buffer = buffer;
         newBuffer->offset = buffers[index].offset;
-		newBuffer->elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
         newBuffer->numElements = static_cast<uint32_t>(data.capacity / sizeof(T));
+        newBuffer->elementOffset = buffers[index - 1].elementOffset + buffers[index - 1].numElements;
         newBuffer->createDescriptors(index, flags);
         buffers.insert(buffers.begin() + index, *newBuffer);
-		delete newBuffer; // Free the heap memory
-
+        delete newBuffer; // Free the heap memory
+        
         // Update offset for next allocation
         offset += alignedSize;
         occupied += alignedSize;
+        
         for (size_t i = index + 1; i < buffers.size(); ++i) {
             buffers[i].offset += alignedSize;
-			buffers[i].elementOffset += static_cast<uint32_t>(data.size());
+            buffers[i].elementOffset += static_cast<uint32_t>(data.capacity / sizeof(T));
             buffers[i].createDescriptors(static_cast<uint32_t>(i), flags); // assign correct binding
         }
+        
         // internal offsets were changed. We need descriptor updates
         descUpdateQueued.trigger();
     }

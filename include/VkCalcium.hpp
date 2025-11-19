@@ -3,7 +3,7 @@ This is a tiny graphics engine built using vulkan.
 */
 
 #pragma once  
-/*#define GLM_FORCE_RADIANS  
+#define GLM_FORCE_RADIANS  
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #define GLM_ENABLE_EXPERIMENTAL
 #define GLFW_INCLUDE_VULKAN
@@ -16,7 +16,7 @@ constexpr int MAX_FRAMES_IN_FLIGHT = 3;
 #include <glm/gtx/hash.hpp>
 #include <glm/gtx/quaternion.hpp>
 #include <glm/gtx/string_cast.hpp>
-#include <vulkan/vulkan_core.h>
+#include "volk.h"
 #include <GLFW/glfw3.h>  
 #include "VkBootstrap.h"  
 #include <iostream>
@@ -25,12 +25,12 @@ constexpr int MAX_FRAMES_IN_FLIGHT = 3;
 #include <fstream>
 #include <unordered_map>
 #include "VkMemAlloc.hpp"
-#include "ComputeStack.hpp"
-#include "RendererBuilder.hpp"
-#include "registry.hpp"
 #include "tiny_obj_loader.h"
 
 int calcium_device_initialization(Init* init, GLFWwindow* window, VkSurfaceKHR& surface) {  
+    if(volkInitialize() != VK_SUCCESS){
+        throw std::runtime_error("Volk couldn't load the vulkan loader from system. It may be missing.");
+    }
     vkb::InstanceBuilder instance_builder;  
     auto instance_ret = instance_builder  
         .use_default_debug_messenger()  
@@ -42,6 +42,8 @@ int calcium_device_initialization(Init* init, GLFWwindow* window, VkSurfaceKHR& 
         return -1;  
     }  
     init->instance = instance_ret.value();  
+    volkLoadInstance(init->instance.instance);
+
     init->inst_disp = init->instance.make_table();  
 
     glfwCreateWindowSurface(init->instance.instance, window, nullptr, &surface);  
@@ -115,6 +117,7 @@ int calcium_device_initialization(Init* init, GLFWwindow* window, VkSurfaceKHR& 
         std::cout << "Logical device created successfully.\n";
     }
     init->device = device_ret.value();  
+    volkLoadDevice(init->device.device);
     init->disp = init->device.make_table();  
 
     return 0;  
@@ -414,6 +417,42 @@ struct UniformBuf {
     VkDeviceAddress normals;
     VkDeviceAddress uvs;
     VkDeviceAddress indices;
+};
+
+struct Swapchain {
+    vkb::Swapchain swapchain;
+
+    Init* init;
+
+    int width, height;
+
+    Swapchain() : init(nullptr) {};
+    Swapchain(Init* init, int width, int height) :
+        init(init), width(width), height(height) {
+        createSwapchain();
+    };
+
+    void createSwapchain() {
+        vkb::SwapchainBuilder builder{ init->device };
+
+        VkSurfaceFormatKHR format{};
+        format.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+        format.colorSpace = VK_COLORSPACE_SRGB_NONLINEAR_KHR;
+
+        VkPresentModeKHR presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+
+        auto swap_ret = builder.set_desired_present_mode(presentMode)
+            .set_desired_extent(width, height)
+            .set_desired_format(format)
+            .set_old_swapchain(swapchain)
+            .build();
+
+        if (!swap_ret) {
+            std::cout << swap_ret.error().message() << " " << swap_ret.vk_result() << "\n";
+        }
+
+        swapchain = swap_ret.value();
+    }
 };
 
 // pipeline can be chained to form a pipeline graph, where each pipeline can have its own render pass and framebuffer. The main graphics pipeline is the root of the graph.
@@ -907,7 +946,7 @@ struct DepthPipeline : public Pipeline {
         rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
         rasterizer.lineWidth = 1.0f;
         rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
         rasterizer.depthBiasEnable = VK_FALSE;
 
         VkPipelineMultisampleStateCreateInfo multisampling = {};
@@ -1056,7 +1095,7 @@ struct GraphicsPipeline : public Pipeline {
         rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
         rasterizer.lineWidth = 1.0f;
         rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
-        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
         rasterizer.depthBiasEnable = VK_FALSE;
 
         VkPipelineMultisampleStateCreateInfo multisampling = {};
@@ -1263,9 +1302,9 @@ public:
         if (direction == BACKWARD)
             Position -= Front * velocity;
         if (direction == LEFT)
-            Position += Right * velocity;
-        if (direction == RIGHT)
             Position -= Right * velocity;
+        if (direction == RIGHT)
+            Position += Right * velocity;
     }
 
     void ProcessMouseMovement(float xoffset, float yoffset, GLboolean constrainPitch) {
@@ -1553,6 +1592,9 @@ struct Engine {
     std::vector<VkSemaphore> finishes;
     std::vector<VkFence> inFlights;
     std::vector<VkFence> imagesInFlights;
+
+    std::function<void()> update;
+    std::function<void()> start;
 
     size_t currentFrame = 0;
 
@@ -1995,7 +2037,7 @@ struct Engine {
         lastX = xpos;
         lastY = ypos;
         if (!cursorEnabled)
-            scene.camera.ProcessMouseMovement(-xoffset, -yoffset, true);
+            scene.camera.ProcessMouseMovement(xoffset, -yoffset, true);
     }
 
     void toggleCursor(GLFWwindow* window, bool enableCursor) {
@@ -2027,6 +2069,7 @@ struct Engine {
 
     // main loop
     void run() {  
+        start();
         auto lastTime = std::chrono::high_resolution_clock::now();  
         
         while (!glfwWindowShouldClose(window)) {  
@@ -2043,6 +2086,10 @@ struct Engine {
             
             drawFrame();
 
+            auto current = scene.entities[1].transform.getPosition();
+		    auto next = current + deltaTime * glm::vec3(1.0f, 0.0f, 0.0f);
+		    scene.entities[1].transform.setPosition(next);
+
 			//std::cout << glm::to_string(scene.camera.Position) << "\n";
 
             glfwPollEvents();
@@ -2056,4 +2103,4 @@ bool Engine::cursorEnabled = true;
 float Engine::xoffset = 0.0f;
 float Engine::yoffset = 0.0f;
 
-Scene Engine::scene{};*/
+Scene Engine::scene{};
