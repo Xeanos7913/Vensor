@@ -730,10 +730,10 @@ int main(void) {
 
 	softmax.target = &targets;
 
-	// residual connection
-	auto &o = input + *bn1(linear1(&input));
+	// longer residual connection: input + output after two layers (linear1->bn1->linear2->bn2)
+	auto &o = input + *bn2(linear2(bn1(linear1(&input))));
 
-	auto loss = softmax(linear3(bn2(linear2(&o))));
+	auto loss = softmax(linear3(&o));
 
 	loss->backward();
 

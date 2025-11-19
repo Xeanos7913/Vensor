@@ -508,7 +508,7 @@ struct Tensor {
     }  
 
     void backward() const {
-        if (back) {back(); std::cout << "calling backward for tensor " << name << "\n";}
+        if (back) {std::cout << "calling backward for tensor " << name << "\n"; back(); }
     }
 
     void view(std::initializer_list<uint32_t> dims) {
@@ -847,10 +847,6 @@ struct TensorPool {
     uint32_t tile_size[3] = { 16, 16, 1 };
     TensorPool(Allocator* alloc)
             : allocator(alloc),
-            additionShader(
-                readShaderBytecode("compiled_shaders/tensor_addition.comp.spv"), alloc, tile_size),
-            additionShaderBackward(
-                readShaderBytecode("compiled_shaders/tensor_addition_backward.comp.spv"), alloc, tile_size),
             inplaceAdditionShader(
                 readShaderBytecode("compiled_shaders/tensor_inplace_addition.comp.spv"), alloc, tile_size),
             inplaceAdditionShaderBackward(
@@ -880,9 +876,9 @@ struct TensorPool {
             linearShaderBackward(
                 readShaderBytecode("compiled_shaders/Linear_no_relu_backward.comp.spv"), alloc, nullptr),
             ReLUShader(
-                readShaderBytecode("compiled_shaders/ReLU.comp.spv"), alloc, tile_size),
+                readShaderBytecode("compiled_shaders/ReLU.comp.spv"), alloc, nullptr),
             ReLUShaderBackward(
-                readShaderBytecode("compiled_shaders/ReLU_backward.comp.spv"), alloc, tile_size),
+                readShaderBytecode("compiled_shaders/ReLU_backward.comp.spv"), alloc, nullptr),
             fillRandomShader(
                 readShaderBytecode("compiled_shaders/tensor_fill_random.comp.spv"), alloc, nullptr),
             crossEntropyShader(
@@ -979,62 +975,40 @@ struct TensorPool {
     }
     
     void tensor_ReLU(const std::string& output_tensor, const std::string& input_tensor, uint32_t mode = 0) {
-        // Check if shapes match
-        try {
-            broadcastShapes(tensors[output_tensor]->shape, tensors[input_tensor]->shape, Operation::ADDITION);
-        }
-        catch (const std::invalid_argument& e) {
-            std::cerr << "Error in tensor_ReLU: " << e.what() << "\n";
-            throw;
-        }
-
         tensor_relu_context uniform{};
         uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
         uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
-        uniform.mode = mode; // Forward pass (should be kernel_type in shader)
+        uniform.mode = mode; // forwarded to shader if needed
 
-        // Helpers
-        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
-            uint64_t p = 1; for (size_t i = l; i < r; ++i) p *= v[i];
-            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
-            return (uint32_t)p;
-            };
+        // Support any-rank tensor: compute total number of elements and dispatch linearly
+        uint32_t total_elements = tensors[input_tensor]->get_num_elements();
+        // fill m/n for compatibility (shader can ignore if not needed)
+        uniform.m = 1;
+        uniform.n = total_elements;
 
-        const auto& shape = tensors[input_tensor]->shape; // X[..., M, N]
-        if (shape.size() < 2)
-            throw std::invalid_argument("Rank must be >= 2");
-        uint32_t M = shape[shape.size() - 2];
-        uint32_t N = shape.back();
-        uniform.m = M;
-        uniform.n = N;
-        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
-        DEBUG_PRINT("ReLU'ing tensor " << input_tensor << " of shape " << shapeToString(shape));
+        DEBUG_PRINT("ReLU'ing tensor " << input_tensor << " total elements: " << total_elements
+                    << " shape: " << shapeToString(tensors[input_tensor]->shape));
 
-        // Compute dispatch grid to cover the OUTPUT tensor C[B,M,N]
-        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
-
-        // Grid covers the output tensor dimensions C[M,N] per batch
-        uint32_t groupX = ceilDiv(M, tile_size[0]);  // Cover all N columns (output cols)
-        uint32_t groupY = ceilDiv(N, tile_size[1]);  // Cover all M rows (output rows)
-        uint32_t groupZ = batch_size;       // One group per batch element
+        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t groupX = cielDiv(total_elements, 256u);
+        uint32_t groupY = 1;
+        uint32_t groupZ = 1;
 
         DEBUG_PRINT("Dispatch: " << groupX << " x " << groupY << " x " << groupZ
-            << " (covering output " << M << "x" << N << " per batch)");
+            << " (covering total elements " << total_elements << ")");
 
         uint32_t workgroup[3] = { groupX, groupY, groupZ };
         tensor_push_const pushConsts{};
-        
-        if(mode == 0){
-            pushConsts.mode = mode; // forward/backward pass
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+
+        if (mode == 0) {
+            pushConsts.mode = mode;
             pushConsts.uniformAddress = ReLUShader.uniformBuffer->getBufferAddress();
-            pushConsts.grid_size = { groupX, groupY, groupZ };
             ReLUShader.loadUniform(uniform, pushConsts);
             ReLUShader.execute(workgroup);
-        }
-        else if (mode == 1) {
-            pushConsts.mode = mode; // forward/backward pass
+        } else if (mode == 1) {
+            pushConsts.mode = mode;
             pushConsts.uniformAddress = ReLUShaderBackward.uniformBuffer->getBufferAddress();
-            pushConsts.grid_size = { groupX, groupY, groupZ };
             ReLUShaderBackward.loadUniform(uniform, pushConsts);
             ReLUShaderBackward.execute(workgroup);
         }
@@ -1807,81 +1781,6 @@ struct TensorPool {
         }
     }
 
-    void tensor_add(const std::string& output_tensor, const std::string& tensor_a, const std::string& tensor_b, uint32_t mode = 0) {
-        try {
-            broadcastShapes(tensors[tensor_a]->shape, tensors[tensor_b]->shape, Operation::ADDITION);
-        }
-        catch (const std::invalid_argument& e) {
-            throw std::invalid_argument("Rank must be >= 2");
-        }
-        matadd_context uniform{};
-        // Helpers
-        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
-            uint64_t p = 1; for (size_t i = l; i < r; ++i) p *= v[i];
-            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
-            return (uint32_t)p;
-            };
-        auto leading_equal = [](const std::vector<uint32_t>& a,
-            const std::vector<uint32_t>& b)->bool {
-                if (a.size() != b.size()) return false;
-                for (size_t i = 0; i < a.size(); ++i) if (a[i] != b[i]) return false;
-                return true;
-            };
-        const auto& shapeA = tensors[tensor_a]->shape; // X[..., M, N]
-        const auto& shapeB = tensors[tensor_b]->shape; // Y[..., M, N]
-        if (shapeA.size() < 1 || shapeB.size() < 1)
-            throw std::invalid_argument("Rank must be >= 1");
-        if (!leading_equal(shapeA, shapeB))
-            throw std::invalid_argument("Shapes must match exactly for addition");
-        // last-2 dims
-        uint32_t M = shapeA.size() >= 2 ? shapeA[shapeA.size() - 2] : 1;
-        uint32_t N = shapeA.back();
-        // flatten all leading dims -> B
-        uint32_t batch_size = prod(shapeA, 0, shapeA.size() - 2);
-        // uniforms
-        uniform.input_a = tensors[tensor_a]->getTensorImpl();
-        uniform.input_b = tensors[tensor_b]->getTensorImpl();
-		uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
-        uniform.mode = mode; // forward
-        uniform.batch_size = batch_size;
-        uniform.m = M;
-        uniform.n = N;
-        uniform.accumulate_grad = 1;
-        // Compute dispatch grid
-        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
-        uint32_t dispatchM, dispatchN, dispatchBatch;
-        // Use output tensor dimensions
-        const auto& output_shape = tensors[output_tensor]->shape;
-        if (output_shape.size() < 1)
-            throw std::invalid_argument("Output rank must be >= 1");
-        dispatchM = output_shape.size() >= 2 ? output_shape[output_shape.size() - 2] : 1;
-        dispatchN = output_shape.back();
-        dispatchBatch = prod(output_shape, 0, output_shape.size() - 2);
-        DEBUG_PRINT("Dispatch : ");
-        
-        uint32_t groupX = ceilDiv(dispatchN, tile_size[0]);
-        uint32_t groupY = ceilDiv(dispatchM, tile_size[1]);
-        uint32_t groupZ = dispatchBatch;
-        DEBUG_PRINT(groupX << " � " << groupY
-            << " � " << groupZ << " (covering " << dispatchM << "�"
-            << dispatchN << " per batch)");
-        uint32_t workgroup[3] = { groupX, groupY, groupZ };
-        tensor_push_const pushConsts{};
-        pushConsts.grid_size = { groupX, groupY, groupZ };
-        if (mode == 0) {
-            pushConsts.mode = mode;
-            pushConsts.uniformAddress = additionShader.uniformBuffer->getBufferAddress();
-            additionShader.loadUniform(uniform, pushConsts);
-            additionShader.execute(workgroup);
-        }
-        else if (mode == 1) {
-            pushConsts.mode = mode;
-            pushConsts.uniformAddress = additionShaderBackward.uniformBuffer->getBufferAddress();
-            additionShaderBackward.loadUniform(uniform, pushConsts);
-            additionShaderBackward.execute(workgroup);
-        }
-	}
-
     // tensor_c = tensor_a + tensor_b or tensor_a = tensor_a + tensor_b
     void tensor_add_inplace(const std::string& tensor_b, const std::string& tensor_a, const std::string& tensor_c = "", uint32_t mode = 0) {
         matadd_inplace_context uniform{};
@@ -1982,7 +1881,6 @@ struct TensorPool {
         uniform.input_a = tensors[tensor_a]->getTensorImpl();
         uniform.input_b = tensors[tensor_b]->getTensorImpl();
         if(!tensor_c.empty()){
-            if(tensors[tensor_a]->shape != tensors[tensor_c]->shape) throw std::invalid_argument("Only tensor_b can be broadcasted. Tensor_a and c must have the same shapes");
             uniform.input_c = tensors[tensor_c]->getTensorImpl();
             uniform.mode = 1;
         }else {
@@ -2574,12 +2472,10 @@ struct TensorPool {
 
 private:
     // tensor operation shaders
-	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShader; // computes C = A + B
-	gpuTaskNoDesc<T, tensor_push_const, matadd_context> additionShaderBackward;
-    gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShader; // computes B = B + A
+    gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShader; // computes C = A + B or A = A + B, supports broadcasting
     gpuTaskNoDesc<T, tensor_push_const, matadd_inplace_context> inplaceAdditionShaderBackward;
-    gpuTaskNoDesc<T, tensor_push_const, matmul_elementwise_context> elementwiseMultiplicationShader; // computes A * B = B, supports broadcasting
-    gpuTaskNoDesc<T, tensor_push_const, matmul_elementwise_context> elementwiseMultiplicationShaderBackward; // computes A * B = B, supports broadcasting
+    gpuTaskNoDesc<T, tensor_push_const, matmul_elementwise_context> elementwiseMultiplicationShader; // computes C = A * B or A = A * B, supports broadcasting
+    gpuTaskNoDesc<T, tensor_push_const, matmul_elementwise_context> elementwiseMultiplicationShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, logvar_to_std_context> logvarToStdShader; // computes std = (0.5 * logvar).exp()
     gpuTaskNoDesc<T, tensor_push_const, logvar_to_std_context> logvarToStdShaderBackward; // computes std = (0.5 * logvar).exp() backward pass
     gpuTaskNoDesc<T, tensor_push_const, mse_loss_context> mseLossShader; // computes Mean Squared Error (MSE) loss

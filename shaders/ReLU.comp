@@ -5,7 +5,7 @@
 #extension GL_EXT_scalar_block_layout : enable
 
 // Workgroup size (runtime specialization constants)
-layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, scalar) buffer tensor_data {
     float data[];
@@ -16,11 +16,11 @@ layout(buffer_reference, std430, scalar) buffer tensor_grad {
 };
 
 layout(buffer_reference, std430, scalar) buffer tensor_strides {
-    int strides[];
+    int strides[]; // stride per-dimension
 };
 
 layout(buffer_reference, std430, scalar) buffer tensor_shape {
-    int dims[];
+    int dims[]; // size per-dimension
 };
 
 struct TensorImpl {
@@ -53,42 +53,57 @@ layout(push_constant) uniform PushConstants {
     uint  kernel_type;       // 0 = forward, 1 = backward (compute dInput)
 } push;
 
-// Compute linear index into a C-contiguous tensor from up to 3 indices using supplied strides.
-uint off2or3(const TensorImpl t, uint b, uint i, uint j)
+// Convert a flat element index (0..numel-1) into the memory offset using the tensor's shape & strides.
+// Works for arbitrary ndim.
+uint offset_from_flat(const TensorImpl t, uint flat_idx)
 {
-    if (t.ndim == 2u) {
-        return i * t.strides.strides[0] + j * t.strides.strides[1];
-    } else {
-        return b * t.strides.strides[0] + i * t.strides.strides[1] + j * t.strides.strides[2];
+    uint rem = flat_idx;
+    uint off = 0u;
+
+    // For each dimension, compute the coordinate and accumulate offset = coord * stride[dim].
+    // coord = rem / product_of_later_dims
+    for (uint d = 0u; d < t.ndim; ++d) {
+        // compute product of sizes of later dims (denom)
+        uint denom = 1u;
+        for (uint k = d + 1u; k < t.ndim; ++k) {
+            denom *= uint(t.shape.dims[k]);
+        }
+
+        uint coord;
+        if (denom > 1u) {
+            coord = rem / denom;
+            rem = rem - coord * denom;
+        } else {
+            // last dimension or denom == 1
+            coord = rem;
+            rem = 0u;
+        }
+
+        off += coord * uint(t.strides.strides[d]);
     }
+
+    return off;
 }
 
-void relu_forward() {
+void relu_forward()
+{
     ReLUcontext c = push.context.ctx;
-    uint bx = gl_WorkGroupID.x;  
-    uint by = gl_WorkGroupID.y;  
-    uint bz = gl_WorkGroupID.z;  
-    uint lx = gl_LocalInvocationID.x;  
-    uint ly = gl_LocalInvocationID.y;  
-    uint b = bz;  
-    uint row = by * gl_WorkGroupSize.y + ly; // in [0..M)  
-    uint col = bx * gl_WorkGroupSize.x + lx; // in [0..N)  
-    uint M = c.M;
-    uint N = c.N;
-    
-    // Early exit for threads that are completely out of bounds  
-    if (row >= M || col >= N) {  
-        return;  
+
+    // Global flat element index
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= c.input_tensor.numel) {
+        return;
     }
-    
-    uint inIdx = off2or3(c.input_tensor, b, row, col);
-    uint outIdx = off2or3(c.output_tensor, b, row, col);
-    
-    // Forward: out = max(0, in)
-    float inputValue = c.input_tensor.data.data[inIdx];
-    c.output_tensor.data.data[outIdx] = max(0.0, inputValue);
+
+    // Compute memory offsets for input and output for this flat element index
+    uint inIdx  = offset_from_flat(c.input_tensor, gid);
+    uint outIdx = offset_from_flat(c.output_tensor, gid);
+
+    float inVal = c.input_tensor.data.data[inIdx];
+    c.output_tensor.data.data[outIdx] = max(0.0, inVal);
 }
 
 void main() {
+    // Only forward implemented here. kernel_type can be checked/extended if needed.
     relu_forward();
 }
