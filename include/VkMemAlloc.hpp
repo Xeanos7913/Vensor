@@ -1756,7 +1756,7 @@ struct MemPool {
         // just record the gap and leave it there. The record of the gaps can be cleaned up later. Kind of like a garbage collector.
         else {
             deadMemory += alignedSize;
-            gaps.push_back({buffers[i].offset, alignedSize});
+            gaps.push_back({buffers[index].offset, alignedSize});
         }
         // Remove the buffer from the vector
         buffers.erase(buffers.begin() + index);

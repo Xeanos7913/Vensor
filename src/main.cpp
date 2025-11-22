@@ -7,7 +7,6 @@ This main file contains some testing code (in the commented out parts) and an ex
 //#define DEBUG
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
-#include "../include/VkCalcium.hpp"
 #include "../include/Dataloader.hpp"
 #include <memory>
 #include <initializer_list>
