@@ -1,0 +1,80 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct ExpContext {
+    TensorImpl logvar;        // input: log-variance tensor
+    TensorImpl std_out;       // output: standard deviation tensor
+    uint accumulate_grad;     // 0: overwrite, 1: += for grads
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    ExpContext ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint  kernel_type; // 0=forward, 1=backward
+} push;
+
+void backward_pass() {
+    uint gid = gl_GlobalInvocationID.x;
+    ExpContext op = push.context.ctx;
+    
+    // Check bounds
+    if (gid >= op.logvar.numel) {
+        return;
+    }
+    
+    // Get gradient from std output
+    float grad_std = op.std_out.grad.grad[gid];
+    
+    // Get the std value computed in forward pass
+    float std_val = op.std_out.data.data[gid];
+    
+    // Compute gradient for logvar
+    // Now std is directly produced (no 0.5 factor from a 0.5*logvar)
+    // d(std)/d(logvar) = std
+    // grad_logvar = grad_std * std
+    
+    if (op.logvar.requires_grad != 0) {
+        float grad_logvar = grad_std * std_val;
+        
+        if (op.accumulate_grad != 0) {
+            atomicAdd(op.logvar.grad.grad[gid], grad_logvar);
+        } else {
+            op.logvar.grad.grad[gid] = grad_logvar;
+        }
+    }
+}
+
+void main() {
+    backward_pass();
+}

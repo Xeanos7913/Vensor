@@ -555,11 +555,11 @@ struct VAE {
 	// eps = random gaussian
 	// mu + eps * std
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		auto std_tensor = tensorPool.tensor_logvar_to_std(logvar->name);
-		auto eps_tensor = &tensorPool.createTensor({16, 1, latent_dim}, "eps");
+		auto &std_tensor = tensorPool.tensor_logvar_to_std(logvar->name);
+		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
 
-		return &(*mu + *std_tensor * *eps_tensor);
+		return &(*mu + std_tensor * eps_tensor);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -703,11 +703,13 @@ int main(void) {
 	auto &input = pool.createTensor({16, 1, 256}, "input");
 	pool.tensor_fill_random("input", -2.5f, 2.5f);
 
-	auto linear1 = LinearReLU<float>(&pool, 256, 256, 16, "linear1");
+	auto linear1 = Linear<float>(&pool, 256, 256, 16, "linear1");
+	auto r1 = ReLU<float>(&pool, 256, 16, "relu1");
 	auto bn1 = Layernorm<float>(&pool, {16, 1, 256}, {1, 256}, "bn1");
-	auto linear2 = LinearReLU<float>(&pool, 256, 256, 16, "linear2");
+	auto linear2 = Linear<float>(&pool, 256, 256, 16, "linear2");
+	auto r2 = ReLU<float>(&pool, 256, 16, "relu2");
 	auto bn2 = BatchNorm1d<float>(&pool, 256, 1, 16, "bn2");
-	auto linear3 = LinearReLU<float>(&pool, 256, 16, 16, "linear3");
+	auto linear3 = Linear<float>(&pool, 256, 16, 16, "linear3");
 	auto softmax = SoftmaxCrossEntropy<float>(&pool, 16, 1, 16, "softmax");
 
 	auto &targets = pool.createTensor({16, 1, 16}, "targets");
@@ -730,17 +732,40 @@ int main(void) {
 	softmax.target = &targets;
 
 	// longer residual connection: input + output after two layers (linear1->bn1->linear2->bn2)
-	auto &o = input + *bn2(linear2(bn1(linear1(&input))));
+	auto &o = input + *r2(bn2(linear2(r1(bn1(linear1(&input))))));
 
 	auto loss = softmax(linear3(&o));
 
 	loss->backward();
 
-	input.printGradient();
+	linear1.weights->printGradient();
 
 	delete allocator;
 	return 0;
 }
+
+/*
+// broadcasting test
+int main(void) {
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
+	TensorPool<float> pool(allocator);
+
+	auto &t1 = pool.createTensor({5, 32, 32}, "t1");
+	pool.tensor_fill_random("t1", 1.0f, 1.0f);
+
+	auto &t2 = pool.createTensor({1, 1, 1}, "t2");
+
+	t2.setElement(0.5f, {0, 0, 0});
+
+	auto &out = t1 * t2;
+
+	out.print();
+
+	return 0;
+}
+*/
 
 // Handwritten image generation model using a VAE
 /*

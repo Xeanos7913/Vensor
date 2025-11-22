@@ -416,6 +416,8 @@ struct Tensor {
 
    std::function<void()> back;
 
+    Tensor(){}; // empty default ctor
+
    Tensor(std::initializer_list<uint32_t> dims, Allocator* allocator)
        : shape(dims),
        allocator(allocator),
@@ -589,8 +591,11 @@ struct Tensor {
     }
 
     Tensor<T>& operator*(Tensor<T>&other);
+    Tensor<T>& operator*(T other);
     Tensor<T>& operator+(Tensor<T>& other);
+    Tensor<T>& operator+(T other);
     Tensor<T>& matmul(Tensor<T>& other); // matmul operator
+    Tensor<T>& exp(); // output = tensor.exp(); // element-wise exponentiation
     void elementwise_multiply(Tensor<T>& other);
     void elementwise_add(Tensor<T>& other);
     
@@ -875,6 +880,14 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/Linear_no_relu.comp.spv"), alloc, nullptr),
             linearShaderBackward(
                 readShaderBytecode("compiled_shaders/Linear_no_relu_backward.comp.spv"), alloc, nullptr),
+            logvarToStdShader(
+                readShaderBytecode("compiled_shaders/logvar_to_std.comp.spv"), alloc, nullptr),
+            logvarToStdShaderBackward(
+                readShaderBytecode("compiled_shaders/logvar_to_std_backward.comp.spv"), alloc, nullptr),
+            expShader(
+                readShaderBytecode("compiled_shaders/tensor_exp.comp.spv"), alloc, nullptr),
+            expShaderBackward(
+                readShaderBytecode("compiled_shaders/tensor_exp_backward.comp.spv"), alloc, nullptr),
             ReLUShader(
                 readShaderBytecode("compiled_shaders/ReLU.comp.spv"), alloc, nullptr),
             ReLUShaderBackward(
@@ -1929,7 +1942,7 @@ struct TensorPool {
     }
 
     // computes std = exp(0.5 * logvar)
-    Tensor<T>* tensor_logvar_to_std(const std::string& logvar_tensor, std::string std_tensor = "", uint32_t mode = 0) {
+    Tensor<T>& tensor_logvar_to_std(const std::string& logvar_tensor, std::string std_tensor = "", uint32_t mode = 0) {
         logvar_to_std_context uniform{};
         
         // Helpers
@@ -1944,7 +1957,7 @@ struct TensorPool {
         Tensor<T>* output;
         if(std_tensor.empty()){
             output = &createTensor(tensors[logvar_tensor]->shape, logvar_tensor + "-std_dev_tensor");
-            std_tensor = logvar_tensor + "-std_dev_tensor";
+            std_tensor = output->name;
         }
 
         const auto& shapeA = tensors[logvar_tensor]->shape; // A[..., M, N]
@@ -1986,7 +1999,7 @@ struct TensorPool {
             pushConsts.uniformAddress = logvarToStdShader.uniformBuffer->getBufferAddress();
             logvarToStdShader.loadUniform(uniform, pushConsts);
             logvarToStdShader.execute(workgroup);
-            return output;
+            return *output;
         }
         else if (mode == 1) {
             // Backward pass
@@ -1994,7 +2007,77 @@ struct TensorPool {
             pushConsts.uniformAddress = logvarToStdShaderBackward.uniformBuffer->getBufferAddress();
             logvarToStdShaderBackward.loadUniform(uniform, pushConsts);
             logvarToStdShaderBackward.execute(workgroup);
+            return *output;
+        }
+    }
 
+    // computes output = exp(input)
+    Tensor<T>& tensor_exp(const std::string& input_tensor, std::string output_tensor = "", uint32_t mode = 0) {
+        logvar_to_std_context uniform{};
+        
+        // Helpers
+        auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
+            uint64_t p = 1; 
+            for (size_t i = l; i < r; ++i) p *= v[i];
+            if (p > UINT32_MAX) throw std::overflow_error("Batch too large");
+            return (uint32_t)p;
+        };
+
+        // if no output is given, create output. If created output already exists, use that
+        Tensor<T>* output;
+        if(output_tensor.empty()){
+            output = &createTensor(tensors[input_tensor]->shape, input_tensor + "-std_dev_tensor");
+            output_tensor = output->name;
+        }
+
+        const auto& shapeA = tensors[input_tensor]->shape; // A[..., M, N]
+        const auto& shapeB = tensors[output_tensor]->shape; // B[..., M, N]
+        
+        // last-2 dims
+        uint32_t M = shapeB.size() >= 2 ? shapeB[shapeB.size() - 2] : 1;
+        uint32_t N = shapeB.back();
+        
+        // flatten all leading dims -> B
+        uint32_t batch_size = prod(shapeB, 0, shapeB.size() - 2);
+        
+        // uniforms
+        uniform.logvar = tensors[input_tensor]->getTensorImpl();
+        uniform.std_out = tensors[output_tensor]->getTensorImpl(); // output
+        uniform.accumulate_grad = 1;
+        
+        // Compute dispatch grid
+        uint32_t num_elements_a = tensors[input_tensor]->get_num_elements();
+
+        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        uint32_t groupX = cielDiv(num_elements_a, 256u);
+        uint32_t groupY = 1;
+        uint32_t groupZ = 1;
+
+        DEBUG_PRINT("Dispatch (in-place, broadcasting): ");
+        DEBUG_PRINT(groupX << " × " << groupY
+                    << " × " << groupZ << " (covering max elements " << num_elements_a << ")");
+
+        uint32_t workgroup[3] = { groupX, groupY, groupZ };
+        
+        tensor_push_const pushConsts{};
+        pushConsts.grid_size = { groupX, groupY, groupZ };
+        
+        if (mode == 0) {
+            // Forward pass
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = expShader.uniformBuffer->getBufferAddress();
+            expShader.loadUniform(uniform, pushConsts);
+            expShader.execute(workgroup);
+            return *output;
+        }
+        else if (mode == 1) {
+            // Backward pass
+            pushConsts.mode = mode;
+            pushConsts.uniformAddress = expShaderBackward.uniformBuffer->getBufferAddress();
+            expShaderBackward.loadUniform(uniform, pushConsts);
+            expShaderBackward.execute(workgroup);
+            return *output;
         }
     }
 
@@ -2478,6 +2561,8 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, matmul_elementwise_context> elementwiseMultiplicationShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, logvar_to_std_context> logvarToStdShader; // computes std = (0.5 * logvar).exp()
     gpuTaskNoDesc<T, tensor_push_const, logvar_to_std_context> logvarToStdShaderBackward; // computes std = (0.5 * logvar).exp() backward pass
+    gpuTaskNoDesc<T, tensor_push_const, logvar_to_std_context> expShader; // computes output = (input).exp()
+    gpuTaskNoDesc<T, tensor_push_const, logvar_to_std_context> expShaderBackward; // computes output = (input).exp() backward pass
     gpuTaskNoDesc<T, tensor_push_const, mse_loss_context> mseLossShader; // computes Mean Squared Error (MSE) loss
     gpuTaskNoDesc<T, tensor_push_const, kld_loss_context> kldLossShader; // computes the Kullback Liebler Divergence (KLD) loss
 	gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShader; // computes ReLU
@@ -2531,6 +2616,19 @@ Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
         other.backward();
     };
     pool->tensor_add_inplace(other.name, name, output.name);
+    return output;
+}
+
+template<typename T>
+Tensor<T>& Tensor<T>::exp(){
+    
+    auto output = pool->tensor_exp(name);
+
+    output->back = [output, this](){
+        this->pool->tensor_exp(this->name, output->name, 1);
+        this->backward();
+    };
+
     return output;
 }
 
