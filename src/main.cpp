@@ -555,7 +555,7 @@ struct VAE {
 	// eps = random gaussian
 	// mu + eps * std
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		auto &std_tensor = tensorPool.tensor_logvar_to_std(logvar->name);
+		auto &std_tensor = (0.5f * *logvar).exp();
 		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
 

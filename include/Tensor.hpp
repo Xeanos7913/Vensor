@@ -964,7 +964,7 @@ struct TensorPool {
         }
     }
 
-    Tensor<T>& createTensor(std::vector<uint32_t> dims, const std::string& name) {
+    Tensor<T>& createTensor(const std::vector<uint32_t>& dims, const std::string& name) {
         if (tensors.find(name) == tensors.end()) {
             tensors[name] = std::make_unique<Tensor<T>>(dims, allocator);
             tensors[name]->name = name;
@@ -2608,6 +2608,38 @@ Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
 }
 
 template<typename T>
+Tensor<T>& Tensor<T>::operator*(T other){
+    auto &output = pool->createTensor(this->shape, name + "-elementwise_multiply_output_for_" + std::to_string(other));
+    auto &to_mul = pool->createTensor(std::vector<uint32_t>(this->shape.size(), 1), "const_mul_tensor_" + name + "_" + std::to_string(other));
+    // set scalar value
+    to_mul.dataBuffer->set(0, other);
+
+    output.back = [this, &output, &to_mul](){
+        this->pool->tensor_multiply_elementwise(to_mul.name, this->name, output.name, 1);
+        this->backward();
+    };
+    pool->tensor_multiply_elementwise(to_mul.name, this->name, output.name);
+    return output;
+}
+
+template<typename T>
+Tensor<T>& operator*(T lhs, Tensor<T>& rhs){
+    // create output with same shape as rhs
+    auto &output = rhs.pool->createTensor(rhs.shape, std::to_string(lhs) + "_" + rhs.name + "-elementwise_multiply_output");
+    // create scalar tensor to hold lhs
+    auto &to_mul = rhs.pool->createTensor(std::vector<uint32_t>(rhs.shape.size(), 1), "const_mul_tensor_" + std::to_string(lhs) + "_" + rhs.name);
+    to_mul.dataBuffer->set(0, lhs);
+
+    output.back = [&rhs, &output, &to_mul](){
+        rhs.pool->tensor_multiply_elementwise(to_mul.name, rhs.name, output.name, 1);
+        rhs.backward();
+    };
+
+    rhs.pool->tensor_multiply_elementwise(to_mul.name, rhs.name, output.name);
+    return output;
+}
+
+template<typename T>
 Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
     auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_addition_output");
     output.back = [this, &other, &output](){
@@ -2620,12 +2652,41 @@ Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
 }
 
 template<typename T>
+Tensor<T>& Tensor<T>::operator+(T other) {
+    auto &output = pool->createTensor(this->shape, name + "_" + std::to_string(other) + "-elementwise_addition_output");
+    auto &to_add = pool->createTensor(std::vector<uint32_t>(this->shape.size(), 1), "const_add_tensor_" + name + "_" + std::to_string(other));
+
+    output.back = [this, &output, &to_add](){
+        this->pool->tensor_add_inplace(to_add.name, this->name, output.name, 1);
+    };
+    pool->tensor_add_inplace(to_add.name, name, output.name);
+    return output;
+}
+
+template<typename T>
+Tensor<T>& operator+(T lhs, Tensor<T>& rhs){
+    // create output with same shape as rhs
+    auto &output = rhs.pool->createTensor(rhs.shape, std::to_string(lhs) + "_" + rhs.name + "-elementwise_addition_output");
+    // create scalar tensor to hold lhs
+    auto &to_add = rhs.pool->createTensor(std::vector<uint32_t>(rhs.shape.size(), 1), "const_add_tensor_" + std::to_string(lhs) + "_" + rhs.name);
+    to_add.dataBuffer->set(0, lhs);
+
+    output.back = [&rhs, &output, &to_add](){
+        rhs.pool->tensor_add_inplace(to_add.name, rhs.name, output.name, 1);
+        rhs.backward();
+    };
+
+    rhs.pool->tensor_add_inplace(to_add.name, rhs.name, output.name);
+    return output;
+}
+
+template<typename T>
 Tensor<T>& Tensor<T>::exp(){
     
-    auto output = pool->tensor_exp(name);
+    auto &output = pool->tensor_exp(name);
 
-    output->back = [output, this](){
-        this->pool->tensor_exp(this->name, output->name, 1);
+    output.back = [&output, this](){
+        this->pool->tensor_exp(this->name, output.name, 1);
         this->backward();
     };
 
