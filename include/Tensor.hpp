@@ -986,6 +986,12 @@ struct TensorPool {
             throw std::runtime_error("Tensor with this name does not exist");
         }
     }
+
+    void zero_out_all_grads(){
+        for (auto& [name, tensor] : tensors){
+            tensor->gradientBuffer->clearBuffer();
+        }
+    }
     
     void tensor_ReLU(const std::string& output_tensor, const std::string& input_tensor, uint32_t mode = 0) {
         tensor_relu_context uniform{};
@@ -2522,12 +2528,6 @@ struct TensorPool {
         auto data = local_tensor.dataBuffer->downloadBuffer();
         destroy_tensor(local_tensor.name);
         return data[0]; // the first element will contain the mean value
-    }
-
-    void zero_out_all_grads() {
-        for (auto& [name, tensor] : tensors){
-            tensor->gradientBuffer->fill_buffer(0u);
-        }
     }
 
     void save_tensor_to_file(const std::string& tensor_name, const std::string& filename) {

@@ -215,7 +215,7 @@ struct Allocator {
     void fillBuffer(VkBuffer buffer, VkDeviceMemory memory, U data, VkDeviceSize offset = 0, VkDeviceSize range = VK_WHOLE_SIZE) {
 		auto cmd = beginSingleTimeCommands();
         vkCmdFillBuffer(commandBuffers[cmd], buffer, offset, range, static_cast<uint32_t>(data));
-		endSingleTimeCommands(true, false);
+		endSingleTimeCommands(true);
     }
 
 	// avoid as much as possible, this kills performance. But if you need to free memory, this is the way to do it.
@@ -1099,7 +1099,7 @@ struct StandaloneBuffer {
 
     void clearBuffer() {
         if (allocator != nullptr) {
-            allocator->freeMemory(buffer, 0, capacity);
+            allocator->fillBuffer(buffer, bufferMemory, 0, 0, capacity);
         }
     }
 
