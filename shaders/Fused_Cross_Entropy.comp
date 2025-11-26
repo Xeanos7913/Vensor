@@ -6,9 +6,10 @@
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
-#extension GL_EXT_shader_atomic_float : enable
 
-// Workgroup size (runtime specialization constants)
+// Warp size
+layout(constant_id = 0) const uint WARP_SIZE = 32;
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data {
@@ -60,8 +61,9 @@ layout(push_constant) uniform PushConstants{
 } push;
 
 // Shared memory for inter-subgroup reductions and exp values
-shared float shared_subgroup_max[8];   // Up to 8 subgroups (256/32)
-shared float shared_subgroup_sum[8];
+#define memSize 256 / WARP_SIZE
+shared float shared_subgroup_max[memSize];   // Up to 8 subgroups (256/32) for NVIDIA
+shared float shared_subgroup_sum[memSize];
 shared float shared_exp[256];
 
 uint off2or3(const TensorImpl t, uint b, uint i, uint j) {

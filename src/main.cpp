@@ -738,7 +738,7 @@ int main(void) {
 
 	loss->backward();
 
-	linear1.weights->printGradient();
+	//linear1.weights->printGradient();
 
 	delete allocator;
 	return 0;

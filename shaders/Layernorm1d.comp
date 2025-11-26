@@ -3,14 +3,15 @@
 #extension GL_EXT_buffer_reference : enable
 #extension GL_EXT_buffer_reference_uvec2 : enable
 #extension GL_EXT_scalar_block_layout : enable
-#extension GL_EXT_shader_atomic_float : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_shuffle : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_shuffle_relative : enable
 
 #define MAX_WG 256u
-#define WARP_SIZE 32u
+
+#define WARP_SIZE gl_SubgroupSize
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, scalar) buffer tensor_data { float data[]; };
@@ -55,7 +56,7 @@ shared float shmem2[MAX_WG];
 const uint VEC4 = 4u;
 const uint VEC4S_PER_THREAD = 2u;       // tuneable: vec4s per thread (2 -> 8 floats/thread)
 const uint FLOATS_PER_THREAD = VEC4 * VEC4S_PER_THREAD;
-const uint NUM_WARPS = MAX_WG / WARP_SIZE;
+uint NUM_WARPS = MAX_WG / WARP_SIZE;
 
 vec4 loadVec4Contig(tensor_data buf, uint idx, uint remaining) {
     vec4 r = vec4(0.0);

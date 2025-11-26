@@ -2,8 +2,7 @@
 #extension GL_ARB_separate_shader_objects : enable  
 #extension GL_EXT_buffer_reference : enable  
 #extension GL_EXT_buffer_reference_uvec2 : enable  
-#extension GL_EXT_scalar_block_layout : enable  
-#extension GL_EXT_shader_atomic_float : enable
+#extension GL_EXT_scalar_block_layout : enable
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;  
 
@@ -60,6 +59,6 @@ void main() {
 
     // Compare the values and update the output tensor
     if (value_a != value_b) {
-        atomicAdd(pc.context.context.outp.data.data[0], 1.0);
+        pc.context.context.outp.data.data[0] = 1.0;
     }
 }

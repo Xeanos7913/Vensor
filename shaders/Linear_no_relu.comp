@@ -3,7 +3,6 @@
 #extension GL_EXT_buffer_reference : enable
 #extension GL_EXT_buffer_reference_uvec2 : enable
 #extension GL_EXT_scalar_block_layout : enable
-#extension GL_EXT_shader_atomic_float : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 
 // Warp-tiling parameters (matching CUDA kernel structure)
@@ -16,7 +15,8 @@
 #define TM 8        // Thread tile size M
 #define TN 4        // Thread tile size N
 #define NUM_THREADS 256
-#define WARPSIZE 32
+
+#define WARPSIZE 32 // should work for most modern GPUs. we should make custom shaders for each GPU, though... perhaps some sort of a shader reflection or something
 
 layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
 

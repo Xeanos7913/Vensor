@@ -12,7 +12,7 @@
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #define MAX_WG 256
-#define WARP_SIZE 32
+#define WARP_SIZE gl_SubgroupSize
 #define TILE_SIZE 4
 
 #define VECTORIZED_BATCHED // use vectorized MSE by default.
