@@ -416,6 +416,9 @@ struct Tensor {
 
    std::vector<std::function<void()>> back;
 
+    bool claimable = false;
+    bool isClaimed = false;
+
     Tensor(){}; // empty default ctor
 
    Tensor(std::initializer_list<uint32_t> dims, Allocator* allocator)
@@ -969,17 +972,41 @@ struct TensorPool {
         }
     }
 
-    Tensor<T>& createTensor(const std::vector<uint32_t>& dims, const std::string& name) {
-        if (tensors.find(name) == tensors.end()) {
-            tensors[name] = std::make_unique<Tensor<T>>(dims, allocator);
-            tensors[name]->name = name;
-            tensors[name]->pool = this;
-            return *tensors[name];
-        }
-        else {
+    Tensor<T>& createTensor(const std::vector<uint32_t>& dims, const std::string& name, bool claimable = false) {
+        // if tensor already exists, return it (user-owned tensors)
+        auto it = tensors.find(name);
+        if (it != tensors.end()) {
             DEBUG_PRINT("tensor with name: " << name << " already exists. Returning that tensor.");
-            return *tensors[name];
+            return *(it->second);
         }
+
+        // look for a reusable intermediate tensor
+        for (auto it = tensors.begin(); it != tensors.end(); ++it) {
+            auto& tensor = it->second;
+            if (tensor->shape == dims && tensor->claimable && !tensor->isClaimed) {
+                tensor->isClaimed = true;
+
+                // save old pointer
+                auto ptr = std::move(it->second);
+
+                // erase old key
+                tensors.erase(it);
+
+                // set new name and insert under new key
+                ptr->name = name;
+                tensors[name] = std::move(ptr);
+
+                return *tensors[name];
+            }
+        }
+
+        // create new tensor
+        auto& new_tensor = *(tensors[name] = std::make_unique<Tensor<T>>(dims, allocator));
+        new_tensor.pool = this;
+        new_tensor.name = name;
+        new_tensor.isClaimed = true;
+        new_tensor.claimable = claimable;
+        return new_tensor;
     }
 
     void destroy_tensor(const std::string& name) {
@@ -2038,7 +2065,7 @@ struct TensorPool {
         // if no output is given, create output. If created output already exists, use that
         Tensor<T>* output;
         if(output_tensor.empty()){
-            output = &createTensor(tensors[input_tensor]->shape, input_tensor + "-std_dev_tensor");
+            output = &createTensor(tensors[input_tensor]->shape, input_tensor + "-std_dev_tensor", true);
             output_tensor = output->name;
         }
 
@@ -2066,7 +2093,7 @@ struct TensorPool {
         uint32_t groupY = 1;
         uint32_t groupZ = 1;
 
-        DEBUG_PRINT("Dispatch (in-place, broadcasting): ");
+        DEBUG_PRINT("Dispatch: ");
         DEBUG_PRINT(groupX << " × " << groupY
                     << " × " << groupZ << " (covering max elements " << num_elements_a << ")");
 
@@ -2604,7 +2631,7 @@ private:
 template<typename T>
 Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
     auto &output = pool->createTensor(this->shape,
-        name + other.name + "-elementwise_multiply_output");
+        name + other.name + "-elementwise_multiply_output", true);
 
     Tensor<T>* self_ptr = this;
     Tensor<T>* oth_ptr  = &other;
@@ -2615,6 +2642,7 @@ Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
         pool_ptr->tensor_multiply_elementwise(oth_ptr->name, self_ptr->name, out_ptr->name, 1);
         self_ptr->backward();
         oth_ptr->backward();
+        out_ptr->isClaimed = false;
     });
 
     pool->tensor_multiply_elementwise(other.name, name, output.name);
@@ -2624,11 +2652,11 @@ Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
 template<typename T>
 Tensor<T>& Tensor<T>::operator*(T other){
     auto &output = pool->createTensor(this->shape,
-        name + "-elementwise_multiply_output_for_" + std::to_string(other));
+        name + "-elementwise_multiply_output_for_" + std::to_string(other), true);
 
     auto &to_mul = pool->createTensor(
         std::vector<uint32_t>(this->shape.size(), 1),
-        "const_mul_tensor_" + name + "_" + std::to_string(other)
+        "const_mul_tensor_" + name + "_" + std::to_string(other), true
     );
     to_mul.dataBuffer->set(0, other);
 
@@ -2640,6 +2668,8 @@ Tensor<T>& Tensor<T>::operator*(T other){
     output.back.push_back([self_ptr, out_ptr, mul_ptr, pool_ptr]() {
         pool_ptr->tensor_multiply_elementwise(mul_ptr->name, self_ptr->name, out_ptr->name, 1);
         self_ptr->backward();
+        out_ptr->isClaimed = false;
+        mul_ptr->isClaimed = false;
     });
 
     pool->tensor_multiply_elementwise(to_mul.name, this->name, output.name);
@@ -2650,12 +2680,12 @@ template<typename T>
 Tensor<T>& operator*(T lhs, Tensor<T>& rhs) {
     auto &output = rhs.pool->createTensor(
         rhs.shape,
-        std::to_string(lhs) + "_" + rhs.name + "-elementwise_multiply_output"
+        std::to_string(lhs) + "_" + rhs.name + "-elementwise_multiply_output", true
     );
 
     auto &to_mul = rhs.pool->createTensor(
         std::vector<uint32_t>(rhs.shape.size(), 1),
-        "const_mul_tensor_" + std::to_string(lhs) + "_" + rhs.name
+        "const_mul_tensor_" + std::to_string(lhs) + "_" + rhs.name, true
     );
     to_mul.dataBuffer->set(0, lhs);
 
@@ -2667,6 +2697,8 @@ Tensor<T>& operator*(T lhs, Tensor<T>& rhs) {
     output.back.push_back([rhs_ptr, out_ptr, mul_ptr, pool_ptr]() {
         pool_ptr->tensor_multiply_elementwise(mul_ptr->name, rhs_ptr->name, out_ptr->name, 1);
         rhs_ptr->backward();
+        mul_ptr->isClaimed = false;
+        out_ptr->isClaimed = false;
     });
 
     rhs.pool->tensor_multiply_elementwise(to_mul.name, rhs.name, output.name);
@@ -2677,7 +2709,7 @@ template<typename T>
 Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
     auto &output = pool->createTensor(
         this->shape,
-        name + other.name + "-elementwise_addition_output"
+        name + other.name + "-elementwise_addition_output", true
     );
 
     Tensor<T>* self_ptr = this;
@@ -2689,6 +2721,7 @@ Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
         pool_ptr->tensor_add_inplace(oth_ptr->name, self_ptr->name, out_ptr->name, 1);
         self_ptr->backward();
         oth_ptr->backward();
+        out_ptr->isClaimed = false;
     });
 
     pool->tensor_add_inplace(other.name, name, output.name);
@@ -2698,11 +2731,11 @@ Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
 template<typename T>
 Tensor<T>& Tensor<T>::operator+(T other) {
     auto &output = pool->createTensor(this->shape,
-        name + "_" + std::to_string(other) + "-elementwise_addition_output");
+        name + "_" + std::to_string(other) + "-elementwise_addition_output", true);
 
     auto &to_add = pool->createTensor(
         std::vector<uint32_t>(this->shape.size(), 1),
-        "const_add_tensor_" + name + "_" + std::to_string(other)
+        "const_add_tensor_" + name + "_" + std::to_string(other), true
     );
     to_add.dataBuffer->set(0, other);
 
@@ -2713,6 +2746,8 @@ Tensor<T>& Tensor<T>::operator+(T other) {
 
     output.back.push_back([self_ptr, out_ptr, add_ptr, pool_ptr]() {
         pool_ptr->tensor_add_inplace(add_ptr->name, self_ptr->name, out_ptr->name, 1);
+        out_ptr->isClaimed = false;
+        add_ptr->isClaimed = false;
     });
 
     pool->tensor_add_inplace(to_add.name, name, output.name);
@@ -2723,12 +2758,12 @@ template<typename T>
 Tensor<T>& operator+(T lhs, Tensor<T>& rhs){
     auto &output = rhs.pool->createTensor(
         rhs.shape,
-        std::to_string(lhs) + "_" + rhs.name + "-elementwise_addition_output"
+        std::to_string(lhs) + "_" + rhs.name + "-elementwise_addition_output", true
     );
 
     auto &to_add = rhs.pool->createTensor(
         std::vector<uint32_t>(rhs.shape.size(), 1),
-        "const_add_tensor_" + std::to_string(lhs) + "_" + rhs.name
+        "const_add_tensor_" + std::to_string(lhs) + "_" + rhs.name, true
     );
     to_add.dataBuffer->set(0, lhs);
 
@@ -2740,6 +2775,8 @@ Tensor<T>& operator+(T lhs, Tensor<T>& rhs){
     output.back.push_back([rhs_ptr, out_ptr, add_ptr, pool_ptr]() {
         pool_ptr->tensor_add_inplace(add_ptr->name, rhs_ptr->name, out_ptr->name, 1);
         rhs_ptr->backward();
+        out_ptr->isClaimed = false;
+        add_ptr->isClaimed = false;
     });
 
     rhs.pool->tensor_add_inplace(to_add.name, rhs.name, output.name);
@@ -2757,6 +2794,7 @@ Tensor<T>& Tensor<T>::exp() {
     output.back.push_back([self_ptr, out_ptr, pool_ptr]() {
         pool_ptr->tensor_exp(self_ptr->name, out_ptr->name, 1);
         self_ptr->backward();
+        out_ptr->isClaimed = false;
     });
 
     return output;
