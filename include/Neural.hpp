@@ -11,7 +11,6 @@ struct Module {
 	Module<T>* prev;
 	Tensor<T>* output;
 	virtual Tensor<T>* forward(Tensor<T>* input) = 0;
-	virtual void backward(Tensor<T>* input) = 0;
 	Tensor<T>* operator()(Tensor<T>* input) {
 		return forward(input);
 	}
@@ -100,19 +99,11 @@ struct LinearReLU : public Module<T>{
 		}
 		tensorPool->tensor_linear_ReLU(output_name, input->name, weights_name, bias_name, 0);
 		input->view(o);
-		this->output->back = [this, input](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_linear_ReLU(this->output_name, input->name, this->weights_name, this->bias_name, 1);
 			input->backward();
-		};
+		});
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		auto o = input->shape;
-		if(input->shape.size() == 2){
-			input->view({input->shape[0], 1, input->shape[1]});
-		}
-		tensorPool->tensor_linear_ReLU(output_name, input->name, weights_name, bias_name, 1);
-		input->view(o);
 	}
 };
 
@@ -181,19 +172,11 @@ struct Linear : public Module<T> {
 		}
 		tensorPool->tensor_linear(output_name, input->name, weights_name, bias_name, 0);
 		input->view(o); // return the tensor's original dims
-		this->output->back = [this, input](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_linear(this->output_name, input->name, this->weights_name, this->bias_name, 1);
 			input->backward();
-		};
+		});
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		auto o = input->shape;
-		if(input->shape.size() == 2){
-			input->view({input->shape[0], 1, input->shape[1]});
-		}
-		tensorPool->tensor_linear(output_name, input->name, weights_name, bias_name, 1);
-		input->view(o);
 	}
 };
 
@@ -222,14 +205,11 @@ struct ReLU : public Module<T> {
 		}
 		// Apply ReLU activation function
 		tensorPool->tensor_ReLU(output_name, input->name);
-		this->output->back = [this, input](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_ReLU(this->output_name, input->name, 1);
 			input->backward();
-		};
+		});
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		tensorPool->tensor_ReLU(output_name, input->name, 1);
 	}
 };
 
@@ -254,10 +234,6 @@ struct Dropout : public Module<T> {
 		// Apply Dropout (not implemented yet)
 		std::cout << "Dropout not implemented yet\n";
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		// Backward pass for Dropout (not implemented yet)
-		std::cout << "Dropout backward not implemented yet\n";
 	}
 };
 
@@ -290,18 +266,11 @@ struct SoftmaxCrossEntropy : public Module<T> {
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		tensorPool->tensor_cross_entropy(output_name, input->name, target->name, softmax_output->name, 0);
-		this->output->back = [this, input](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_cross_entropy(this->output_name, input->name, this->target->name, this->softmax_output->name, 1);
 			input->backward();
-		};
+		});
 		return this->output;
-	}
-
-	void backward(Tensor<T>* input) override {
-		if (target == nullptr) {
-			throw std::runtime_error("Target tensor not set for SoftmaxCrossEntropy");
-		}
-		tensorPool->tensor_cross_entropy(output_name, input->name, target->name, softmax_output->name, 1);
 	}
 };
 
@@ -323,13 +292,11 @@ struct MSEloss : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(target == nullptr) throw std::runtime_error("Target tensor for MSE loss not set!");
 		tensorPool->mse_loss(input->name, target->name, this->output->name);
-		this->output->back = [this, input](){
+		this->output->back.push_back([input](){
 			input->backward();
-		};
+		});
 		return this->output;
 	}
-
-	void backward(Tensor<T>* input) override {} // does nothing
 };
 
 template<typename T>
@@ -349,13 +316,11 @@ struct KLDloss : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(logvar_tensor == nullptr || mu_tensor == nullptr) throw std::runtime_error("logvar and mu tensors need to be set for KLDloss to work!");
 		tensorPool->kld_loss(mu_tensor->name, logvar_tensor->name, this->output->name);
-		this->output->back = [this, input](){
+		this->output->back.push_back([input](){
 			input->backward();
-		};
+		});
 		return this->output;
 	}
-
-	void backward(Tensor<T>* input) override {} // does nothing
 };
 
 template<typename T>
@@ -441,18 +406,14 @@ struct BatchNorm1d : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if (mode == 0){
 			tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
-			this->output->back = [this, input](){
+			this->output->back.push_back([this, input](){
 				this->tensorPool->tensor_batchnorm_1d(input->name, this->weight_tensor->name, this->bias_tensor->name, this->running_mean->name, this->running_var->name, this->output_name, this->save_mean->name, this->save_var->name, 1);
 				input->backward();
-			};
+			});
 		}else {
 			tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, "", "", 0);
 		}
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		if(mode != 0) throw std::invalid_argument("can't call backward on Batchnorm1d with mode = 1 (eval)");
-		tensorPool->tensor_batchnorm_1d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 1);
 	}
 };
 
@@ -540,17 +501,14 @@ struct BatchNorm2d : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(mode == 0){
 			tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 0);
-			this->output->back = [this, input](){
+			this->output->back.push_back([this, input](){
 				this->tensorPool->tensor_batchnorm_2d(input->name, this->weight_tensor->name, this->bias_tensor->name, this->running_mean->name, this->running_var->name, this->output_name, this->save_mean->name, this->save_var->name, 1);
 				input->backward();
-			};
+			});
 		} else {
 			tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, "", "", 0);
 		}
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		tensorPool->tensor_batchnorm_2d(input->name, weight_tensor->name, bias_tensor->name, running_mean->name, running_var->name, this->output->name, save_mean->name, save_var->name, 1);
 	}
 };
 
@@ -573,10 +531,6 @@ struct ResidualConnect : public Module<T>{
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		return input_a->operator+(input_b);
-	}
-
-	void backward(Tensor<T>* input) override {
-		tensorPool->tensor_add_inplace(input_b->name, input_a->name, 1);
 	}
 };
 
@@ -639,19 +593,15 @@ struct Layernorm : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(mode == 0){
 			tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 0);
-			this->output->back = [this, input](){
+			this->output->back.push_back([this, input](){
 				this->tensorPool->tensor_layernorm(input->name, this->weight_tensor->name, this->bias_tensor->name, this->output_name, this->save_mean->name, this->save_rstd->name, 1);
 				input->backward();
-			};
+			});
 		}
 		else {
 			tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, "", "", 0);
 		}
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		if(mode == 1) throw std::runtime_error("Cannot call backward on Layernorm with eval mode on! \n Change mode = 0 -> mode = 1 in the ctor.");
-		tensorPool->tensor_layernorm(input->name, weight_tensor->name, bias_tensor->name, this->output->name, save_mean->name, save_rstd->name, 1);
 	}
 };
 
@@ -766,27 +716,12 @@ struct Conv2d3x3 : public Module<T> {
 		}
 
 		tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
-		this->output->back = [this, input](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups, 1);
 			input->backward();
-		};
+		});
 		
 		return this->output;
-	}
-
-	void backward(Tensor<T>* input) override {
-		// Ensure input tensor shape matches expected dimensions
-		if (input->shape.size() != 4) {
-			throw std::invalid_argument("Input tensor must have 4 dimensions: [N, C_in, H_in, W_in]");
-		}
-		if (input->shape[1] != weight_tensor->shape[1]) {
-			throw std::invalid_argument("Input channels (C_in) must match weight tensor's input channels");
-		}
-		if (input->shape[2] < 3 || input->shape[3] < 3) {
-			throw std::invalid_argument("Input height and width must be at least 3 to apply a 3x3 convolution");
-		}
-
-		tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
 	}
 };
 
@@ -905,27 +840,12 @@ struct Conv2d : public Module<T> {
 		}
 
 		tensorPool->tensor_conv2d(output_name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
-		this->output->back = [this, input](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_conv2d(output_name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
 			input->backward();
-		};
+		});
 		
 		return this->output;
-	}
-
-	void backward(Tensor<T>* input) override {
-		// Ensure input tensor shape matches expected dimensions
-		if (input->shape.size() != 4) {
-			throw std::invalid_argument("Input tensor must have 4 dimensions: [N, C_in, H_in, W_in]");
-		}
-		if (input->shape[1] != weight_tensor->shape[1]) {
-			throw std::invalid_argument("Input channels (C_in) must match weight tensor's input channels");
-		}
-		if (input->shape[2] < 3 || input->shape[3] < 3) {
-			throw std::invalid_argument("Input height and width must be at least 3 to apply a 3x3 convolution");
-		}
-
-		tensorPool->tensor_conv2d(output_name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
 	}
 };
 
@@ -1068,7 +988,7 @@ struct TransposedConv2d : public Module<T> {
             groups
         );
 
-		this->output->back = [this, input](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_transposed_conv2d(
 				output_name,
 				input->name,
@@ -1083,30 +1003,8 @@ struct TransposedConv2d : public Module<T> {
 				groups
         	);
 			input->backward();
-		};
+		});
         return this->output;
-    }
-
-    // Backward
-    void backward(Tensor<T>* input) override {
-        if (input->shape.size() != 4)
-            throw std::invalid_argument("Input tensor must have 4 dims [N, C_in, H_in, W_in]");
-        if (input->shape[1] != weight_tensor->shape[0])
-            throw std::invalid_argument("Input channels must match weight tensor's input channels (C_in)");
-        
-        tensorPool->tensor_transposed_conv2d(
-            output_name,
-            input->name,
-            weight_tensor->name,
-            bias_tensor->name,
-            kernel_h, kernel_w,
-            1, // mode = backward
-            stride_w, stride_h,
-            pad_h, pad_w,
-            dilation_h, dilation_w,
-            output_pad_h, output_pad_w,
-            groups
-        );
     }
 };
 
@@ -1155,14 +1053,12 @@ struct MaxPool : public Module<T> {
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		tensorPool->tensor_max_pool(input->name, this->output->name, kernel_h, kernel_w, stride_h, stride_w, 0);
-		this->output->back = [this,input](){
+
+		this->output->back.push_back([this,input](){
 			this->tensorPool->tensor_max_pool(input->name, this->output->name, kernel_h, kernel_w, stride_h, stride_w, 1);
 			input->backward();
-		};
+		});
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		tensorPool->tensor_max_pool(input->name, this->output->name, kernel_h, kernel_w, stride_h, stride_w, 1);
 	}
 };
 
@@ -1193,13 +1089,12 @@ struct EmbeddingTable : public Module<T> {
 	// input tensor contains token indices (B, token_count)
 	Tensor<T>* forward(Tensor<T>* input) override {
 		tensorPool->tensor_embed_lookup(this->output->name, embedding_tensor->name, input->name, 0);
-		this->output->back = [this, input](){
+		
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_embed_lookup(this->output->name, this->embedding_tensor->name, input->name, 1);
-		};
+		});
+
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		tensorPool->tensor_embed_lookup(this->output->name, embedding_tensor->name, input->name, 1);
 	}
 };
 
@@ -1219,12 +1114,15 @@ struct ShapeTo : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		original_shape = input->shape;
 		input->view(new_shape);
+
+		auto saved_shape = original_shape;   // COPY
+
+		input->back.push_back([input, saved_shape]() mutable {
+			input->view(saved_shape);
+		});
+
 		this->output = input;
 		return this->output;
-	}
-	
-	void backward(Tensor<T>* input) override {
-		input->view(original_shape);
 	}
 };
 
@@ -1244,12 +1142,15 @@ struct FlattenTo1d : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		original_shape = input->shape;
 		input->view({ input->shape[0], static_cast<uint32_t>(std::accumulate(input->shape.begin() + 1, input->shape.end(), 1, std::multiplies<uint32_t>())) });
+		
+		auto saved_shape = original_shape;   // COPY
+
+		input->back.push_back([input, saved_shape]() mutable {
+			input->view(saved_shape);
+		});
+		
 		this->output = input;
 		return this->output;
-	}
-
-	void backward(Tensor<T>* input) override {
-		input->view(original_shape);
 	}
 };
 
@@ -1267,12 +1168,23 @@ struct FlattenTo2d : public Module<T> {
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		original_shape = input->shape;
-		input->view({ input->shape[0], input->shape[1], static_cast<uint32_t>(std::accumulate(input->shape.begin()+2, input->shape.end(), 1, std::multiplies<uint32_t>())) });
+
+		input->view({
+			input->shape[0],
+			input->shape[1],
+			static_cast<uint32_t>(
+				std::accumulate(input->shape.begin()+2, input->shape.end(), 1, std::multiplies<uint32_t>())
+			)
+		});
+
+		auto saved_shape = original_shape;   // COPY
+
+		input->back.push_back([input, saved_shape]() {
+			input->view(saved_shape);
+		});
+
 		this->output = input;
 		return this->output;
-	}
-	void backward(Tensor<T>* input) override {
-		input->view(original_shape);
 	}
 };
 
@@ -1332,19 +1244,6 @@ struct Sequential : public Module<T> {
 			ts.insert(ts.end(), layer_ts.begin(), layer_ts.end());
 		}
 		return ts;
-	}
-
-	void backward(Tensor<T>* input = nullptr) {
-		for (auto it = layers.rbegin(); it != layers.rend(); ++it) {
-			auto& layer = *it;
-			if(layer->prev) {
-				layer->backward(layer->prev->output);
-			}
-			else {
-				// we're at first layer
-				layer->backward(input);
-			}
-		}
 	}
 };
 

@@ -414,7 +414,7 @@ struct Tensor {
 
    std::string name;
 
-   std::function<void()> back;
+   std::vector<std::function<void()>> back;
 
     Tensor(){}; // empty default ctor
 
@@ -509,8 +509,13 @@ struct Tensor {
        }  
     }  
 
-    void backward() const {
-        if (back) {std::cout << "calling backward for tensor " << name << "\n"; back(); }
+    void backward() {
+        for (size_t i = back.size(); i-- > 0; ) {
+            if (back[i]) {
+                std::cout << "Calling backward " << i << " for tensor: " << name << "\n";
+                back[i]();
+            }
+        }
     }
 
     void view(std::initializer_list<uint32_t> dims) {
@@ -2597,43 +2602,71 @@ private:
 
 template<typename T>
 Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
-    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_multiply_output");
-    output.back = [this, &other, &output](){
-        this->pool->tensor_multiply_elementwise(other.name, this->name, output.name, 1);
-        this->backward();
-        other.backward();
-    };
+    auto &output = pool->createTensor(this->shape,
+        name + other.name + "-elementwise_multiply_output");
+
+    Tensor<T>* self_ptr = this;
+    Tensor<T>* oth_ptr  = &other;
+    Tensor<T>* out_ptr  = &output;
+    auto pool_ptr       = this->pool;
+
+    output.back.push_back([self_ptr, oth_ptr, out_ptr, pool_ptr]() {
+        pool_ptr->tensor_multiply_elementwise(oth_ptr->name, self_ptr->name, out_ptr->name, 1);
+        self_ptr->backward();
+        oth_ptr->backward();
+    });
+
     pool->tensor_multiply_elementwise(other.name, name, output.name);
     return output;
 }
 
 template<typename T>
 Tensor<T>& Tensor<T>::operator*(T other){
-    auto &output = pool->createTensor(this->shape, name + "-elementwise_multiply_output_for_" + std::to_string(other));
-    auto &to_mul = pool->createTensor(std::vector<uint32_t>(this->shape.size(), 1), "const_mul_tensor_" + name + "_" + std::to_string(other));
-    // set scalar value
+    auto &output = pool->createTensor(this->shape,
+        name + "-elementwise_multiply_output_for_" + std::to_string(other));
+
+    auto &to_mul = pool->createTensor(
+        std::vector<uint32_t>(this->shape.size(), 1),
+        "const_mul_tensor_" + name + "_" + std::to_string(other)
+    );
     to_mul.dataBuffer->set(0, other);
 
-    output.back = [this, &output, &to_mul](){
-        this->pool->tensor_multiply_elementwise(to_mul.name, this->name, output.name, 1);
-        this->backward();
-    };
+    Tensor<T>* self_ptr = this;
+    Tensor<T>* out_ptr  = &output;
+    Tensor<T>* mul_ptr  = &to_mul;
+    auto pool_ptr       = this->pool;
+
+    output.back.push_back([self_ptr, out_ptr, mul_ptr, pool_ptr]() {
+        pool_ptr->tensor_multiply_elementwise(mul_ptr->name, self_ptr->name, out_ptr->name, 1);
+        self_ptr->backward();
+    });
+
     pool->tensor_multiply_elementwise(to_mul.name, this->name, output.name);
     return output;
 }
 
 template<typename T>
-Tensor<T>& operator*(T lhs, Tensor<T>& rhs){
-    // create output with same shape as rhs
-    auto &output = rhs.pool->createTensor(rhs.shape, std::to_string(lhs) + "_" + rhs.name + "-elementwise_multiply_output");
-    // create scalar tensor to hold lhs
-    auto &to_mul = rhs.pool->createTensor(std::vector<uint32_t>(rhs.shape.size(), 1), "const_mul_tensor_" + std::to_string(lhs) + "_" + rhs.name);
+Tensor<T>& operator*(T lhs, Tensor<T>& rhs) {
+    auto &output = rhs.pool->createTensor(
+        rhs.shape,
+        std::to_string(lhs) + "_" + rhs.name + "-elementwise_multiply_output"
+    );
+
+    auto &to_mul = rhs.pool->createTensor(
+        std::vector<uint32_t>(rhs.shape.size(), 1),
+        "const_mul_tensor_" + std::to_string(lhs) + "_" + rhs.name
+    );
     to_mul.dataBuffer->set(0, lhs);
 
-    output.back = [&rhs, &output, &to_mul](){
-        rhs.pool->tensor_multiply_elementwise(to_mul.name, rhs.name, output.name, 1);
-        rhs.backward();
-    };
+    Tensor<T>* rhs_ptr = &rhs;
+    Tensor<T>* out_ptr = &output;
+    Tensor<T>* mul_ptr = &to_mul;
+    auto pool_ptr      = rhs.pool;
+
+    output.back.push_back([rhs_ptr, out_ptr, mul_ptr, pool_ptr]() {
+        pool_ptr->tensor_multiply_elementwise(mul_ptr->name, rhs_ptr->name, out_ptr->name, 1);
+        rhs_ptr->backward();
+    });
 
     rhs.pool->tensor_multiply_elementwise(to_mul.name, rhs.name, output.name);
     return output;
@@ -2641,54 +2674,89 @@ Tensor<T>& operator*(T lhs, Tensor<T>& rhs){
 
 template<typename T>
 Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
-    auto &output = pool->createTensor(this->shape, name + other.name + "-elementwise_addition_output");
-    output.back = [this, &other, &output](){
-        this->pool->tensor_add_inplace(other.name, this->name, output.name, 1);
-        this->backward();
-        other.backward();
-    };
+    auto &output = pool->createTensor(
+        this->shape,
+        name + other.name + "-elementwise_addition_output"
+    );
+
+    Tensor<T>* self_ptr = this;
+    Tensor<T>* oth_ptr  = &other;
+    Tensor<T>* out_ptr  = &output;
+    auto pool_ptr       = this->pool;
+
+    output.back.push_back([self_ptr, oth_ptr, out_ptr, pool_ptr]() {
+        pool_ptr->tensor_add_inplace(oth_ptr->name, self_ptr->name, out_ptr->name, 1);
+        self_ptr->backward();
+        oth_ptr->backward();
+    });
+
     pool->tensor_add_inplace(other.name, name, output.name);
     return output;
 }
 
 template<typename T>
 Tensor<T>& Tensor<T>::operator+(T other) {
-    auto &output = pool->createTensor(this->shape, name + "_" + std::to_string(other) + "-elementwise_addition_output");
-    auto &to_add = pool->createTensor(std::vector<uint32_t>(this->shape.size(), 1), "const_add_tensor_" + name + "_" + std::to_string(other));
+    auto &output = pool->createTensor(this->shape,
+        name + "_" + std::to_string(other) + "-elementwise_addition_output");
 
-    output.back = [this, &output, &to_add](){
-        this->pool->tensor_add_inplace(to_add.name, this->name, output.name, 1);
-    };
+    auto &to_add = pool->createTensor(
+        std::vector<uint32_t>(this->shape.size(), 1),
+        "const_add_tensor_" + name + "_" + std::to_string(other)
+    );
+    to_add.dataBuffer->set(0, other);
+
+    Tensor<T>* self_ptr = this;
+    Tensor<T>* out_ptr  = &output;
+    Tensor<T>* add_ptr  = &to_add;
+    auto pool_ptr       = this->pool;
+
+    output.back.push_back([self_ptr, out_ptr, add_ptr, pool_ptr]() {
+        pool_ptr->tensor_add_inplace(add_ptr->name, self_ptr->name, out_ptr->name, 1);
+    });
+
     pool->tensor_add_inplace(to_add.name, name, output.name);
     return output;
 }
 
 template<typename T>
 Tensor<T>& operator+(T lhs, Tensor<T>& rhs){
-    // create output with same shape as rhs
-    auto &output = rhs.pool->createTensor(rhs.shape, std::to_string(lhs) + "_" + rhs.name + "-elementwise_addition_output");
-    // create scalar tensor to hold lhs
-    auto &to_add = rhs.pool->createTensor(std::vector<uint32_t>(rhs.shape.size(), 1), "const_add_tensor_" + std::to_string(lhs) + "_" + rhs.name);
+    auto &output = rhs.pool->createTensor(
+        rhs.shape,
+        std::to_string(lhs) + "_" + rhs.name + "-elementwise_addition_output"
+    );
+
+    auto &to_add = rhs.pool->createTensor(
+        std::vector<uint32_t>(rhs.shape.size(), 1),
+        "const_add_tensor_" + std::to_string(lhs) + "_" + rhs.name
+    );
     to_add.dataBuffer->set(0, lhs);
 
-    output.back = [&rhs, &output, &to_add](){
-        rhs.pool->tensor_add_inplace(to_add.name, rhs.name, output.name, 1);
-        rhs.backward();
-    };
+    Tensor<T>* rhs_ptr = &rhs;
+    Tensor<T>* out_ptr = &output;
+    Tensor<T>* add_ptr = &to_add;
+    auto pool_ptr      = rhs.pool;
+
+    output.back.push_back([rhs_ptr, out_ptr, add_ptr, pool_ptr]() {
+        pool_ptr->tensor_add_inplace(add_ptr->name, rhs_ptr->name, out_ptr->name, 1);
+        rhs_ptr->backward();
+    });
 
     rhs.pool->tensor_add_inplace(to_add.name, rhs.name, output.name);
     return output;
 }
 
 template<typename T>
-Tensor<T>& Tensor<T>::exp(){
-    
+Tensor<T>& Tensor<T>::exp() {
     auto &output = pool->tensor_exp(name);
 
-    output.back = [&output, this](){
-        this->pool->tensor_exp(this->name, output.name, 1);
-        this->backward();
-    };
+    Tensor<T>* self_ptr = this;
+    Tensor<T>* out_ptr  = &output;
+    auto pool_ptr       = this->pool;
+
+    output.back.push_back([self_ptr, out_ptr, pool_ptr]() {
+        pool_ptr->tensor_exp(self_ptr->name, out_ptr->name, 1);
+        self_ptr->backward();
+    });
 
     return output;
 }
@@ -2731,12 +2799,22 @@ Tensor<T>& Tensor<T>::matmul(Tensor<T>& other){
 
     auto &output = pool->createTensor(output_shape, name + other.name + "-matmul_output");
     pool->tensor_linear(output.name, name, other.name);
-    output.back = [this, &other, &output](){
-        pool->tensor_linear(output.name, this->name, other.name, "", 1);
-        this->backward();
-        other.backward();
-    };
-    
+
+    {
+        std::string out_name  = output.name;
+        std::string self_name = this->name;
+        std::string oth_name  = other.name;
+
+        Tensor *self  = this;
+        Tensor *oth   = &other;
+
+        output.back.push_back([self, oth, out_name, self_name, oth_name]() {
+            self->pool->tensor_linear(out_name, self_name, oth_name, "", 1);
+            self->backward();
+            oth->backward();
+        });
+    }
+
     return output;
 }
 

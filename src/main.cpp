@@ -641,11 +641,12 @@ struct Trainer {
 			auto* input = dataLoader->imagesBatchTensors[i];
 			sequence.forward(input);
 			softmax->target = dataLoader->labelTensors[i];
-			softmax->forward(sequence.output);
+			auto loss = softmax->forward(sequence.output);
 			
-			softmax->backward(sequence.output);
-			sequence.backward(input);
+			loss->backward();
+			
 			optim.step();
+			tensorPool.zero_out_all_grads();
 		}
 		auto loss = tensorPool.find_mean_of_tensor(softmax->output->name);
 		std::cout << "train_loss: " << loss << "\n";
