@@ -995,6 +995,7 @@ struct TensorPool {
     void zero_out_all_grads(){
         for (auto& [name, tensor] : tensors){
             tensor->gradientBuffer->clearBuffer();
+            tensor->back.clear();
         }
     }
     
