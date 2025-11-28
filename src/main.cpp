@@ -496,19 +496,22 @@ struct VAE {
 	Linear<float> fc_mu;
 	Linear<float> fc_logvar;
 
-	Sequential<float> model;
-
 	MSEloss<float> mseLoss;
 	KLDloss<float> kldLoss;
 
+	SDGoptim<float> optim;
+
 	uint32_t latent_dim = 20;
 
-	VAE(){
+	std::unique_ptr<MNISTDataloader<float>> dataLoader;
 
+	VAE(){
 		device_initialization(init);
 		allocator = new Allocator(&init);
 
 		tensorPool = TensorPool<float>(allocator);
+
+		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
 
 		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
 		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2);
@@ -566,12 +569,44 @@ struct VAE {
 		return dec_conv(z);
 	}
 
-	void forward(Tensor<float>* input){
+	Tensor<float>* forward(Tensor<float>* input){
 		auto [mu, logvar] = encode(input);
 		auto z = reparameterize(mu, logvar);
-		auto recon = decode(z);
+		return decode(z);
 	}
 
+	Tensor<float>* loss_function(Tensor<float>* recon, Tensor<float>* x, Tensor<float>* mu, Tensor<float>* logvar) {
+		mseLoss.target = x;
+		auto &ml = *mseLoss(recon);
+		kldLoss.logvar_tensor = logvar;
+		kldLoss.mu_tensor = mu;
+		auto &kld = *kldLoss(x);
+
+		return &(ml + kld);
+	}
+
+	void train(){
+		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
+
+		optim.load_tensors(enc_conv);
+		optim.load_tensors(fc_logvar);
+		optim.load_tensors(fc_mu);
+		optim.load_tensors(dec_conv);
+
+		for(int i = 0; i < dataLoader->num_batches; i++){
+			auto* input = dataLoader->imagesBatchTensors[i];
+			
+			auto [mu, logvar] = encode(input);
+			auto z = reparameterize(mu, logvar);
+			auto recon = decode(z);
+
+			auto loss = loss_function(recon, input, mu, logvar);
+
+			loss->backward();
+			optim.step();
+			tensorPool.zero_out_all_grads();
+		}
+	}
 };
 
 // A handwritten digit recognision neural network

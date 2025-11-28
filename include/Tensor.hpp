@@ -515,7 +515,7 @@ struct Tensor {
     void backward() {
         for (size_t i = back.size(); i-- > 0; ) {
             if (back[i]) {
-                std::cout << "Calling backward " << i << " for tensor: " << name << "\n";
+                //std::cout << "Calling backward " << i << " for tensor: " << name << "\n";
                 back[i]();
             }
         }
@@ -1023,6 +1023,9 @@ struct TensorPool {
         for (auto& [name, tensor] : tensors){
             tensor->gradientBuffer->clearBuffer();
             tensor->back.clear();
+            if(tensor->claimable && tensor->isClaimed){
+                tensor->isClaimed = false;
+            }
         }
     }
     

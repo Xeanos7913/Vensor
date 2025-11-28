@@ -316,8 +316,9 @@ struct KLDloss : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(logvar_tensor == nullptr || mu_tensor == nullptr) throw std::runtime_error("logvar and mu tensors need to be set for KLDloss to work!");
 		tensorPool->kld_loss(mu_tensor->name, logvar_tensor->name, this->output->name);
-		this->output->back.push_back([input](){
-			input->backward();
+		this->output->back.push_back([this](){
+			mu_tensor->backward();
+			logvar_tensor->backward();
 		});
 		return this->output;
 	}
@@ -1272,9 +1273,9 @@ struct SDGoptim : public Optimiser<T>{
 
 	SDGoptim(){}
 
-	void load_tensors(Sequential<T>& sequence){
-		auto s = sequence.getTrainableTensors();
-		tensors.insert(tensors.end(), s.begin(), s.end());
+	void load_tensors(Module<T>& module){
+		auto s = module.getTrainableTensors();
+		for (auto* t : s) this->tensors.push_back(t);
 	}
 
 	void step() override {
