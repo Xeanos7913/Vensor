@@ -4,7 +4,7 @@ This main file contains some testing code (in the commented out parts) and an ex
 #define VOLK_IMPLEMENTATION
 #include <iostream>
 #include <fstream>
-//#define DEBUG
+#define DEBUG
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/Dataloader.hpp"
@@ -513,6 +513,8 @@ struct VAE {
 
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
 
+		optim = SDGoptim<float>(allocator);
+
 		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
 		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2);
 		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
@@ -593,7 +595,7 @@ struct VAE {
 		optim.load_tensors(fc_mu);
 		optim.load_tensors(dec_conv);
 
-		for(int i = 0; i < dataLoader->num_batches; i++){
+		for(int i = 0; i < dataLoader->num_batches - 99; i++){
 			auto* input = dataLoader->imagesBatchTensors[i];
 			
 			auto [mu, logvar] = encode(input);
@@ -608,6 +610,15 @@ struct VAE {
 		}
 	}
 };
+
+int main(void){
+	
+	VAE vae = VAE();
+
+	vae.train();
+	
+	return 0;
+}
 
 // A handwritten digit recognision neural network
 struct Trainer {
@@ -730,6 +741,7 @@ int main(void){
 }
 */
 
+/*
 int main(void) {
 	Init init;
 	device_initialization(init);
@@ -779,6 +791,7 @@ int main(void) {
 	delete allocator;
 	return 0;
 }
+*/
 
 /*
 // broadcasting test

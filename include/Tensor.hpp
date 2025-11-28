@@ -515,7 +515,7 @@ struct Tensor {
     void backward() {
         for (size_t i = back.size(); i-- > 0; ) {
             if (back[i]) {
-                //std::cout << "Calling backward " << i << " for tensor: " << name << "\n";
+                DEBUG_PRINT("Calling backward " << i << " for tensor: " << name);
                 back[i]();
             }
         }
@@ -549,7 +549,7 @@ struct Tensor {
         shapeBuffer->alloc(shape);
     }
 
-    void view(std::vector<uint32_t>& dims) {
+    void view(const std::vector<uint32_t>& dims) {
         if (dims == shape) return; // shapes equal -> no-op
 
         size_t total_size = 1;
@@ -975,7 +975,7 @@ struct TensorPool {
     Tensor<T>& createTensor(const std::vector<uint32_t>& dims, const std::string& name, bool claimable = false) {
         // if tensor already exists, return it (user-owned tensors)
         auto it = tensors.find(name);
-        if (it != tensors.end()) {
+        if (it != tensors.end() && !claimable) {
             DEBUG_PRINT("tensor with name: " << name << " already exists. Returning that tensor.");
             return *(it->second);
         }
@@ -1856,7 +1856,7 @@ struct TensorPool {
         uint32_t N = shapeB.back();
         
         // flatten all leading dims -> B
-        uint32_t batch_size = prod(shapeB, 0, shapeB.size() - 2);
+        uint32_t batch_size = 0; //prod(shapeB, 0, shapeB.size() - 2);
         
         // uniforms
         uniform.input_a = tensors[tensor_a]->getTensorImpl();
@@ -1998,7 +1998,7 @@ struct TensorPool {
         // if no output is given, create output. If created output already exists, use that
         Tensor<T>* output;
         if(std_tensor.empty()){
-            output = &createTensor(tensors[logvar_tensor]->shape, logvar_tensor + "-std_dev_tensor");
+            output = &createTensor(tensors[logvar_tensor]->shape, logvar_tensor + "-std_dev_tensor", true);
             std_tensor = output->name;
         }
 
@@ -2113,7 +2113,7 @@ struct TensorPool {
             expShader.execute(workgroup);
             return *output;
         }
-        else if (mode == 1) {
+        else {
             // Backward pass
             pushConsts.mode = mode;
             pushConsts.uniformAddress = expShaderBackward.uniformBuffer->getBufferAddress();
@@ -2271,7 +2271,8 @@ struct TensorPool {
         const std::string& bias_tensor = "",
         uint32_t mode = 0) {
         linear_context uniform{};
-        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        // Defer setting uniform.input_tensor until after possible temporary view
+
         uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
         if (!bias_tensor.empty()) {
             uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
@@ -2289,12 +2290,16 @@ struct TensorPool {
             return static_cast<uint32_t>(p);
         };
 
-        // Input shape X[..., M, K]
-        const auto& shape = tensors[input_tensor]->shape;
-        if (shape.size() < 2)
-            throw std::invalid_argument("Rank must be >= 2");
-        uint32_t M = shape[shape.size() - 2];
-        uint32_t K = shape.back();
+        // Capture original input shape and element count
+        const auto original_shape = tensors[input_tensor]->shape;
+        const uint32_t total_elements = tensors[input_tensor]->get_num_elements();
+
+        // Input shape X[..., M, K] (original)
+        if (original_shape.size() < 2)
+            throw std::invalid_argument("Input rank must be >= 2");
+
+        uint32_t orig_M = original_shape[original_shape.size() - 2];
+        uint32_t orig_K = original_shape.back();
 
         // Weight shape W[..., N, K] (transposed)
         const auto& weight_shape = tensors[weight_tensor]->shape;
@@ -2302,13 +2307,62 @@ struct TensorPool {
             throw std::invalid_argument("Weight rank must be >= 2");
         uint32_t KB = weight_shape.back();
         uint32_t N = weight_shape[weight_shape.size() - 2];
-        if (KB != K)
-            throw std::invalid_argument("Inner dims mismatch: X[...,M,K] @ W[...,N,K] (transposed)");
 
-        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+        // We'll possibly temporarily reshape (view) the input tensor to match expected dims
+        bool reshaped = false;
+        std::vector<uint32_t> temp_shape;
+
+        uint32_t M = orig_M;
+        uint32_t K = orig_K;
+        uint32_t batch_size = prod(original_shape, 0, original_shape.size() - 2);
+
+        // If inner dims mismatch, try to see if a view can reconcile element counts
+        if (KB != orig_K) {
+            // Derive expected input shape from the provided output tensor and weight K (KB)
+            const auto& output_shape = tensors[output_tensor]->shape;
+            if (output_shape.size() < 2)
+                throw std::invalid_argument("Output rank must be >= 2");
+
+            temp_shape = output_shape; // expected [..., M, N] -> input should be [..., M, KB]
+            // ensure there are at least two dims to overwrite
+            temp_shape[temp_shape.size() - 1] = KB;                        // K := KB
+            // M should be the same as output's -2
+            M = temp_shape[temp_shape.size() - 2];
+            K = KB;
+
+            // compute expected elements
+            uint64_t expected_elems = 1;
+            for (auto d : temp_shape) expected_elems *= d;
+
+            if (expected_elems == total_elements) {
+                // safe to view
+                DEBUG_PRINT("Temporarily viewing input tensor " << input_tensor << " from "
+                            << shapeToString(original_shape) << " to " << shapeToString(temp_shape)
+                            << " to satisfy inner-dim KB=" << KB);
+                tensors[input_tensor]->view(temp_shape);
+                reshaped = true;
+                // recompute batch size according to new view shape
+                batch_size = prod(tensors[input_tensor]->shape, 0, tensors[input_tensor]->shape.size() - 2);
+            } else {
+                // cannot reconcile, throw as before but with useful info
+                throw std::invalid_argument(
+                    "Inner dimensions do not match for linear: expected K=" + std::to_string(KB) +
+                    ", got K=" + std::to_string(orig_K) +
+                    ". Input has " + std::to_string(total_elements) + " elements, but expected " +
+                    std::to_string(expected_elems) + " for a view to " + shapeToString(temp_shape));
+            }
+        } else {
+            // matching inner dim - use original values
+            M = orig_M;
+            K = orig_K;
+            batch_size = prod(original_shape, 0, original_shape.size() - 2);
+        }
+
+        // Now set uniform.input_tensor based on current (possibly viewed) shape
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
 
         DEBUG_PRINT("Linear'ing tensor " << input_tensor << " of shape "
-            << shapeToString(shape) << " with transposed weights " << weight_tensor
+            << shapeToString(tensors[input_tensor]->shape) << " with transposed weights " << weight_tensor
             << " of shape " << shapeToString(weight_shape));
 
         uniform.m = M;
@@ -2331,8 +2385,11 @@ struct TensorPool {
         if (mode == 0) {
             // Mode 0: Use output tensor dimensions
             const auto& output_shape = tensors[output_tensor]->shape;
-            if (output_shape.size() < 2)
+            if (output_shape.size() < 2) {
+                // revert view if necessary before throwing
+                if (reshaped) tensors[input_tensor]->view(original_shape);
                 throw std::invalid_argument("Output rank must be >= 2");
+            }
 
             dispatchM = output_shape[output_shape.size() - 2];
             dispatchN = output_shape[output_shape.size() - 1];
@@ -2357,7 +2414,7 @@ struct TensorPool {
             std::vector<uint32_t> maxShape = tensors[input_tensor]->shape;
             auto transposedWeightShape = tensors[weight_tensor]->shape;
             if (transposedWeightShape.size() >= 2) {
-                std::swap(transposedWeightShape[transposedWeightShape.size() - 1], 
+                std::swap(transposedWeightShape[transposedWeightShape.size() - 1],
                          transposedWeightShape[transposedWeightShape.size() - 2]);
             }
             maxShape = maxDim(maxShape, transposedWeightShape);
@@ -2365,8 +2422,10 @@ struct TensorPool {
                 maxShape = maxDim(maxShape, tensors[bias_tensor]->shape);
             maxShape = maxDim(maxShape, tensors[output_tensor]->shape);
 
-            if (maxShape.size() < 2)
+            if (maxShape.size() < 2) {
+                if (reshaped) tensors[input_tensor]->view(original_shape);
                 throw std::invalid_argument("Max rank must be >= 2");
+            }
 
             dispatchM = maxShape[maxShape.size() - 2];
             dispatchN = maxShape[maxShape.size() - 1];
@@ -2383,7 +2442,7 @@ struct TensorPool {
 
         DEBUG_PRINT(groupX << " × " << groupY
             << " × " << groupZ << " workgroups (covering " << dispatchM << "×"
-            << dispatchN << " per batch)" << "Workgroup size: " << NUM_THREADS << " threads (" 
+            << dispatchN << " per batch)" << "Workgroup size: " << NUM_THREADS << " threads ("
             << BM << "×" << BN << " tile)");
 
         uint32_t workgroup[3] = { groupX, groupY, groupZ };
@@ -2391,18 +2450,33 @@ struct TensorPool {
         tensor_push_const pushConsts{};
         pushConsts.grid_size = { groupX, groupY, groupZ };
 
-        if (mode == 0) {
-            pushConsts.mode = mode;
-            uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
-            pushConsts.uniformAddress = linearShader.uniformBuffer->getBufferAddress();
-            linearShader.loadUniform(uniform, pushConsts);
-            linearShader.execute(workgroup);
+        try {
+            if (mode == 0) {
+                pushConsts.mode = mode;
+                uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+                pushConsts.uniformAddress = linearShader.uniformBuffer->getBufferAddress();
+                linearShader.loadUniform(uniform, pushConsts);
+                linearShader.execute(workgroup);
+            }
+            else if (mode == 1) {
+                pushConsts.mode = mode;
+                pushConsts.uniformAddress = linearShaderBackward.uniformBuffer->getBufferAddress();
+                linearShaderBackward.loadUniform(uniform, pushConsts);
+                linearShaderBackward.execute(workgroup);
+            }
+        } catch (...) {
+            // revert any temporary view before propagating exception
+            if (reshaped) {
+                DEBUG_PRINT("Reverting temporary view of " << input_tensor << " back to " << shapeToString(original_shape));
+                tensors[input_tensor]->view(original_shape);
+            }
+            throw;
         }
-        else if (mode == 1) {
-            pushConsts.mode = mode;
-            pushConsts.uniformAddress = linearShaderBackward.uniformBuffer->getBufferAddress();
-            linearShaderBackward.loadUniform(uniform, pushConsts);
-            linearShaderBackward.execute(workgroup);
+
+        // revert any temporary view after successful execution
+        if (reshaped) {
+            DEBUG_PRINT("Reverting temporary view of " << input_tensor << " back to " << shapeToString(original_shape));
+            tensors[input_tensor]->view(original_shape);
         }
     }
 
