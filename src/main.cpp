@@ -578,7 +578,7 @@ struct VAE {
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
 		auto &std_tensor = (0.5f * *logvar).exp();
 		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
-		tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
+		tensorPool.tensor_fill_random("eps", -0.1f, 0.1f);
 
 		return &(*mu + std_tensor * eps_tensor);
 	}
@@ -618,13 +618,16 @@ struct VAE {
 			auto z = reparameterize(mu, logvar);
 			auto recon = decode(z);
 
+			
 			auto loss = loss_function(recon, input, mu, logvar);
 
 			loss->backward();
+			
+			//z->print();
+			
+			dynamic_cast<Linear<float>*>(enc_conv.layers[7].get())->weights->printGradient();
 
-			//dynamic_cast<Linear<float>*>(dec_conv.layers[0].get())->weights->printGradient();
-
-			fc_logvar.weights->printGradient();
+			//input->printGradient();
 
 			optim.step();
 			tensorPool.zero_out_all_grads();

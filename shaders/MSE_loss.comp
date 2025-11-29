@@ -182,7 +182,7 @@ void main() {
             
             // Compute and write gradients
             if (ctx.predicted_tensor.requires_grad != 0) {
-                vec4 grad = 2.0 * diff / float(elementsPerBatch);
+                vec4 grad = (2.0 * diff / float(elementsPerBatch));
                 
                 ctx.predicted_tensor.grad.grad[globalBaseIdx] = grad.x;
                 ctx.predicted_tensor.grad.grad[globalBaseIdx + 1] = grad.y;
