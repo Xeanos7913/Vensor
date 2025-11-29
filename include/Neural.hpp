@@ -53,8 +53,8 @@ struct LinearReLU : public Module<T>{
 		weights = &tensorPool->createTensor({weight_shape[0], weight_shape[1], weight_shape[2]}, weights_name);
 		bias = &tensorPool->createTensor(output_shape, bias_name);
 		this->output = &tensorPool->createTensor(output_shape, output_name);
-		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
-		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
 	}
 
 	LinearReLU(TensorPool<T>* pool, const std::vector<uint32_t>& weight_dims, const std::vector<uint32_t>& output_dims, const std::string& name) : tensorPool(pool), name(name) {
@@ -67,8 +67,8 @@ struct LinearReLU : public Module<T>{
 		weights = &tensorPool->createTensor(weight_dims, weights_name);
 		bias = &tensorPool->createTensor(output_dims, bias_name);
 		this->output = &tensorPool->createTensor(output_dims, output_name);
-		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
-		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
 	}
 
 	LinearReLU(){}; // default empty ctor
@@ -130,8 +130,8 @@ struct Linear : public Module<T> {
 		weights = &tensorPool->createTensor(weight_shape, weights_name);
 		bias = &tensorPool->createTensor({1, 1, out_features}, bias_name);
 		this->output = &tensorPool->createTensor(output_shape, output_name);
-		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
-		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
 	}
 
 	Linear(TensorPool<T>* pool, const std::vector<uint32_t>& weight_dims, const std::vector<uint32_t>& output_dims, const std::string& name) : tensorPool(pool), name(name) {
@@ -144,8 +144,8 @@ struct Linear : public Module<T> {
 		weights = &tensorPool->createTensor(weight_dims, weights_name);
 		bias = &tensorPool->createTensor({1, output_dims[1], output_dims[2]}, bias_name); // exclude the batch dim
 		this->output = &tensorPool->createTensor(output_dims, output_name);
-		tensorPool->tensor_fill_random(weights_name, -1.0f, 1.0f);
-		tensorPool->tensor_fill_random(bias_name, -1.0f, 1.0f);
+		tensorPool->tensor_fill_random(weights_name, -0.1f, 0.1f);
+		tensorPool->tensor_fill_random(bias_name, -0.1f, 0.1f);
 	}
 
 	Linear(){}; // default empty ctor
@@ -186,19 +186,20 @@ struct ReLU : public Module<T> {
 	TensorPool<T>* tensorPool;
 	std::string name;
 	std::string output_name;
-	ReLU(TensorPool<T>* pool, uint32_t features, uint32_t batch_size, const std::string& name) : tensorPool(pool), name(name) {
+	ReLU(TensorPool<T>* pool, const std::string& name) : tensorPool(pool), name(name) {
 		output_name = name + "-output";
-		std::vector<uint32_t> shape = { batch_size, 1, features };
-		tensorPool->createTensor(shape, output_name);
-		this->output = &tensorPool->getTensor(output_name, { shape.begin(), shape.end() });
+		// do not create output here; create on first forward call
 	}
-	ReLU(TensorPool<T>* pool, const std::vector<uint32_t> dims, const std::string& name) : tensorPool(pool), name(name) {
+	ReLU(TensorPool<T>* pool, const std::vector<uint32_t>& dims, const std::string& name) : tensorPool(pool), name(name) {
 		output_name = name + "-output";
-		tensorPool->createTensor(dims, output_name);
-		this->output = &tensorPool->getTensor(output_name, { dims.begin(), dims.end() });
+		// do not create output here; create on first forward call
 	}
 	ReLU(){}; // default empty ctor
 	Tensor<T>* forward(Tensor<T>* input) override {
+		// create output on first use if it doesn't exist, matching input shape
+		if (this->output == nullptr) {
+			this->output = &tensorPool->createTensor(input->shape, output_name);
+		}
 		// Ensure input shape is compatible
 		if (input->shape != this->output->shape) {
 			throw std::invalid_argument("Input tensor shape is not compatible with ReLU output");

@@ -101,7 +101,7 @@ void main() {
     float local_sum = 0.0;
     
     // Gradient scaling factor: -0.5 * beta
-    float grad_scale = -0.5 * ctx.beta;
+    float grad_scale = -0.5 * ctx.beta * (1.0f/ctx.batch_size);
     
     // Vectorized loading: each thread processes TILE_SIZE elements
     uint base_idx = global_tid * TILE_SIZE;

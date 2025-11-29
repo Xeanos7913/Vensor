@@ -4,7 +4,7 @@ This main file contains some testing code (in the commented out parts) and an ex
 #define VOLK_IMPLEMENTATION
 #include <iostream>
 #include <fstream>
-#define DEBUG
+//#define DEBUG
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/Dataloader.hpp"
@@ -516,7 +516,11 @@ struct VAE {
 		optim = SDGoptim<float>(allocator);
 
 		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
+		auto bn1 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, conv1->output_width, conv1->output_height, 16, "bn1");
+		auto relu1 = std::make_unique<ReLU<float>>(&tensorPool, "relu1");
 		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2);
+		auto bn2 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 64, conv2->output_width, conv2->output_height, 16, "bn2");
+		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
 		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
 		auto enc_fc = std::make_unique<Linear<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 512, 16, "enc_fc");
 		
@@ -524,22 +528,34 @@ struct VAE {
 		fc_logvar = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
 
 		auto dec_fc = std::make_unique<Linear<float>>(&tensorPool, latent_dim, 64 * conv2->output_height * conv2->output_width, 16, "dec_fc");
+		auto bn3 = std::make_unique<BatchNorm1d<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 1, 16, "bn3");
+		auto relu3 = std::make_unique<ReLU<float>>(&tensorPool, "relu3");
 		auto reshape = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 64, conv2->output_height, conv2->output_width}, "reshape");
 		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 4, 4, "dec_conv1", 2, 2);
+		auto bn4 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, dec_conv1->output_width, dec_conv1->output_height, 16, "bn4");
+		auto relu4 = std::make_unique<ReLU<float>>(&tensorPool, "relu4");
 		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2);
 
 		enc_conv = Sequential<float>(&tensorPool, "enc");
 
 		enc_conv.addLayer(std::move(conv1));
+		enc_conv.addLayer(std::move(bn1));
+		enc_conv.addLayer(std::move(relu1));
 		enc_conv.addLayer(std::move(conv2));
+		enc_conv.addLayer(std::move(bn2));
+		enc_conv.addLayer(std::move(relu2));
 		enc_conv.addLayer(std::move(flatten));
 		enc_conv.addLayer(std::move(enc_fc));
 
 		dec_conv = Sequential<float>(&tensorPool, "dec");
 
 		dec_conv.addLayer(std::move(dec_fc));
+		dec_conv.addLayer(std::move(bn3));
+		dec_conv.addLayer(std::move(relu3));
 		dec_conv.addLayer(std::move(reshape));
 		dec_conv.addLayer(std::move(dec_conv1));
+		dec_conv.addLayer(std::move(bn4));
+		dec_conv.addLayer(std::move(relu4));
 		dec_conv.addLayer(std::move(dec_conv2));
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
@@ -605,6 +621,11 @@ struct VAE {
 			auto loss = loss_function(recon, input, mu, logvar);
 
 			loss->backward();
+
+			//dynamic_cast<Linear<float>*>(dec_conv.layers[0].get())->weights->printGradient();
+
+			fc_logvar.weights->printGradient();
+
 			optim.step();
 			tensorPool.zero_out_all_grads();
 		}
@@ -674,7 +695,7 @@ struct Trainer {
 			sequence.addLayer(std::make_unique<FlattenTo1d<float>>(&tensorPool, "f"));
 			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 16, "linear1"));
 			sequence.addLayer(std::make_unique<Layernorm<float>>(&tensorPool, vec{16, 1, 1024}, vec{1, 1024}, "ln1"));
-			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, 1024, 16, "relu1"));
+			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, "relu1"));
 			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 1024, 10, 16, "linear2"));
 		}
 		softmax = std::make_unique<SoftmaxCrossEntropy<float>>(&tensorPool, 10, 1, 16, "softmax");
