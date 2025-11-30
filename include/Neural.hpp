@@ -761,8 +761,8 @@ struct Conv2d : public Module<T> {
 		if (dilation_h > 2 || dilation_w > 2) {
 			throw std::invalid_argument("Dilation must be 1 or 2");
 		}
-		if (kernel_w > 15 || kernel_h > 15) {
-			throw std::invalid_argument("Kernel sizes above 15 are not supported!");
+		if (kernel_w > 10 || kernel_h > 10) {
+			throw std::invalid_argument("Kernel sizes above 10 are not supported!");
 		}
 		
 		// Calculate effective kernel size with dilation
@@ -789,7 +789,13 @@ struct Conv2d : public Module<T> {
 		output_name = name + "-output";
 		this->output = &tensorPool->createTensor({ batch_size, out_channels, this->output_height, this->output_width }, output_name);
 		
-		weight_tensor = &tensorPool->createTensor({ out_channels, in_channels, 3, 3 }, name + "-weight");
+		weight_tensor = &tensorPool->createTensor({ 
+			out_channels, 
+			in_channels, 
+			kernel_h, 
+			kernel_w 
+		}, name + "-weight");
+
 		bias_tensor = &tensorPool->createTensor({ out_channels }, name + "-bias");
 		
 		tensorPool->tensor_fill_random(weight_tensor->name, -1.0f, 1.0f);

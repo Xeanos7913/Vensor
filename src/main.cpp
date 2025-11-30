@@ -515,10 +515,10 @@ struct VAE {
 
 		optim = SDGoptim<float>(allocator);
 
-		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 3, 3, "conv1", 2, 2);
+		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
 		auto bn1 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, conv1->output_width, conv1->output_height, 16, "bn1");
 		auto relu1 = std::make_unique<ReLU<float>>(&tensorPool, "relu1");
-		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 3, 3, "conv2", 2, 2);
+		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2);
 		auto bn2 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 64, conv2->output_width, conv2->output_height, 16, "bn2");
 		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
 		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
@@ -531,10 +531,10 @@ struct VAE {
 		auto bn3 = std::make_unique<BatchNorm1d<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 1, 16, "bn3");
 		auto relu3 = std::make_unique<ReLU<float>>(&tensorPool, "relu3");
 		auto reshape = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 64, conv2->output_height, conv2->output_width}, "reshape");
-		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 3, 3, "dec_conv1", 2, 2);
+		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 4, 4, "dec_conv1", 2, 2);
 		auto bn4 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, dec_conv1->output_width, dec_conv1->output_height, 16, "bn4");
 		auto relu4 = std::make_unique<ReLU<float>>(&tensorPool, "relu4");
-		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 3, 3, "dec_conv2", 2, 2);
+		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2);
 
 		enc_conv = Sequential<float>(&tensorPool, "enc");
 
@@ -612,10 +612,8 @@ struct VAE {
 		optim.load_tensors(dec_conv);
 
 		for(int i = 0; i < dataLoader->num_batches - 99; i++){
-			//auto* input = dataLoader->imagesBatchTensors[i];
+			auto* input = dataLoader->imagesBatchTensors[i];
 			
-			auto input = &tensorPool.createTensor({16, 1, 28, 28}, "input1");
-			tensorPool.tensor_fill_random("input1", -1.0f, 1.0f);
 			auto [mu, logvar] = encode(input);
 			auto z = reparameterize(mu, logvar);
 			auto recon = decode(z);
@@ -627,7 +625,7 @@ struct VAE {
 			
 			//z->print();
 			
-			dynamic_cast<Conv2d<float>*>(enc_conv.layers[3].get())->weight_tensor->printGradient();
+			dynamic_cast<Conv2d<float>*>(enc_conv.layers[3].get())->output->print();
 
 			//input->printGradient();
 
