@@ -1187,7 +1187,7 @@ struct TensorPool {
         }
     };
 
-    // general MxN convolution supporting kernel sizes up to 15x15
+    // general MxN convolution supporting kernel sizes up to 10x10
     void tensor_conv2d(const std::string& output_tensor, const std::string& input_tensor, const std::string& weight_tensor, const std::string& bias_tensor, uint32_t kernel_h, uint32_t kernel_w, uint32_t mode = 0,
         uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1, uint32_t groups = 1) {
         tensor_conv2d_context uniform{};
@@ -2524,7 +2524,7 @@ struct TensorPool {
         uniform.mu_tensor = tensors[mu_tensor]->getTensorImpl();
         uniform.elements_per_batch = std::accumulate(tensors[mu_tensor]->shape.begin() + 1, tensors[mu_tensor]->shape.end(), 1, std::multiplies<uint32_t>());
         uniform.loss_tensor = tensors[loss_tensor]->getTensorImpl();
-        uniform.beta = 1.0f;
+        uniform.beta = 0.01f;
 
         uint32_t grpx = (uniform.elements_per_batch + (256 * 4) - 1)/(256 * 4);
         uint32_t wrkgrp[3] = {grpx, 1, uniform.batch_size};

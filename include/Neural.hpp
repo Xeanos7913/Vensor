@@ -719,7 +719,7 @@ struct Conv2d3x3 : public Module<T> {
 
 		tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
 		this->output->back.push_back([this, input](){
-			this->tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups, 1);
+			this->tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
 			input->backward();
 		});
 		
