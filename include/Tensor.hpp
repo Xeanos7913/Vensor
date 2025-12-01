@@ -814,7 +814,7 @@ struct Tensor {
 
    void print() const {  
        auto buf = dataBuffer->downloadBuffer();
-	   std::cout << "Tensor shape: " << shapeToString(shape) << "\n";
+	   std::cout << name << " Tensor shape: " << shapeToString(shape) << "\n";
 	   std::cout << "Tensor data: ";
 	   for (size_t i = 0; i < buf.size(); ++i) {
 		   std::cout << buf[i] << " ";
@@ -1023,8 +1023,9 @@ struct TensorPool {
         for (auto& [name, tensor] : tensors){
             tensor->gradientBuffer->clearBuffer();
             tensor->back.clear();
-            if(tensor->claimable && tensor->isClaimed){
+            if(tensor->claimable){
                 tensor->isClaimed = false;
+                //tensor->dataBuffer->clearBuffer();
             }
         }
     }
@@ -2068,7 +2069,7 @@ struct TensorPool {
         // if no output is given, create output. If created output already exists, use that
         Tensor<T>* output;
         if(output_tensor.empty()){
-            output = &createTensor(tensors[input_tensor]->shape, input_tensor + "-std_dev_tensor", true);
+            output = &createTensor(tensors[input_tensor]->shape, input_tensor + "-exponentiated_", true);
             output_tensor = output->name;
         }
 

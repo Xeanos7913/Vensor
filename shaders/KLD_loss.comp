@@ -177,6 +177,6 @@ void main() {
 
     if (tid == 0) {
         float loss_value = -0.5 * ctx.beta * block_sum;
-        atomicAdd(ctx.loss_tensor.data.data[batch_idx], loss_value);
+        ctx.loss_tensor.data.data[batch_idx] = loss_value;
     }
 }

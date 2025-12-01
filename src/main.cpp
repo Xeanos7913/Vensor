@@ -514,6 +514,8 @@ struct VAE {
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
 
 		optim = SDGoptim<float>(allocator);
+		optim.batch_size = 16;
+		optim.lr = 1e-03;
 
 		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
 		auto bn1 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, conv1->output_width, conv1->output_height, 16, "bn1");
@@ -571,12 +573,8 @@ struct VAE {
 		return {mu, logvar};
 	}
 
-	// does the same as:
-	// std = (0.5 * logvar).exp()
-	// eps = random gaussian
-	// mu + eps * std
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		auto &std_tensor = (0.5f * *logvar).exp();
+		auto &std_tensor = (0.1f * *logvar).exp();
 		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		tensorPool.tensor_fill_random("eps", -0.1f, 0.1f);
 
@@ -611,27 +609,24 @@ struct VAE {
 		optim.load_tensors(fc_mu);
 		optim.load_tensors(dec_conv);
 
-		for(int i = 0; i < dataLoader->num_batches - 99; i++){
-			auto* input = dataLoader->imagesBatchTensors[i];
+		Tensor<float>* loss;
+		for(int i = 0; i < dataLoader->num_batches; i++){
+			auto* input = dataLoader->imagesBatchTensors[0];
 			
 			auto [mu, logvar] = encode(input);
 			auto z = reparameterize(mu, logvar);
 			auto recon = decode(z);
-
 			
-			auto loss = loss_function(recon, input, mu, logvar);
-
+			loss = loss_function(recon, input, mu, logvar);
+			
 			loss->backward();
-			
-			//z->print();
-			
-			dynamic_cast<Conv2d<float>*>(enc_conv.layers[3].get())->output->print();
-
-			//input->printGradient();
 
 			optim.step();
 			tensorPool.zero_out_all_grads();
 		}
+		
+		auto l = tensorPool.find_mean_of_tensor(loss->name);
+		std::cout << "epoch loss: " << l << "\n";
 	}
 };
 
@@ -639,7 +634,9 @@ int main(void){
 	
 	VAE vae = VAE();
 
-	vae.train();
+	for(int i = 0; i < 100; i++){
+		vae.train();
+	}
 	
 	return 0;
 }

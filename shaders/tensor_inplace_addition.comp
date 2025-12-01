@@ -119,7 +119,7 @@ void forward_pass() {
     } else {
         // Mode 1: Separate output (c = a + b)
         // Output goes to input_c at the current global index
-        op.input_c.data.data[gid] += result;
+        op.input_c.data.data[gid] = result;
     }
 }
 

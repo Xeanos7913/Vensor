@@ -72,13 +72,16 @@ void main() {
     // Load current parameter value and gradient
     float param = tensor.data.data[gid];
     float gradient = tensor.grad.grad[gid];
-    
+
     // SGD update: param = param - lr * gradient
     // If using mini-batches, average the gradient
     if (u.batch_size > 1u) {
         gradient /= float(u.batch_size);
     }
-    
+
+    // Clamp gradient to avoid exploding updates
+    //gradient = clamp(gradient, -15.0, 15.0);
+
     float updated_param = param - u.lr * gradient;
     
     // Write back updated parameter
