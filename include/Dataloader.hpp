@@ -166,26 +166,42 @@ public:
         if (numImgs < total_images_needed)
             throw std::runtime_error("Not enough MNIST samples for configured dataloader");
 
-        std::vector<uint8_t> imageBuf(rows * cols);
+        size_t imgSize = static_cast<size_t>(rows) * static_cast<size_t>(cols);
+        std::vector<uint8_t> imageBuf(imgSize);
+
+        // build shuffled indices to sample a random set of images (no replacement)
+        std::vector<size_t> indices(numImgs);
+        for (size_t i = 0; i < numImgs; ++i) indices[i] = i;
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::shuffle(indices.begin(), indices.end(), gen);
+
         for (uint32_t batch_idx = 0; batch_idx < num_batches; ++batch_idx) {
             T* imageMap = reinterpret_cast<T*>(imagesBatchTensors[batch_idx]->dataBuffer->memMap);
             T* labelMap = reinterpret_cast<T*>(labelTensors[batch_idx]->dataBuffer->memMap);
 
             for (uint32_t i = 0; i < batch_size; ++i) {
-                size_t global_idx = static_cast<size_t>(batch_idx) * batch_size + i;
+                size_t shuffled_pos = static_cast<size_t>(batch_idx) * batch_size + i;
+                size_t sample_idx = indices[shuffled_pos];
 
-                // read single image
-                imgFile.read(reinterpret_cast<char*>(imageBuf.data()), rows * cols);
-                uint8_t lbl;
+                // seek to the selected image and label
+                imgFile.clear();
+                imgFile.seekg(16 + static_cast<std::streamoff>(sample_idx * imgSize), std::ios::beg);
+                lblFile.clear();
+                lblFile.seekg(8 + static_cast<std::streamoff>(sample_idx), std::ios::beg);
+
+                imgFile.read(reinterpret_cast<char*>(imageBuf.data()), static_cast<std::streamsize>(imgSize));
+                uint8_t lbl = 0;
                 lblFile.read(reinterpret_cast<char*>(&lbl), 1);
 
                 // write into NCHW layout; MNIST is single-channel
                 T* dst_base = imageMap + static_cast<size_t>(i) * num_pixels;
-                // channel 0 contiguous, normalize to [-1, 1]
-                for (size_t j = 0; j < rows * cols; ++j)
-                    dst_base[j] = (static_cast<T>(imageBuf[j]) / static_cast<T>(127.5)) - 1.0f;
+                for (size_t j = 0; j < imgSize; ++j)
+                    dst_base[j] = (static_cast<T>(imageBuf[j]) / static_cast<T>(127.5)) - static_cast<T>(1);
 
                 // one-hot label
+                if (lbl >= num_classes)
+                    throw std::runtime_error("Label out of range in MNIST data");
                 std::fill(labelMap + i * num_classes, labelMap + (i + 1) * num_classes, static_cast<T>(0));
                 labelMap[i * num_classes + lbl] = static_cast<T>(1);
             }

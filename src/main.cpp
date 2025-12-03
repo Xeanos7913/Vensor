@@ -8,6 +8,7 @@ This main file contains some testing code (in the commented out parts) and an ex
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/Dataloader.hpp"
+#include "../include/progressbar.hpp"
 #include <memory>
 #include <initializer_list>
 
@@ -483,6 +484,93 @@ int main(void){
 }
 */
 
+// Writes a single image (first batch element by default) from a Tensor<float>* to a PNG file using stb_image_write.
+// Supports tensors in NCHW (4D) or NHW / N H W (3D) formats. Creates the output folder if it doesn't exist.
+
+static void write_tensor_image_png(Tensor<float>* tensor,
+								   const std::string& filename,
+								   size_t img_index = 0,
+								   const std::string& out_dir = "output_images")
+{
+	if (!tensor) return;
+
+	// Try to read shape. Tensor is expected to expose a shape vector<uint32_t>.
+	std::vector<uint32_t> shape;
+	try {
+		shape = tensor->shape; // assumes public member named `shape`
+	} catch (...) {
+		// If shape not present, bail out.
+		std::cerr << "Tensor has no accessible shape member\n";
+		return;
+	}
+
+	size_t N = 1, C = 1, H = 1, W = 1;
+	if (shape.size() != 4) {
+		std::cerr << "Expected 4D tensor shape (N,C,H,W). Got " << shape.size() << "D.\n";
+		return;
+	}
+	N = static_cast<size_t>(shape[0]);
+	C = static_cast<size_t>(shape[1]);
+	H = static_cast<size_t>(shape[2]);
+	W = static_cast<size_t>(shape[3]);
+
+	if (img_index >= N) {
+		std::cerr << "img_index out of range (N = " << N << ")\n";
+		return;
+	}
+
+	// raw float data (assumes contiguous NCHW layout like loader provides)
+	auto d = tensor->dataBuffer->downloadBuffer();
+	float* data = d.data();
+	if (!data) {
+		std::cerr << "Tensor data pointer is null\n";
+		return;
+	}
+
+	const size_t img_elems = C * H * W;
+	const float* src = data + img_index * img_elems;
+
+	// Prepare output buffer (uint8_t)
+	std::vector<uint8_t> out_buf(img_elems);
+	for (size_t i = 0; i < img_elems; ++i) {
+		float v = src[i];
+		// assume input is normalized in [0,1], clamp; if in [-1,1] user can preprocess externally
+		int iv = static_cast<int>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
+		out_buf[i] = static_cast<uint8_t>(std::clamp(iv, 0, 255));
+	}
+
+	// Ensure output directory exists
+	std::filesystem::create_directories(out_dir);
+
+	// Build full path and write. For multi-channel images the tensor is assumed to be in CHW order;
+	// stb_image_write expects interleaved RGB(A). For C>1 we convert CHW -> HWC interleaved here.
+	std::string out_path = out_dir + "/" + filename;
+	if (C == 1) {
+		// single-channel PNG
+		if (!stbi_write_png(out_path.c_str(), static_cast<int>(W), static_cast<int>(H), 1, out_buf.data(), static_cast<int>(W) * 1)) {
+			std::cerr << "Failed to write PNG: " << out_path << "\n";
+		}
+	} else {
+		// convert CHW -> HWC (interleaved)
+		std::vector<uint8_t> interleaved(H * W * C);
+		for (size_t c = 0; c < C; ++c) {
+			size_t plane_offset = c * H * W;
+			for (size_t h = 0; h < H; ++h) {
+				for (size_t w = 0; w < W; ++w) {
+					size_t src_idx = plane_offset + h * W + w;
+					size_t dst_idx = (h * W + w) * C + c;
+					interleaved[dst_idx] = out_buf[src_idx];
+				}
+			}
+		}
+		if (!stbi_write_png(out_path.c_str(), static_cast<int>(W), static_cast<int>(H), static_cast<int>(C), interleaved.data(), static_cast<int>(W) * static_cast<int>(C))) {
+			std::cerr << "Failed to write PNG: " << out_path << "\n";
+		}
+	}
+
+	std::cout << "Wrote image: " << out_path << "\n";
+}
+
 // WIP vae for the MNIST dataset
 struct VAE {
 
@@ -601,7 +689,7 @@ struct VAE {
 		return &(ml + kld);
 	}
 
-	void train(){
+	void train(int epoch){
 		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
 
 		optim.load_tensors(enc_conv);
@@ -610,12 +698,15 @@ struct VAE {
 		optim.load_tensors(dec_conv);
 
 		Tensor<float>* loss;
+		Tensor<float>* recon;
+		progressbar bar(100, true, std::cout);
 		for(int i = 0; i < dataLoader->num_batches; i++){
-			auto* input = dataLoader->imagesBatchTensors[0];
+			bar.update();
+			auto* input = dataLoader->imagesBatchTensors[i];
 			
 			auto [mu, logvar] = encode(input);
 			auto z = reparameterize(mu, logvar);
-			auto recon = decode(z);
+			recon = decode(z);
 			
 			loss = loss_function(recon, input, mu, logvar);
 			
@@ -626,7 +717,8 @@ struct VAE {
 		}
 		
 		auto l = tensorPool.find_mean_of_tensor(loss->name);
-		std::cout << "epoch loss: " << l << "\n";
+		std::cout << " epoch loss: " << l << "\n";
+		write_tensor_image_png(recon, "recon_" + std::to_string(epoch) + ".png");
 	}
 };
 
@@ -635,7 +727,7 @@ int main(void){
 	VAE vae = VAE();
 
 	for(int i = 0; i < 100; i++){
-		vae.train();
+		vae.train(i);
 	}
 	
 	return 0;
@@ -702,10 +794,12 @@ struct Trainer {
 		optim.load_tensors(sequence);
 	}
 
-	void train_epoch(){
+	void train_epoch(int i){
 		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
+
+		Tensor<float>* input;
 		for (uint32_t i = 0; i < dataLoader->num_batches; i++){
-			auto* input = dataLoader->imagesBatchTensors[i];
+			input = dataLoader->imagesBatchTensors[i];
 			sequence.forward(input);
 			softmax->target = dataLoader->labelTensors[i];
 			auto loss = softmax->forward(sequence.output);
@@ -716,6 +810,8 @@ struct Trainer {
 			tensorPool.zero_out_all_grads();
 		}
 		auto loss = tensorPool.find_mean_of_tensor(softmax->output->name);
+		auto cls = tensorPool.get_highest_classes_from_dist(softmax->softmax_output->name);
+		write_tensor_image_png(input, "image_" + std::to_string(cls[3]) + "_epoch:" + std::to_string(i) + ".png", 3);
 		std::cout << "train_loss: " << loss << "\n";
 	}
 
@@ -747,16 +843,17 @@ struct Trainer {
 		delete allocator;
 	}
 };
+
 /*
 int main(void){
 	
 	Trainer t = Trainer();
 
-	//for (int i = 0; i < 60; i++){
-	//	t.train_epoch();
-	//	//t.test_epoch();
-	//}
-	//t.save_model();
+	for (int i = 0; i < 60; i++){
+		t.train_epoch(i);
+		//t.test_epoch();
+	}
+	t.save_model();
 
 	return 0;
 }
@@ -871,6 +968,8 @@ struct Trainer {
 */
 
 // dataloader sanity check:
+
+// Example usage: load MNIST batch and write the first image to output_images/mnist_sample.png
 /*
 int main(void){
 	Init init;
@@ -878,40 +977,21 @@ int main(void){
 	Allocator* allocator = new Allocator(&init);
 	TensorPool<float> tensorPool(allocator);
 
-	uint32_t batch_idx = 0;
-	uint32_t img_idx   = 7;
-
 	auto loader = MNISTDataloader<float>(&tensorPool, 16, 100);
 	loader.loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
 
-	Tensor<float>* tensor = loader.imagesBatchTensors[batch_idx];
-	float* data = reinterpret_cast<float*>(tensor->dataBuffer->memMap);
+	// take first batch tensor and write its first image
+	Tensor<float>* batch = loader.imagesBatchTensors[0];
+	write_tensor_image_png(batch, "mnist_sample.png", 0, "output_images");
 
-	uint32_t B = loader.batch_size;
-	uint32_t C = loader.channels; // 1
-	uint32_t H = loader.height;   // 28
-	uint32_t W = loader.width;    // 28
-
-	// NCHW layout => offset = (b * C * H * W) + (c * H * W)
-	const float* src = data + img_idx * C * H * W;
-
-	// convert to uint8
-	std::vector<uint8_t> img8(H * W * C);
-	for (size_t i = 0; i < H * W * C; ++i)
-		img8[i] = static_cast<uint8_t>(std::clamp(src[i], 0.0f, 1.0f) * 255.0f);
-
-	// write to PNG
-	stbi_write_png("mnist_sample.png", W, H, C, img8.data(), W * C);
-
-	// optional: print the label
-	float* lbl = reinterpret_cast<float*>(loader.labelTensors[batch_idx]->dataBuffer->memMap);
-	int label = std::distance(lbl + img_idx * 10, std::max_element(lbl + img_idx * 10, lbl + (img_idx + 1) * 10));
+	// optional: print the label for that image
+	float* lbl = reinterpret_cast<float*>(loader.labelTensors[0]->dataBuffer->memMap);
+	int label = std::distance(lbl, std::max_element(lbl, lbl + 10));
 	std::cout << "Label = " << label << std::endl;
 
 	delete allocator;
 	return 0;
 }
-
 */
 
 // MSE loss sanity check

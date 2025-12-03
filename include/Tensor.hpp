@@ -347,6 +347,12 @@ struct tensor_transposed_conv2d_context {
     uint kernel_type;
 };
 
+struct tensor_sample_context {
+    tensor_impl input_tensor;  // going to be a vector tensor shaped (B, 1, N) [the prob distribution]
+    tensor_impl output_tensor; // output tensor (B)
+    uint32_t M, N;
+};
+
 struct tensor_max_pool_context {
     tensor_impl input_tensor;    // [B, C, H, W]
     tensor_impl output_tensor;   // [B, C, H_out, W_out]
@@ -912,6 +918,8 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/KLD_loss.comp.spv"), alloc, nullptr),
             mean_shader(
                 readShaderBytecode("compiled_shaders/find_mean.comp.spv"), alloc, nullptr),
+            sampleShader(
+                readShaderBytecode("compiled_shaders/sample_from_dist.comp.spv"), alloc, nullptr),
             softmaxShader(
                 readShaderBytecode("compiled_shaders/Softmax.comp.spv"), alloc, nullptr),
             embedLookupShader(
@@ -2641,6 +2649,27 @@ struct TensorPool {
         return data[0]; // the first element will contain the mean value
     }
 
+    std::vector<T> get_highest_classes_from_dist(const std::string& dist){
+        auto dist_tensor = tensors[dist].get();
+        auto& local_tensor = createTensor({dist_tensor->shape[0]}, "temp_local_tensor");
+        tensor_sample_context ctx;
+        ctx.input_tensor = dist_tensor->getTensorImpl();
+        ctx.output_tensor = local_tensor.getTensorImpl();
+        ctx.M = dist_tensor->shape[1];
+        ctx.N = dist_tensor->shape[dist_tensor->shape.size() - 1];
+        auto cieldiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t grpx = cieldiv(ctx.N, 256u);
+        uint32_t grpz = dist_tensor->shape[0];
+        uint32_t wrkgrp[3] = {grpx, 1, grpz};
+        tensor_push_const p;
+        p.uniformAddress = sampleShader.uniformBuffer->getBufferAddress();
+        sampleShader.loadUniform(ctx, p);
+        sampleShader.execute(wrkgrp);
+        auto data = local_tensor.dataBuffer->downloadBuffer();
+        destroy_tensor(local_tensor.name);
+        return data;
+    }
+
     void save_tensor_to_file(const std::string& tensor_name, const std::string& filename) {
         if (tensors.find(tensor_name) == tensors.end()) {
             throw std::invalid_argument("Tensor " + tensor_name + " does not exist.");
@@ -2695,6 +2724,7 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, tensor_cmp_context> cmpShader; // compares two tensors for equality
     gpuTaskNoDesc<T, tensor_push_const, mean_context> mean_shader; // compute the mean of a tensor
+    gpuTaskNoDesc<T, tensor_push_const, tensor_sample_context> sampleShader; // returns class index of highest probability
     gpuTaskNoDesc<T, tensor_push_const, tensor_fill_rand_uniform_address<T>> fillRandomShader; // fills tensor with random values
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3; // computes 2D convolution with 3x3 kernel
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3Backward; // computes 2D convolution with 3x3 kernel backward pass
