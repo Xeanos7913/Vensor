@@ -589,7 +589,7 @@ struct VAE {
 
 	SDGoptim<float> optim;
 
-	uint32_t latent_dim = 20;
+	uint32_t latent_dim = 48;
 
 	std::unique_ptr<MNISTDataloader<float>> dataLoader;
 
@@ -650,6 +650,11 @@ struct VAE {
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
 		kldLoss = KLDloss<float>(&tensorPool, 16, "kld");
+		
+		optim.load_tensors(enc_conv);
+		optim.load_tensors(fc_logvar);
+		optim.load_tensors(fc_mu);
+		optim.load_tensors(dec_conv);
 	}
 
 	std::pair<Tensor<float>*, Tensor<float>*> encode(Tensor<float>* input) {
@@ -662,11 +667,11 @@ struct VAE {
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		auto &std_tensor = (0.1f * *logvar).exp();
-		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
-		tensorPool.tensor_fill_random("eps", -0.1f, 0.1f);
+		//auto &std_tensor = (0.5f * *logvar).exp();
+		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
+		//tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
 
-		return &(*mu + std_tensor * eps_tensor);
+		return &(*mu);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -682,26 +687,23 @@ struct VAE {
 	Tensor<float>* loss_function(Tensor<float>* recon, Tensor<float>* x, Tensor<float>* mu, Tensor<float>* logvar) {
 		mseLoss.target = x;
 		auto &ml = *mseLoss(recon);
-		kldLoss.logvar_tensor = logvar;
-		kldLoss.mu_tensor = mu;
-		auto &kld = *kldLoss(x);
+		//kldLoss.logvar_tensor = logvar;
+		//kldLoss.mu_tensor = mu;
+		//auto &kld = *kldLoss(x);
 
-		return &(ml + kld);
+		return &(ml);
 	}
 
 	void train(int epoch){
+		using namespace std::chrono;
+		auto epoch_start = high_resolution_clock::now();
+
 		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
 
-		optim.load_tensors(enc_conv);
-		optim.load_tensors(fc_logvar);
-		optim.load_tensors(fc_mu);
-		optim.load_tensors(dec_conv);
-
-		Tensor<float>* loss;
-		Tensor<float>* recon;
+		Tensor<float>* loss = nullptr;
+		Tensor<float>* recon = nullptr;
 		progressbar bar(100, true, std::cout);
 		for(int i = 0; i < dataLoader->num_batches; i++){
-			bar.update();
 			auto* input = dataLoader->imagesBatchTensors[i];
 			
 			auto [mu, logvar] = encode(input);
@@ -714,10 +716,16 @@ struct VAE {
 
 			optim.step();
 			tensorPool.zero_out_all_grads();
+			bar.update();
 		}
 		
 		auto l = tensorPool.find_mean_of_tensor(loss->name);
+
+		auto epoch_end = high_resolution_clock::now();
+		double elapsed_ms = duration_cast<duration<double, std::milli>>(epoch_end - epoch_start).count();
+
 		std::cout << " epoch loss: " << l << "\n";
+		std::cout << " epoch " << epoch << " time: " << elapsed_ms << " ms\n";
 		write_tensor_image_png(recon, "recon_" + std::to_string(epoch) + ".png");
 	}
 };
@@ -798,6 +806,7 @@ struct Trainer {
 		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
 
 		Tensor<float>* input;
+		progressbar bar(100, true, std::cout);
 		for (uint32_t i = 0; i < dataLoader->num_batches; i++){
 			input = dataLoader->imagesBatchTensors[i];
 			sequence.forward(input);
@@ -808,6 +817,7 @@ struct Trainer {
 			
 			optim.step();
 			tensorPool.zero_out_all_grads();
+			bar.update();
 		}
 		auto loss = tensorPool.find_mean_of_tensor(softmax->output->name);
 		auto cls = tensorPool.get_highest_classes_from_dist(softmax->softmax_output->name);

@@ -555,10 +555,11 @@ struct Allocator {
     VkCommandPool commandPool;
     VkCommandPool graphicsPool;
     VkQueue graphicsQueue;
+    std::vector<std::pair<VkBuffer, VkDeviceMemory>> allocated;
 private:
     VkQueue allocQueue;
     std::vector<VkCommandBuffer> commandBuffers;
-    std::vector<std::pair<VkBuffer, VkDeviceMemory>> allocated;
+    
     std::vector<std::pair<VkImage, VkDeviceMemory>> images;
 
     int beginSingleTimeCommands(bool useGraphicsQueue = false) {
@@ -773,6 +774,11 @@ struct StandaloneBuffer {
         memMap(other.memMap),
         descUpdateQueued(other.descUpdateQueued),
         bufferAddress(other.bufferAddress){
+    }
+
+    ~StandaloneBuffer(){
+        allocator->killMemory(buffer, bufferMemory);
+        allocator->killMemory(stagingBuffer,  stagingBufferMemory);
     }
 
     StandaloneBuffer(size_t numElements, Allocator* allocator, VkShaderStageFlagBits flags = VK_SHADER_STAGE_COMPUTE_BIT) : allocator(allocator), flags(flags), numElements(numElements) {
@@ -1457,6 +1463,11 @@ struct MemPool {
 		bufferInfo.buffer = buffer;
 		bufferInfo.pNext = nullptr;
 		poolAddress = allocator->init->disp.getBufferDeviceAddress(&bufferInfo);
+    }
+
+    ~MemPool(){
+        allocator->killMemory(buffer, memory);
+        allocator->killMemory(stagingBuffer, stagingMemory);
     }
 
     MemPool() {};
