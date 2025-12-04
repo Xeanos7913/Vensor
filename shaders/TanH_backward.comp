@@ -1,0 +1,86 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct TanHcontext {
+    TensorImpl input_tensor;   
+    TensorImpl output_tensor;
+    uint batch_size;
+    uint m, n;
+    uint accumulate_grad; // 0: overwrite, 1: += for grads
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    TanHcontext ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint  kernel_type; // 0=forward, 1=backward
+} push;
+
+void backward_pass() {
+    TanHcontext ctx = push.context.ctx;
+    
+    uint global_id = gl_GlobalInvocationID.x;
+    uint total_elements = ctx.output_tensor.numel;
+    
+    if (global_id >= total_elements) {
+        return;
+    }
+    
+    // Read output gradient (gradient from next layer)
+    float grad_output = ctx.output_tensor.grad.grad[global_id];
+    
+    // Read the forward pass output (tanh value)
+    float tanh_x = ctx.output_tensor.data.data[global_id];
+    
+    // Derivative of tanh: d(tanh(x))/dx = 1 - tanh²(x)
+    float grad_tanh = 1.0 - tanh_x * tanh_x;
+    
+    // Chain rule: gradient w.r.t input
+    float grad_input = grad_output * grad_tanh;
+    
+    // Write gradient to input tensor
+    if (ctx.accumulate_grad == 1) {
+        // Accumulate gradient (for backprop through computational graph)
+        atomicAdd(ctx.input_tensor.grad.grad[global_id], grad_input);
+    } else {
+        // Overwrite gradient
+        ctx.input_tensor.grad.grad[global_id] = grad_input;
+    }
+}
+
+void main() {
+    backward_pass();
+}

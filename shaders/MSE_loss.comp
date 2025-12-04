@@ -182,7 +182,7 @@ void main() {
             
             // Compute and write gradients
             if (ctx.predicted_tensor.requires_grad != 0) {
-                vec4 grad = (2.0 * diff / float(elementsPerBatch)) * ctx.batch_size;
+                vec4 grad = (2.0 * diff / float(elementsPerBatch)) * ctx.batch_size * 10.0f;
                 
                 ctx.predicted_tensor.grad.grad[globalBaseIdx] = grad.x;
                 ctx.predicted_tensor.grad.grad[globalBaseIdx + 1] = grad.y;
@@ -204,7 +204,7 @@ void main() {
         tileSquaredError += diff * diff;
         
         if (ctx.predicted_tensor.requires_grad != 0) {
-            ctx.predicted_tensor.grad.grad[globalIdx] = 2.0 * diff / float(elementsPerBatch);
+            ctx.predicted_tensor.grad.grad[globalIdx] = (2.0 * diff / float(elementsPerBatch)) * ctx.batch_size * 10.0f;
         }
     }
     

@@ -1,0 +1,79 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct TanHcontext {
+    TensorImpl input_tensor;   
+    TensorImpl output_tensor;
+    uint batch_size;
+    uint m, n;
+    uint accumulate_grad; // 0: overwrite, 1: += for grads
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    TanHcontext ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint  kernel_type; // 0=forward, 1=backward
+} push;
+
+void forward_pass() {
+    TanHcontext ctx = push.context.ctx;
+    
+    uint global_id = gl_GlobalInvocationID.x;
+    uint total_elements = ctx.input_tensor.numel;
+    
+    if (global_id >= total_elements) {
+        return;
+    }
+    
+    // Read input value
+    float x = ctx.input_tensor.data.data[global_id];
+    
+    // Compute tanh(x) = (e^x - e^-x) / (e^x + e^-x)
+    // Using tanh(x) = (e^2x - 1) / (e^2x + 1) for better numerical stability
+    float e2x = exp(2.0 * x);
+    float tanh_x = (e2x - 1.0) / (e2x + 1.0);
+    
+    // Clamp for numerical stability
+    tanh_x = clamp(tanh_x, -1.0, 1.0);
+    
+    // Write output
+    ctx.output_tensor.data.data[global_id] = tanh_x;
+}
+
+void main() {
+    forward_pass();
+}

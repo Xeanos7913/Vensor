@@ -208,6 +208,14 @@ struct tensor_relu_context {
     uint32_t mode;
 };
 
+struct tanh_context {
+    tensor_impl input_tensor;   
+    tensor_impl output_tensor;
+    uint batch_size;
+    uint m, n;
+    uint accumulate_grad; // 0: overwrite, 1: += for grads
+};
+
 struct tensor_softmax_context {
     tensor_impl input_tensor;
     tensor_impl output_tensor;
@@ -390,14 +398,6 @@ struct tensor_fill_range_uniform_address {
 
 template<typename T>
 struct TensorPool;
-
-// Source - https://stackoverflow.com/a
-// Posted by Davide Cannizzo, modified by community. See post 'Timeline' for change history
-// Retrieved 2025-11-14, License - CC BY-SA 4.0
-// Some actual voodoo magic
-#define define const struct
-#define coperator(ReturnType, OperatorName, FirstOperandType, SecondOperandType) OperatorName ## _ {} OperatorName; template <typename T> struct OperatorName ## Proxy{public:OperatorName ## Proxy(const T& t) : t_(t){}const T& t_;static ReturnType _ ## OperatorName ## _(const FirstOperandType a, const SecondOperandType b);};template <typename T> OperatorName ## Proxy<T> operator<(const T& lhs, const OperatorName ## _& rhs){return OperatorName ## Proxy<T>(lhs);}ReturnType operator>(const OperatorName ## Proxy<FirstOperandType>& lhs, const SecondOperandType& rhs){return OperatorName ## Proxy<FirstOperandType>::_ ## OperatorName ## _(lhs.t_, rhs);}template <typename T> inline ReturnType OperatorName ## Proxy<T>::_ ## OperatorName ## _(const FirstOperandType a, const SecondOperandType b)
-// this monster allows me to have any custom operators, eg. the matmul operator '@'
 
 template<typename T>  
 struct Tensor {  
@@ -906,6 +906,10 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/ReLU.comp.spv"), alloc, nullptr),
             ReLUShaderBackward(
                 readShaderBytecode("compiled_shaders/ReLU_backward.comp.spv"), alloc, nullptr),
+            tanhShader(
+                readShaderBytecode("compiled_shaders/TanH.comp.spv"), alloc, nullptr),
+            tanhShaderBackward(
+                readShaderBytecode("compiled_shaders/TanH_backward.comp.spv"), alloc, nullptr),
             fillRandomShader(
                 readShaderBytecode("compiled_shaders/tensor_fill_random.comp.spv"), alloc, nullptr),
             crossEntropyShader(
@@ -1075,6 +1079,33 @@ struct TensorPool {
             pushConsts.uniformAddress = ReLUShaderBackward.uniformBuffer->getBufferAddress();
             ReLUShaderBackward.loadUniform(uniform, pushConsts);
             ReLUShaderBackward.execute(workgroup);
+        }
+    };
+
+    void tensor_tanh(const std::string& input_tensor, const std::string& output_tensor, uint32_t mode = 0){
+        tanh_context uniform;
+        uniform.batch_size = tensors[input_tensor]->shape[0];
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+
+        uint32_t numel = uniform.input_tensor.num_elements;
+
+        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        tensor_push_const push;
+        uint32_t grpx = cielDiv(numel, 256u);
+        uint32_t wrkgrp[3] = {grpx, 1, 1};
+        
+        if(mode == 0){
+            push.uniformAddress = tanhShader.uniformBuffer->getBufferAddress();
+            push.mode = mode;
+            tanhShader.loadUniform(uniform, push);
+            tanhShader.execute(wrkgrp);
+        }else{
+            push.uniformAddress = tanhShaderBackward.uniformBuffer->getBufferAddress();
+            push.mode = mode;
+            tanhShaderBackward.loadUniform(uniform, push);
+            tanhShaderBackward.execute(wrkgrp);
         }
     };
 
@@ -2707,6 +2738,8 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, kld_loss_context> kldLossShader; // computes the Kullback Liebler Divergence (KLD) loss
 	gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShader; // computes ReLU
     gpuTaskNoDesc<T, tensor_push_const, tensor_relu_context> ReLUShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, tanh_context> tanhShader; // computes tanh(input)
+    gpuTaskNoDesc<T, tensor_push_const, tanh_context> tanhShaderBackward;
 	gpuTaskNoDesc<T, tensor_push_const, tensor_softmax_context> softmaxShader;  // computes softmax
 	gpuTaskNoDesc<T, tensor_push_const, tensor_cross_entropy_context> crossEntropyShader; // computes softmax + cross-entropy loss
     gpuTaskNoDesc<T, tensor_push_const, tensor_cross_entropy_context> crossEntropyShaderBackward; // computes softmax + cross-entropy loss

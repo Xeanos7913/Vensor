@@ -589,7 +589,7 @@ struct VAE {
 
 	SDGoptim<float> optim;
 
-	uint32_t latent_dim = 48;
+	uint32_t latent_dim = 64;
 
 	std::unique_ptr<MNISTDataloader<float>> dataLoader;
 
@@ -625,6 +625,8 @@ struct VAE {
 		auto bn4 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, dec_conv1->output_width, dec_conv1->output_height, 16, "bn4");
 		auto relu4 = std::make_unique<ReLU<float>>(&tensorPool, "relu4");
 		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2);
+		auto bn5 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 1, dec_conv2->output_width, dec_conv2->output_height, 16, "bn5");
+		auto tanh = std::make_unique<TanH<float>>(&tensorPool, "tanh");
 
 		enc_conv = Sequential<float>(&tensorPool, "enc");
 
@@ -647,6 +649,8 @@ struct VAE {
 		dec_conv.addLayer(std::move(bn4));
 		dec_conv.addLayer(std::move(relu4));
 		dec_conv.addLayer(std::move(dec_conv2));
+		dec_conv.addLayer(std::move(bn5));
+		dec_conv.addLayer(std::move(tanh));
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
 		kldLoss = KLDloss<float>(&tensorPool, 16, "kld");
@@ -667,9 +671,9 @@ struct VAE {
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		//auto &std_tensor = (0.5f * *logvar).exp();
+		//auto &std_tensor = (0.1f * *logvar).exp();
 		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
-		//tensorPool.tensor_fill_random("eps", -2.5f, 2.5f);
+		//tensorPool.tensor_fill_random("eps", -0.5f, 0.5f);
 
 		return &(*mu);
 	}
@@ -709,7 +713,7 @@ struct VAE {
 			auto [mu, logvar] = encode(input);
 			auto z = reparameterize(mu, logvar);
 			recon = decode(z);
-			
+
 			loss = loss_function(recon, input, mu, logvar);
 			
 			loss->backward();

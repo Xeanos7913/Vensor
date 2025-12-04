@@ -215,6 +215,44 @@ struct ReLU : public Module<T> {
 };
 
 template<typename T>
+struct TanH : public Module<T> {
+	TensorPool<T>* tensorPool;
+	std::string name;
+	std::string output_name;
+
+	TanH(TensorPool<T>* pool, const std::string& name) : tensorPool(pool), name(name) {
+		output_name = name + "-output";
+		// do not create output here; create on first forward call
+	}
+	TanH(TensorPool<T>* pool, const std::vector<uint32_t>& dims, const std::string& name) : tensorPool(pool), name(name) {
+		output_name = name + "-output";
+		// do not create output here; create on first forward call
+	}
+	TanH(){}; // default empty ctor
+
+	// Forward left empty for user to implement
+	Tensor<T>* forward(Tensor<T>* input) override {
+		// create output on first use if it doesn't exist, matching input shape
+		if (this->output == nullptr) {
+			this->output = &tensorPool->createTensor(input->shape, output_name);
+		}
+		// Ensure input shape is compatible
+		if (input->shape != this->output->shape) {
+			throw std::invalid_argument("Input tensor shape is not compatible with TanH output");
+		}
+		
+		// Apply tanh activation function
+		tensorPool->tensor_tanh(input->name, this->output->name);
+		this->output->back.push_back([this, input](){
+			this->tensorPool->tensor_tanh(input->name, this->output->name, 1);
+			input->backward();
+		});
+
+		return this->output;
+	}
+};
+
+template<typename T>
 struct Dropout : public Module<T> {
 	//Tensor<T>* output;
 	TensorPool<T>* tensorPool;
