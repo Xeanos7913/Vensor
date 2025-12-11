@@ -25,10 +25,11 @@ struct TensorImpl {
 
 struct TensorFillContext {
     TensorImpl tensor;
-    uint type;     // 0 = Gaussian, 1 = Uniform
-    uint m, n;
-    float min;
-    float max;
+    uint init_type;     // 0=Uniform, 1=Normal, 2=Xavier/Glorot, 3=He/Kaiming, 4=Constant
+    uint fan_in;        // Number of input connections (for Xavier/He)
+    uint fan_out;       // Number of output connections (for Xavier)
+    float param1;       // mean for Normal, constant value, or min for Uniform
+    float param2;       // stddev for Normal, unused, or max for Uniform
     uint seed;
 };
 
@@ -39,7 +40,7 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuff
 layout(push_constant) uniform PushConstants {
     ContextBuffer context;
     uvec3 grid_size;
-    uint  kernel_type; // unused
+    uint  kernel_type;
 } push;
 
 // ---------------- RNG helpers ----------------
@@ -65,10 +66,11 @@ float hash_to_float(uint h) {
     return float(top24) / 16777216.0;
 }
 
-float random_uniform(uint seed) {
+float random_uniform_01(uint seed) {
     return hash_to_float(finalizer32(seed));
 }
 
+// Box-Muller transform for Gaussian
 float random_gaussian(uint seed, float mean, float stddev) {
     uint s1 = finalizer32(seed);
     uint s2 = finalizer32(s1 + 0x9E3779B9u);
@@ -83,23 +85,47 @@ void main() {
     uvec3 gid = gl_WorkGroupID;
     uint local_id = gl_LocalInvocationIndex;
     uint global_id = gid.x * gl_WorkGroupSize.x + local_id;
-
+    
     TensorFillContext ctx = push.context.ctx;
     TensorImpl tensor = ctx.tensor;
     uint index = global_id;
-
+    
     if (index >= tensor.numel) return;
-
+    
     uint seed = make_seed(ctx.seed, index, gid);
     float val;
-
-    if (ctx.type == 0u) {
-        float mean = (ctx.min + ctx.max) * 0.5;
-        float stddev = 1.0;
-        val = clamp(random_gaussian(seed, mean, stddev), ctx.min, ctx.max);
-    } else {
-        val = ctx.min + random_uniform(seed) * (ctx.max - ctx.min);
+    
+    switch(ctx.init_type) {
+        case 0u: // Uniform [param1, param2]
+            val = ctx.param1 + random_uniform_01(seed) * (ctx.param2 - ctx.param1);
+            break;
+            
+        case 1u: // Normal (mean=param1, stddev=param2)
+            val = random_gaussian(seed, ctx.param1, ctx.param2);
+            break;
+            
+        case 2u: // Xavier/Glorot: Normal(0, sqrt(2/(fan_in + fan_out)))
+            {
+                float stddev = sqrt(2.0 / float(ctx.fan_in + ctx.fan_out));
+                val = random_gaussian(seed, 0.0, stddev);
+            }
+            break;
+            
+        case 3u: // He/Kaiming: Normal(0, sqrt(2/fan_in))
+            {
+                float stddev = sqrt(2.0 / float(ctx.fan_in));
+                val = random_gaussian(seed, 0.0, stddev);
+            }
+            break;
+            
+        case 4u: // Constant value (param1)
+            val = ctx.param1;
+            break;
+            
+        default:
+            val = 0.0;
+            break;
     }
-
+    
     tensor.data.data[index] = val;
 }

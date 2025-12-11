@@ -574,7 +574,6 @@ static void write_tensor_image_png(Tensor<float>* tensor,
 // WIP vae for the MNIST dataset
 struct VAE {
 
-	Init init;
 	Allocator* allocator;
 
 	TensorPool<float> tensorPool;
@@ -582,8 +581,9 @@ struct VAE {
 	Sequential<float> enc_conv;
 	Sequential<float> dec_conv;
 	Linear<float> fc_mu;
+	ReLU<float> fc_mu_relu;
 	Linear<float> fc_logvar;
-
+	ReLU<float> fc_logvar_relu;
 	MSEloss<float> mseLoss;
 	KLDloss<float> kldLoss;
 
@@ -593,9 +593,7 @@ struct VAE {
 
 	std::unique_ptr<MNISTDataloader<float>> dataLoader;
 
-	VAE(){
-		device_initialization(init);
-		allocator = new Allocator(&init);
+	VAE(Allocator* allocator) : allocator(allocator) {
 
 		tensorPool = TensorPool<float>(allocator);
 
@@ -606,35 +604,41 @@ struct VAE {
 		optim.lr = 1e-03;
 
 		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
-		auto bn1 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, conv1->output_width, conv1->output_height, 16, "bn1");
+		//auto bn1 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, conv1->output_width, conv1->output_height, 16, "bn1");
 		auto relu1 = std::make_unique<ReLU<float>>(&tensorPool, "relu1");
 		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2);
-		auto bn2 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 64, conv2->output_width, conv2->output_height, 16, "bn2");
+		//auto bn2 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 64, conv2->output_width, conv2->output_height, 16, "bn2");
 		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
 		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
 		auto enc_fc = std::make_unique<Linear<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 512, 16, "enc_fc");
 		
+		fc_mu_relu = ReLU<float>(&tensorPool, "fc_mu_relu");
 		fc_mu = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_mu");
+		fc_logvar_relu = ReLU<float>(&tensorPool, "fc_logvar_relu");
 		fc_logvar = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
 
 		auto dec_fc = std::make_unique<Linear<float>>(&tensorPool, latent_dim, 64 * conv2->output_height * conv2->output_width, 16, "dec_fc");
-		auto bn3 = std::make_unique<BatchNorm1d<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 1, 16, "bn3");
+		//auto bn3 = std::make_unique<BatchNorm1d<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 1, 16, "bn3");
 		auto relu3 = std::make_unique<ReLU<float>>(&tensorPool, "relu3");
 		auto reshape = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 64, conv2->output_height, conv2->output_width}, "reshape");
 		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 4, 4, "dec_conv1", 2, 2);
-		auto bn4 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, dec_conv1->output_width, dec_conv1->output_height, 16, "bn4");
+		//auto bn4 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, dec_conv1->output_width, dec_conv1->output_height, 16, "bn4");
 		auto relu4 = std::make_unique<ReLU<float>>(&tensorPool, "relu4");
 		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2);
-		auto bn5 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 1, dec_conv2->output_width, dec_conv2->output_height, 16, "bn5");
+		// Xavier/Glorot initialization for the final layer (followed by TanH)
+		uint32_t fan_in = 32 * 4 * 4;   // in_channels * kernel_h * kernel_w = 512
+		uint32_t fan_out = 1 * 4 * 4;   // out_channels * kernel_h * kernel_w = 16
+		tensorPool.tensor_fill_random(dec_conv2->weight_tensor->name, 2, fan_in, fan_out, 0.0f, 0.0f);
+		//auto bn5 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 1, dec_conv2->output_width, dec_conv2->output_height, 16, "bn5");
 		auto tanh = std::make_unique<TanH<float>>(&tensorPool, "tanh");
 
 		enc_conv = Sequential<float>(&tensorPool, "enc");
 
 		enc_conv.addLayer(std::move(conv1));
-		enc_conv.addLayer(std::move(bn1));
+		//enc_conv.addLayer(std::move(bn1));
 		enc_conv.addLayer(std::move(relu1));
 		enc_conv.addLayer(std::move(conv2));
-		enc_conv.addLayer(std::move(bn2));
+		//enc_conv.addLayer(std::move(bn2));
 		enc_conv.addLayer(std::move(relu2));
 		enc_conv.addLayer(std::move(flatten));
 		enc_conv.addLayer(std::move(enc_fc));
@@ -642,14 +646,14 @@ struct VAE {
 		dec_conv = Sequential<float>(&tensorPool, "dec");
 
 		dec_conv.addLayer(std::move(dec_fc));
-		dec_conv.addLayer(std::move(bn3));
+		//dec_conv.addLayer(std::move(bn3));
 		dec_conv.addLayer(std::move(relu3));
 		dec_conv.addLayer(std::move(reshape));
 		dec_conv.addLayer(std::move(dec_conv1));
-		dec_conv.addLayer(std::move(bn4));
+		//dec_conv.addLayer(std::move(bn4));
 		dec_conv.addLayer(std::move(relu4));
 		dec_conv.addLayer(std::move(dec_conv2));
-		dec_conv.addLayer(std::move(bn5));
+		//dec_conv.addLayer(std::move(bn5));
 		dec_conv.addLayer(std::move(tanh));
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
@@ -665,16 +669,19 @@ struct VAE {
 		auto h = enc_conv(input);
 
 		auto mu = fc_mu(h);
-		auto logvar = fc_logvar(h);
+		auto logvar = nullptr;//fc_logvar(h);
 
 		return {mu, logvar};
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		//auto &std_tensor = (0.1f * *logvar).exp();
+		//auto &std_tensor = (0.5f * *logvar).exp();
 		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
-		//tensorPool.tensor_fill_random("eps", -0.5f, 0.5f);
-
+		
+		// Use Gaussian/Normal distribution N(0, 1) for VAE reparameterization
+		// init_type=1: Normal distribution with mean=0.0, stddev=1.0
+		//tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
+		
 		return &(*mu);
 	}
 
@@ -734,16 +741,61 @@ struct VAE {
 	}
 };
 
+
 int main(void){
 	
-	VAE vae = VAE();
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
 
-	for(int i = 0; i < 100; i++){
-		vae.train(i);
+	{
+		VAE vae = VAE(allocator);
+
+		for(int i = 0; i < 100; i++){
+			vae.train(i);
+		}
 	}
-	
+		
+	delete allocator;
 	return 0;
 }
+
+
+/*
+int main(void){
+	Init init;
+	device_initialization(init);
+
+	// Allocator must be heap-allocated and must outlive all library resources that use it.
+	Allocator* allocator = new Allocator(&init);
+
+	{
+		// All resources that depend on allocator live in this scope.
+		TensorPool<float> tensorPool(allocator);
+
+		MNISTDataloader<float> data(&tensorPool, 1, 1);
+		data.loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
+
+		MSEloss<float> mse(&tensorPool, 1, "mse");
+
+		// imagesBatchTensors holds Tensor<float>* entries
+		Tensor<float>* in = data.imagesBatchTensors[0];
+		Tensor<float>* tar = data.imagesBatchTensors[0];
+
+		mse.target = tar;
+		mse.forward(in);
+
+		mse.output->print();
+
+		// leaving this scope will destroy tensorPool, data, mse, and any other objects that used allocator
+	}
+
+	// Now it's safe to delete the allocator after all dependent resources have been destroyed.
+	delete allocator;
+
+	return 0;
+}
+*/
 
 // A handwritten digit recognision neural network
 struct Trainer {

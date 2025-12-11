@@ -285,11 +285,13 @@ struct tensor_layernorm1d_context {
 };
 
 struct mse_loss_context {
-    tensor_impl target_tensor;      // [B, ...]
-    tensor_impl predicted_tensor;   // [B, ...]
-    tensor_impl loss_tensor;        // [B, ...]
-    uint32_t batch_size;
-    uint32_t elements_per_batch;
+    tensor_impl target_tensor;   // [B, C, H, W] shape
+    tensor_impl predicted_tensor;// [B, C, H, W] shape
+    tensor_impl loss_tensor;     // [B] shape
+    uint batch_size;            // B
+    uint channels;              // C
+    uint height;                // H
+    uint width;                 // W
 };
 
 struct kld_loss_context {
@@ -381,10 +383,11 @@ struct tensor_fill_uniform_address {
 template<typename T>
 struct tensor_fill_rand_uniform_address {
 	tensor_impl tensor;
-	uint32_t type; // 0 = gaussian, 1 = uniform
-    uint32_t m, n;
-	T min;
-    T max;
+    uint init_type;     // 0=Uniform, 1=Normal, 2=Xavier/Glorot, 3=He/Kaiming, 4=Constant
+    uint fan_in;        // Number of input connections (for Xavier/He)
+    uint fan_out;       // Number of output connections (for Xavier)
+    float param1;       // mean for Normal, constant value, or min for Uniform
+    float param2;       // stddev for Normal, unused, or max for Uniform
     uint seed;
 };
 
@@ -2520,37 +2523,46 @@ struct TensorPool {
         }
     }
 
-    // automatically populates predicted tensor's gradient buffer with the single call. No need to call .backward()
-    void mse_loss(const std::string& predicted, const std::string& target, const std::string& loss){
+    // Automatically populates predicted tensor's gradient buffer with a single call. No need to call .backward()
+    void mse_loss(const std::string& predicted, const std::string& target, const std::string& loss) {
         mse_loss_context uniform;
+        
+        // Get tensor implementations
         uniform.loss_tensor = tensors[loss]->getTensorImpl();
         uniform.predicted_tensor = tensors[predicted]->getTensorImpl();
         uniform.target_tensor = tensors[target]->getTensorImpl();
-
-        // num_elements per batch element
-        constexpr uint32_t VEC_TILE_SIZE = 4;  // As defined in shader
+        
+        // Extract shape dimensions [B, C, H, W]
+        auto& shape = tensors[target]->shape;
+        uniform.batch_size = shape[0];  // B
+        uniform.channels = shape[1];    // C
+        uniform.height = shape[2];      // H
+        uniform.width = shape[3];       // W
+        
+        // Calculate elements per batch: C * H * W
+        uint32_t elements_per_batch = uniform.channels * uniform.height * uniform.width;
+        
+        // Dispatch configuration
+        constexpr uint32_t VEC_TILE_SIZE = 4;      // As defined in shader
         constexpr uint32_t ELEMENTS_PER_VEC4 = 4;
         constexpr uint32_t TILE = VEC_TILE_SIZE * ELEMENTS_PER_VEC4;  // 16 elements per thread
-        constexpr uint32_t GRP = 256;
-
-        uint32_t num_elements = std::accumulate(
-            tensors[target]->shape.begin() + 1, 
-            tensors[target]->shape.end(), 
-            1, 
-            std::multiplies<uint32_t>()
-        );
-
-        uint32_t batch_size = tensors[target]->shape[0];
-
-        uniform.batch_size = batch_size;
-        uniform.elements_per_batch = num_elements;
-
-        // Each workgroup has GRP threads, each processing TILE elements
-        uint32_t num_workgroups_x = (num_elements + (GRP * TILE) - 1) / (GRP * TILE);
+        constexpr uint32_t GRP = 256;              // Workgroup size
         
-        uint32_t workgroup[3] = {num_workgroups_x, 1, batch_size};
-
-        DEBUG_PRINT("MSE loss on tensor: " << predicted << " Using targets: " << target << " with dispatch: " << "(" << num_workgroups_x << ", " << "1, " << batch_size << ")");
+        // Calculate workgroups needed per batch element
+        // Each workgroup has GRP threads, each processing TILE elements
+        uint32_t num_workgroups_x = (elements_per_batch + (GRP * TILE) - 1) / (GRP * TILE);
+        
+        // Dispatch: (workgroups_per_batch, 1, batch_size)
+        // Each Z slice handles one batch element
+        uint32_t workgroup[3] = {num_workgroups_x, 1, uniform.batch_size};
+        
+        DEBUG_PRINT("MSE loss on tensor: " << predicted 
+                    << " Using targets: " << target 
+                    << " Shape: [" << uniform.batch_size << ", " << uniform.channels 
+                    << ", " << uniform.height << ", " << uniform.width << "]"
+                    << " Dispatch: (" << num_workgroups_x << ", 1, " << uniform.batch_size << ")");
+        
+        // Setup push constants and execute
         tensor_push_const push;
         push.uniformAddress = mseLossShader.uniformBuffer->getBufferAddress();
         mseLossShader.loadUniform(uniform, push);
@@ -2564,7 +2576,7 @@ struct TensorPool {
         uniform.mu_tensor = tensors[mu_tensor]->getTensorImpl();
         uniform.elements_per_batch = std::accumulate(tensors[mu_tensor]->shape.begin() + 1, tensors[mu_tensor]->shape.end(), 1, std::multiplies<uint32_t>());
         uniform.loss_tensor = tensors[loss_tensor]->getTensorImpl();
-        uniform.beta = 0.01f;
+        uniform.beta = 0.0001f;
 
         uint32_t grpx = (uniform.elements_per_batch + (256 * 4) - 1)/(256 * 4);
         uint32_t wrkgrp[3] = {grpx, 1, uniform.batch_size};
@@ -2578,52 +2590,66 @@ struct TensorPool {
         kldLossShader.execute(wrkgrp);
     }
 
-    void tensor_fill_random(const std::string& tensor, T min, T max) {
+    void tensor_fill_random(const std::string& tensor, uint32_t init_type, uint32_t fan_in, uint32_t fan_out, T param1, T param2) {
         tensor_fill_rand_uniform_address<T> uniform{};
-
-		uniform.tensor = tensors[tensor]->getTensorImpl();
-		uniform.type = std::is_floating_point<T>::value ? 0 : (std::is_integral<T>::value ? 1 : 2); // 0 = float, 1 = int, 2 = uint
-        if (uniform.type == 0) {
-            // For floating point types, we can use the min and max directly
-            uniform.min = min;
-            uniform.max = max;
-        } else if (uniform.type == 1) {
-            // For integral types, we need to cast min and max to T
-            uniform.min = static_cast<T>(min);
-            uniform.max = static_cast<T>(max);
-        } else {
-            // For unsigned types, we also cast
-            uniform.min = static_cast<T>(min);
-            uniform.max = static_cast<T>(max);
-		}
-
-        uniform.max = max;
-        uniform.min = min;
-        uniform.type = 0; // gaussian
-
-        std::random_device rd; // random seed
+        
+        uniform.tensor = tensors[tensor]->getTensorImpl();
+        
+        // Set initialization type and parameters
+        uniform.init_type = init_type;  // 0=Uniform, 1=Normal, 2=Xavier, 3=He, 4=Constant
+        uniform.fan_in = fan_in;
+        uniform.fan_out = fan_out;
+        uniform.param1 = param1;
+        uniform.param2 = param2;
+        
+        // Random seed
+        std::random_device rd;
         uniform.seed = static_cast<uint>(rd());
         
         tensor_push_const p;
         p.uniformAddress = fillRandomShader.uniformBuffer->getBufferAddress();
-
+        
         uint32_t total_elements = std::accumulate(tensors[tensor]->shape.begin(), tensors[tensor]->shape.end(), 1, std::multiplies<uint32_t>());
-		
-        // Compute dispatch grid to cover the OUTPUT tensor C[B,M,N]
+        
+        // Compute dispatch grid to cover the tensor
         auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
-
-        // Grid covers the output tensor's data buffer.
         uint32_t groupX = ceilDiv(total_elements, 256u);
         uint32_t groupY = 1u;
         uint32_t groupZ = 1u;
         
         p.grid_size = glm::uvec3(groupX, groupY, groupZ);
+        
         fillRandomShader.loadUniform(uniform, p);
+        
         std::array<uint32_t, 3> workgroup = { groupX, groupY, groupZ };
-
-		DEBUG_PRINT("workgroup: " << workgroup[0] << " " << workgroup[1] << " " << workgroup[2] << "for tensor: " << tensor);
-
+        DEBUG_PRINT("workgroup: " << workgroup[0] << " " << workgroup[1] << " " << workgroup[2] << " for tensor: " << tensor);
+        
         fillRandomShader.execute(workgroup.data());
+    }
+
+    // He initialization for Conv2d/Linear with ReLU
+    void init_he(const std::string& tensor, uint32_t fan_in) {
+        tensor_fill_random(tensor, 3, fan_in, 0, 0.0f, 0.0f);
+    }
+
+    // Xavier initialization for layers with TanH/Sigmoid
+    void init_xavier(const std::string& tensor, uint32_t fan_in, uint32_t fan_out) {
+        tensor_fill_random(tensor, 2, fan_in, fan_out, 0.0f, 0.0f);
+    }
+
+    // Constant initialization (for biases, BatchNorm params)
+    void init_constant(const std::string& tensor, float value) {
+        tensor_fill_random(tensor, 4, 0, 0, value, 0.0f);
+    }
+
+    // Uniform initialization (if you still need it)
+    void init_uniform(const std::string& tensor, float min, float max) {
+        tensor_fill_random(tensor, 0, 0, 0, min, max);
+    }
+
+    // Normal/Gaussian initialization with custom mean and stddev
+    void init_normal(const std::string& tensor, float mean, float stddev) {
+        tensor_fill_random(tensor, 1, 0, 0, mean, stddev);
     }
 
     bool are_tensors_equal(const std::string& tensor_a, const std::string& tensor_b){

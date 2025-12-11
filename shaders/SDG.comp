@@ -80,7 +80,7 @@ void main() {
     }
 
     // Clamp gradient to avoid exploding updates
-    //gradient = clamp(gradient, -15.0, 15.0);
+    gradient = clamp(gradient, -15.0, 15.0);
 
     float updated_param = param - u.lr * gradient;
     

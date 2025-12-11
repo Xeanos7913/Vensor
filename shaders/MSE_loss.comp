@@ -13,7 +13,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #define MAX_WG 256
 #define WARP_SIZE gl_SubgroupSize
-#define TILE_SIZE 4
+#define VEC_TILE_SIZE 4  // Process 4 vec4s = 16 floats per thread
 
 #define VECTORIZED_BATCHED // use vectorized MSE by default.
 
@@ -42,11 +42,13 @@ struct TensorImpl {
 };
 
 struct MSE_context {
-    TensorImpl target_tensor;   // [B, ...] shape
-    TensorImpl predicted_tensor;// [B, ...] shape
+    TensorImpl target_tensor;   // [B, C, H, W] shape
+    TensorImpl predicted_tensor;// [B, C, H, W] shape
     TensorImpl loss_tensor;     // [B] shape
     uint batch_size;            // B
-    uint elements_per_batch;    // product of dimensions after batch dim
+    uint channels;              // C
+    uint height;                // H
+    uint width;                 // W
 };
 
 layout(buffer_reference, std430, scalar) buffer ContextBuffer {
@@ -86,8 +88,6 @@ float blockReduceSum(float val) {
     return val;
 }
 
-// Basic batched MSE kernel - each workgroup processes one batch element
-#ifdef BASIC_BATCHED
 void main() {
     MSE_context ctx = push.context.ctx;
     
@@ -96,60 +96,15 @@ void main() {
     
     if (batchIdx >= ctx.batch_size) return;
     
-    uint elementsPerBatch = ctx.elements_per_batch;
-    uint batchOffset = batchIdx * elementsPerBatch;
-    
-    float tileSquaredError = 0.0;
-    
-    // Each thread processes TILE_SIZE elements within this batch
-    for (uint i = 0; i < TILE_SIZE; i++) {
-        uint localIdx = tid * TILE_SIZE + i;
-        
-        if (localIdx < elementsPerBatch) {
-            uint globalIdx = batchOffset + localIdx;
-            
-            float pred = ctx.predicted_tensor.data.data[globalIdx];
-            float targ = ctx.target_tensor.data.data[globalIdx];
-            float diff = pred - targ;
-            
-            tileSquaredError += diff * diff;
-            
-            // Gradient: 2 * diff / elements_per_batch (for mean within batch)
-            if (ctx.predicted_tensor.requires_grad != 0) {
-                ctx.predicted_tensor.grad.grad[globalIdx] = 2.0 * diff / float(elementsPerBatch);
-            }
-        }
-    }
-    
-    // Reduce within workgroup to get batch loss
-    float batchLoss = blockReduceSum(tileSquaredError);
-    
-    // First thread writes the per-batch loss (mean over batch elements)
-    if (tid == 0) {
-        ctx.loss_tensor.data.data[batchIdx] = batchLoss / float(elementsPerBatch);
-    }
-}
-#endif
-
-// Vectorized batched MSE kernel using vec4
-#ifdef VECTORIZED_BATCHED
-#define VEC_TILE_SIZE 4  // Process 4 vec4s = 16 floats per thread
-
-void main() {
-    MSE_context ctx = push.context.ctx;
-    
-    uint batchIdx = gl_WorkGroupID.z;  // Which batch element
-    uint tid = gl_LocalInvocationID.x;
-    
-    if (batchIdx >= ctx.batch_size) return;
-    
-    uint elementsPerBatch = ctx.elements_per_batch;
+    // Calculate elements per batch: C * H * W
+    uint elementsPerBatch = ctx.channels * ctx.height * ctx.width;
     uint batchOffset = batchIdx * elementsPerBatch;
     uint totalVec4s = elementsPerBatch / 4;
     
     float tileSquaredError = 0.0;
+    float normalizer = (1.0 / float(elementsPerBatch));
     
-    // Each thread processes VEC_TILE_SIZE vec4 elements
+    // Each thread processes VEC_TILE_SIZE vec4 elements (16 floats)
     uint baseVecIdx = tid * VEC_TILE_SIZE;
     
     #pragma unroll
@@ -157,8 +112,7 @@ void main() {
         uint vecIdx = baseVecIdx + i;
         
         if (vecIdx < totalVec4s) {
-            uint localBaseIdx = vecIdx * 4;
-            uint globalBaseIdx = batchOffset + localBaseIdx;
+            uint globalBaseIdx = batchOffset + (vecIdx * 4);
             
             // Vectorized load
             vec4 pred = vec4(
@@ -180,9 +134,9 @@ void main() {
             
             tileSquaredError += squared.x + squared.y + squared.z + squared.w;
             
-            // Compute and write gradients
+            // Compute and write gradients: d(MSE)/d(pred) = 2 * (pred - targ) / N
             if (ctx.predicted_tensor.requires_grad != 0) {
-                vec4 grad = (2.0 * diff / float(elementsPerBatch)) * ctx.batch_size * 10.0f;
+                vec4 grad = 2.0 * diff * normalizer;
                 
                 ctx.predicted_tensor.grad.grad[globalBaseIdx] = grad.x;
                 ctx.predicted_tensor.grad.grad[globalBaseIdx + 1] = grad.y;
@@ -204,7 +158,7 @@ void main() {
         tileSquaredError += diff * diff;
         
         if (ctx.predicted_tensor.requires_grad != 0) {
-            ctx.predicted_tensor.grad.grad[globalIdx] = (2.0 * diff / float(elementsPerBatch)) * ctx.batch_size * 10.0f;
+            ctx.predicted_tensor.grad.grad[globalIdx] = 2.0 * diff * normalizer;
         }
     }
     
@@ -213,59 +167,6 @@ void main() {
     
     // First thread writes the per-batch loss (mean over batch elements)
     if (tid == 0) {
-        ctx.loss_tensor.data.data[batchIdx] = batchLoss / float(elementsPerBatch);
+        ctx.loss_tensor.data.data[batchIdx] = batchLoss * normalizer;
     }
 }
-#endif
-
-// Multi-batch per workgroup kernel (for small batch elements)
-// Each workgroup processes multiple batch elements when elements_per_batch is small
-#ifdef MULTI_BATCH_PER_WG
-void main() {
-    MSE_context ctx = push.context.ctx;
-    
-    uint elementsPerBatch = ctx.elements_per_batch;
-    uint threadsNeeded = (elementsPerBatch + TILE_SIZE - 1) / TILE_SIZE;
-    
-    // Calculate how many batches this workgroup can handle
-    uint batchesPerWG = MAX_WG / threadsNeeded;
-    if (batchesPerWG == 0) batchesPerWG = 1;
-    
-    uint wgBatchStart = gl_WorkGroupID.z * batchesPerWG;
-    uint localBatchIdx = gl_LocalInvocationID.x / threadsNeeded;
-    uint localThreadIdx = gl_LocalInvocationID.x % threadsNeeded;
-    
-    uint batchIdx = wgBatchStart + localBatchIdx;
-    
-    if (batchIdx >= ctx.batch_size) return;
-    
-    uint batchOffset = batchIdx * elementsPerBatch;
-    float tileSquaredError = 0.0;
-    
-    // Each thread processes TILE_SIZE elements
-    for (uint i = 0; i < TILE_SIZE; i++) {
-        uint localIdx = localThreadIdx * TILE_SIZE + i;
-        
-        if (localIdx < elementsPerBatch) {
-            uint globalIdx = batchOffset + localIdx;
-            
-            float pred = ctx.predicted_tensor.data.data[globalIdx];
-            float targ = ctx.target_tensor.data.data[globalIdx];
-            float diff = pred - targ;
-            
-            tileSquaredError += diff * diff;
-            
-            if (ctx.predicted_tensor.requires_grad != 0) {
-                ctx.predicted_tensor.grad.grad[globalIdx] = 2.0 * diff / float(elementsPerBatch);
-            }
-        }
-    }
-    
-    // Reduce within sub-group for this batch
-    // TODO: Implement sub-group reduction per batch
-    // For now, use atomics
-    if (tileSquaredError > 0.0) {
-        atomicAdd(ctx.loss_tensor.data.data[batchIdx], tileSquaredError / float(elementsPerBatch));
-    }
-}
-#endif
