@@ -357,6 +357,17 @@ struct tensor_transposed_conv2d_context {
     uint kernel_type;
 };
 
+struct tensor_upsample_context {
+    tensor_impl input_tensor;   // [B, C, H_in, W_in] shape
+    tensor_impl output_tensor;  // [B, C, H_out, W_out] shape
+    uint batch_size;           // B
+    uint channels;             // C
+    uint height_in;            // H_in
+    uint width_in;             // W_in
+    uint height_out;           // H_out
+    uint width_out;            // W_out
+};
+
 struct tensor_sample_context {
     tensor_impl input_tensor;  // going to be a vector tensor shaped (B, 1, N) [the prob distribution]
     tensor_impl output_tensor; // output tensor (B)
@@ -933,6 +944,10 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/Embedding_table.comp.spv"), alloc, nullptr),
             embedLookupShaderBackward(
                 readShaderBytecode("compiled_shaders/Embedding_table_backward.comp.spv"), alloc, nullptr),
+            upsampleShader(
+                readShaderBytecode("compiled_shaders/Upsample.comp.spv"), alloc, nullptr),
+            upsampleShaderBackward(
+                readShaderBytecode("compiled_shaders/Upsample_backward.comp.spv"), alloc, nullptr),
             conv2dShader3x3(
                 readShaderBytecode("compiled_shaders/Conv2d3x3.comp.spv"), alloc, nullptr),
             conv2dShader3x3Backward(
@@ -2096,6 +2111,43 @@ struct TensorPool {
         }
     }
 
+    void tensor_upsample(const std::string& input_tensor, const std::string& output_tensor, uint32_t mode = 0){
+        auto inp = tensors[input_tensor].get();
+        auto ou = tensors[output_tensor].get();
+
+        if((inp->shape.size() != ou->shape.size()) || inp->shape.size() != 4){
+            throw std::invalid_argument("Can only upsample tensors of shape [B, N, H, W]");
+        }
+
+        tensor_upsample_context uniform;
+        uniform.input_tensor = inp->getTensorImpl();
+        uniform.output_tensor = ou->getTensorImpl();
+        uniform.batch_size = inp->shape[0];
+        uniform.channels = inp->shape[1];
+        uniform.height_in = inp->shape[2];
+        uniform.width_in = inp->shape[3];
+        uniform.height_out = ou->shape[2];
+        uniform.width_out = ou->shape[3];
+        
+        uint32_t numElements = uniform.output_tensor.num_elements;
+
+        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t grpx = cielDiv(numElements, 256u);
+        uint32_t wrkgrp[3] = {grpx, 1, 1};
+
+        tensor_push_const push;
+        if(mode == 0){
+            push.uniformAddress = upsampleShader.uniformBuffer->getBufferAddress();
+            upsampleShader.loadUniform(uniform, push);
+            upsampleShader.execute(wrkgrp);
+        }
+        else{
+            push.uniformAddress = upsampleShaderBackward.uniformBuffer->getBufferAddress();
+            upsampleShaderBackward.loadUniform(uniform, push);
+            upsampleShaderBackward.execute(wrkgrp);
+        }
+    }
+
     // computes output = exp(input)
     Tensor<T>& tensor_exp(const std::string& input_tensor, std::string output_tensor = "", uint32_t mode = 0) {
         logvar_to_std_context uniform{};
@@ -2781,6 +2833,8 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, tensor_layernorm1d_context> layernorm1dShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShader; // computes embedding lookup
     gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShaderBackward;
+    gpuTaskNoDesc<T, tensor_push_const, tensor_upsample_context> upsampleShader; // upsamples image tensors [B, C, H, W]
+    gpuTaskNoDesc<T, tensor_push_const, tensor_upsample_context> upsampleShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, tensor_cmp_context> cmpShader; // compares two tensors for equality
     gpuTaskNoDesc<T, tensor_push_const, mean_context> mean_shader; // compute the mean of a tensor
     gpuTaskNoDesc<T, tensor_push_const, tensor_sample_context> sampleShader; // returns class index of highest probability

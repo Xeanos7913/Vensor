@@ -603,62 +603,149 @@ struct VAE {
 		optim.batch_size = 16;
 		optim.lr = 1e-03;
 
-		auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
-		//auto bn1 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, conv1->output_width, conv1->output_height, 16, "bn1");
-		auto relu1 = std::make_unique<ReLU<float>>(&tensorPool, "relu1");
-		auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2);
-		//auto bn2 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 64, conv2->output_width, conv2->output_height, 16, "bn2");
-		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
-		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
-		auto enc_fc = std::make_unique<Linear<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 512, 16, "enc_fc");
-		
-		fc_mu_relu = ReLU<float>(&tensorPool, "fc_mu_relu");
-		fc_mu = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_mu");
-		fc_logvar_relu = ReLU<float>(&tensorPool, "fc_logvar_relu");
-		fc_logvar = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
+		// ------------------------------
+		// Encoder
+		// ------------------------------
+		auto conv1 = std::make_unique<Conv2d<float>>(
+			&tensorPool, 1, 32, 16,
+			28, 28,
+			4, 4,
+			"conv1",
+			2, 2   // stride
+		);
 
-		auto dec_fc = std::make_unique<Linear<float>>(&tensorPool, latent_dim, 64 * conv2->output_height * conv2->output_width, 16, "dec_fc");
-		//auto bn3 = std::make_unique<BatchNorm1d<float>>(&tensorPool, 64 * conv2->output_height * conv2->output_width, 1, 16, "bn3");
+		auto relu1 = std::make_unique<ReLU<float>>(&tensorPool, "relu1");
+
+		auto conv2 = std::make_unique<Conv2d<float>>(
+			&tensorPool, 32, 64, 16,
+			conv1->output_height, conv1->output_width,
+			4, 4,
+			"conv2",
+			2, 2
+		);
+
+		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
+
+		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
+
+		auto enc_fc = std::make_unique<Linear<float>>(
+			&tensorPool,
+			64 * conv2->output_height * conv2->output_width,
+			512,
+			16,
+			"enc_fc"
+		);
+
+		// mu / logvar heads
+		fc_mu_relu     = ReLU<float>(&tensorPool, "fc_mu_relu");
+		fc_mu          = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_mu");
+		fc_logvar_relu = ReLU<float>(&tensorPool, "fc_logvar_relu");
+		fc_logvar      = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
+
+		// ------------------------------
+		// Decoder (replacing ConvTranspose2d)
+		// ------------------------------
+		auto dec_fc = std::make_unique<Linear<float>>(
+			&tensorPool,
+			latent_dim,
+			64 * conv2->output_height * conv2->output_width,
+			16,
+			"dec_fc"
+		);
+
 		auto relu3 = std::make_unique<ReLU<float>>(&tensorPool, "relu3");
-		auto reshape = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 64, conv2->output_height, conv2->output_width}, "reshape");
-		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 4, 4, "dec_conv1", 2, 2);
-		//auto bn4 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, dec_conv1->output_width, dec_conv1->output_height, 16, "bn4");
+
+		auto reshape = std::make_unique<ShapeTo<float>>(
+			&tensorPool,
+			vec{16, 64, conv2->output_height, conv2->output_width},
+			"reshape"
+		);
+
+		// ---- First Upsample + Conv ----
+		uint32_t up1_h = conv2->output_height * 2;
+		uint32_t up1_w = conv2->output_width  * 2;
+
+		auto upsample1 = std::make_unique<Upsample<float>>(
+			&tensorPool,
+			up1_h,
+			up1_w,
+			"upsample1"
+		);
+
+		auto dec_conv1 = std::make_unique<Conv2d<float>>(
+			&tensorPool,
+			64, 32,
+			16,
+			up1_h, up1_w,
+			3, 3,
+			"dec_conv1",
+			1, 1,   // stride
+			1, 1    // padding
+		);
+
 		auto relu4 = std::make_unique<ReLU<float>>(&tensorPool, "relu4");
-		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2);
-		// Xavier/Glorot initialization for the final layer (followed by TanH)
-		uint32_t fan_in = 32 * 4 * 4;   // in_channels * kernel_h * kernel_w = 512
-		uint32_t fan_out = 1 * 4 * 4;   // out_channels * kernel_h * kernel_w = 16
-		tensorPool.tensor_fill_random(dec_conv2->weight_tensor->name, 2, fan_in, fan_out, 0.0f, 0.0f);
-		//auto bn5 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 1, dec_conv2->output_width, dec_conv2->output_height, 16, "bn5");
+
+		// ---- Second Upsample + Conv ----
+		uint32_t up2_h = up1_h * 2;
+		uint32_t up2_w = up1_w * 2;
+
+		auto upsample2 = std::make_unique<Upsample<float>>(
+			&tensorPool,
+			up2_h,
+			up2_w,
+			"upsample2"
+		);
+
+		auto dec_conv2 = std::make_unique<Conv2d<float>>(
+			&tensorPool,
+			32, 1,
+			16,
+			up2_h, up2_w,
+			3, 3,
+			"dec_conv2",
+			1, 1,
+			1, 1
+		);
+
+		// Xavier for final conv
+		tensorPool.tensor_fill_random(
+			dec_conv2->weight_tensor->name,
+			2,                      // Glorot (uniform or normal mode flag)
+			32 * 3 * 3,             // fan_in
+			1  * 3 * 3,             // fan_out
+			0.0f,
+			0.0f
+		);
+
 		auto tanh = std::make_unique<TanH<float>>(&tensorPool, "tanh");
 
+		// ------------------------------
+		// Build Sequential Networks
+		// ------------------------------
 		enc_conv = Sequential<float>(&tensorPool, "enc");
-
 		enc_conv.addLayer(std::move(conv1));
-		//enc_conv.addLayer(std::move(bn1));
 		enc_conv.addLayer(std::move(relu1));
 		enc_conv.addLayer(std::move(conv2));
-		//enc_conv.addLayer(std::move(bn2));
 		enc_conv.addLayer(std::move(relu2));
 		enc_conv.addLayer(std::move(flatten));
 		enc_conv.addLayer(std::move(enc_fc));
 
 		dec_conv = Sequential<float>(&tensorPool, "dec");
-
 		dec_conv.addLayer(std::move(dec_fc));
-		//dec_conv.addLayer(std::move(bn3));
 		dec_conv.addLayer(std::move(relu3));
 		dec_conv.addLayer(std::move(reshape));
+
+		dec_conv.addLayer(std::move(upsample1));
 		dec_conv.addLayer(std::move(dec_conv1));
-		//dec_conv.addLayer(std::move(bn4));
 		dec_conv.addLayer(std::move(relu4));
+
+		dec_conv.addLayer(std::move(upsample2));
 		dec_conv.addLayer(std::move(dec_conv2));
-		//dec_conv.addLayer(std::move(bn5));
 		dec_conv.addLayer(std::move(tanh));
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
 		kldLoss = KLDloss<float>(&tensorPool, 16, "kld");
-		
+
 		optim.load_tensors(enc_conv);
 		optim.load_tensors(fc_logvar);
 		optim.load_tensors(fc_mu);
@@ -669,20 +756,20 @@ struct VAE {
 		auto h = enc_conv(input);
 
 		auto mu = fc_mu(h);
-		auto logvar = nullptr;//fc_logvar(h);
+		auto logvar = fc_logvar(h);
 
 		return {mu, logvar};
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		//auto &std_tensor = (0.5f * *logvar).exp();
-		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
-		
+		auto &std_tensor = (0.5f * *logvar).exp();
+		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
+	
 		// Use Gaussian/Normal distribution N(0, 1) for VAE reparameterization
 		// init_type=1: Normal distribution with mean=0.0, stddev=1.0
-		//tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
+		tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
 		
-		return &(*mu);
+		return &(*mu + std_tensor * eps_tensor);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -698,9 +785,9 @@ struct VAE {
 	Tensor<float>* loss_function(Tensor<float>* recon, Tensor<float>* x, Tensor<float>* mu, Tensor<float>* logvar) {
 		mseLoss.target = x;
 		auto &ml = *mseLoss(recon);
-		//kldLoss.logvar_tensor = logvar;
-		//kldLoss.mu_tensor = mu;
-		//auto &kld = *kldLoss(x);
+		kldLoss.logvar_tensor = logvar;
+		kldLoss.mu_tensor = mu;
+		auto &kld = *kldLoss(x);
 
 		return &(ml);
 	}

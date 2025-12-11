@@ -926,6 +926,31 @@ struct Conv2d : public Module<T> {
 	}
 };
 
+// Uses Bilinear Interpolation to upsample input to output
+template<typename T>
+struct Upsample : public Module<T>{
+	TensorPool<float>* tensorPool;
+	uint32_t height_out;
+	uint32_t width_out;
+	std::string name;
+	Upsample(TensorPool<float>* tensorPool, uint32_t height_out, uint32_t width_out, const std::string& name) 
+	: tensorPool(tensorPool), height_out(height_out), width_out(width_out), name(name) {}
+	Upsample(){}
+
+	Tensor<T>* forward(Tensor<T>* input) override {
+		if(this->output == nullptr){
+			this->output = &tensorPool->createTensor({input->shape[0], input->shape[1], height_out, width_out}, name + "-output");
+		}
+		tensorPool->tensor_upsample(input->name, this->output->name);
+		this->output->back.push_back([this, input](){
+			this->tensorPool->tensor_upsample(input->name, this->output->name, 1);
+			input->backward();
+		});
+
+		return this->output;
+	}
+};
+
 template<typename T>
 struct TransposedConv2d : public Module<T> {
     Tensor<T>* weight_tensor; // [C_in, C_out, K_h, K_w]

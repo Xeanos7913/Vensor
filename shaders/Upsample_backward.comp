@@ -1,0 +1,122 @@
+#version 460
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_atomic_float : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_KHR_shader_subgroup_shuffle_relative : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_WG 256
+#define WARP_SIZE gl_SubgroupSize
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+struct TensorImpl {
+    tensor_data data;
+    tensor_grad grad;
+    tensor_strides strides;
+    tensor_shape shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct Upsample_context {
+    TensorImpl input_tensor;   // [B, C, H_in, W_in] shape
+    TensorImpl output_tensor;  // [B, C, H_out, W_out] shape
+    uint batch_size;           // B
+    uint channels;             // C
+    uint height_in;            // H_in
+    uint width_in;             // W_in
+    uint height_out;           // H_out
+    uint width_out;            // W_out
+};
+
+layout(buffer_reference, std430, scalar) buffer ContextBuffer {
+    Upsample_context ctx;
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint kernel_type;
+} push;
+
+// Bilinear interpolation upsample backward pass
+void main() {
+    Upsample_context ctx = push.context.ctx;
+    
+    uint global_id = gl_GlobalInvocationID.x;
+    uint total_output = ctx.batch_size * ctx.channels * ctx.height_out * ctx.width_out;
+    
+    if (global_id >= total_output) return;
+    
+    // Decode output coordinates from linear index
+    uint w_out = global_id % ctx.width_out;
+    uint h_out = (global_id / ctx.width_out) % ctx.height_out;
+    uint c = (global_id / (ctx.width_out * ctx.height_out)) % ctx.channels;
+    uint b = global_id / (ctx.width_out * ctx.height_out * ctx.channels);
+    
+    // Calculate scale factors
+    float scale_h = float(ctx.height_in) / float(ctx.height_out);
+    float scale_w = float(ctx.width_in) / float(ctx.width_out);
+    
+    // Map output coordinates to input coordinates (align_corners=False)
+    float h_in = (float(h_out) + 0.5) * scale_h - 0.5;
+    float w_in = (float(w_out) + 0.5) * scale_w - 0.5;
+    
+    // Clamp to valid range
+    h_in = max(0.0, min(h_in, float(ctx.height_in - 1)));
+    w_in = max(0.0, min(w_in, float(ctx.width_in - 1)));
+    
+    // Get integer and fractional parts
+    int h0 = int(floor(h_in));
+    int w0 = int(floor(w_in));
+    int h1 = min(h0 + 1, int(ctx.height_in - 1));
+    int w1 = min(w0 + 1, int(ctx.width_in - 1));
+    
+    float h_lambda = h_in - float(h0);
+    float w_lambda = w_in - float(w0);
+    
+    // Calculate weights for bilinear interpolation
+    float w00 = (1.0 - h_lambda) * (1.0 - w_lambda);
+    float w01 = (1.0 - h_lambda) * w_lambda;
+    float w10 = h_lambda * (1.0 - w_lambda);
+    float w11 = h_lambda * w_lambda;
+    
+    // Get gradient from output
+    float grad_output = ctx.output_tensor.grad.grad[global_id];
+    
+    // Calculate input tensor indices
+    uint base_idx = b * ctx.channels * ctx.height_in * ctx.width_in + 
+                    c * ctx.height_in * ctx.width_in;
+    
+    uint idx_00 = base_idx + uint(h0) * ctx.width_in + uint(w0);
+    uint idx_01 = base_idx + uint(h0) * ctx.width_in + uint(w1);
+    uint idx_10 = base_idx + uint(h1) * ctx.width_in + uint(w0);
+    uint idx_11 = base_idx + uint(h1) * ctx.width_in + uint(w1);
+    
+    // Distribute gradient to input using atomic operations
+    // Each output gradient contributes to 4 input gradients weighted by interpolation coefficients
+    atomicAdd(ctx.input_tensor.grad.grad[idx_00], grad_output * w00);
+    atomicAdd(ctx.input_tensor.grad.grad[idx_01], grad_output * w01);
+    atomicAdd(ctx.input_tensor.grad.grad[idx_10], grad_output * w10);
+    atomicAdd(ctx.input_tensor.grad.grad[idx_11], grad_output * w11);
+}
