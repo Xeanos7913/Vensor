@@ -764,7 +764,7 @@ struct VAE {
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
 		auto &std_tensor = (0.5f * *logvar).exp();
 		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
-	
+		
 		// Use Gaussian/Normal distribution N(0, 1) for VAE reparameterization
 		// init_type=1: Normal distribution with mean=0.0, stddev=1.0
 		tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
