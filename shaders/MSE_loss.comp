@@ -136,7 +136,7 @@ void main() {
             
             // Compute and write gradients: d(MSE)/d(pred) = 2 * (pred - targ) / N
             if (ctx.predicted_tensor.requires_grad != 0) {
-                vec4 grad = 2.0 * diff * normalizer;
+                vec4 grad = 2.0 * diff;
                 
                 ctx.predicted_tensor.grad.grad[globalBaseIdx] = grad.x;
                 ctx.predicted_tensor.grad.grad[globalBaseIdx + 1] = grad.y;
@@ -158,7 +158,7 @@ void main() {
         tileSquaredError += diff * diff;
         
         if (ctx.predicted_tensor.requires_grad != 0) {
-            ctx.predicted_tensor.grad.grad[globalIdx] = 2.0 * diff * normalizer;
+            ctx.predicted_tensor.grad.grad[globalIdx] = 2.0 * diff;
         }
     }
     

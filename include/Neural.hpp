@@ -359,10 +359,39 @@ struct MSEloss : public Module<T> {
 	// forward already handles gradient computation directly
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(target == nullptr) throw std::runtime_error("Target tensor for MSE loss not set!");
+
+		// If shapes differ, allow it only when total element counts are equal (views).
+		if (input->shape != target->shape) {
+			auto prod = [](const std::vector<uint32_t>& s) -> uint64_t {
+				uint64_t p = 1;
+				for (auto v : s) p *= v;
+				return p;
+			};
+			uint64_t in_elems = prod(input->shape);
+			uint64_t target_elems = prod(target->shape);
+			if (in_elems != target_elems) {
+				throw std::invalid_argument("Input tensor shape is not compatible with target for MSE loss");
+			}
+
+			// Temporarily view input to match target shape for kernel call, then restore original shape.
+			auto orig_shape = input->shape;
+			input->view(target->shape);
+			tensorPool->mse_loss(input->name, target->name, this->output->name);
+			input->view(orig_shape);
+			this->output->back.push_back([input](){
+				input->backward();
+			});
+
+			return this->output;
+		}
+
+		// Shapes equal: normal path
 		tensorPool->mse_loss(input->name, target->name, this->output->name);
+
 		this->output->back.push_back([input](){
 			input->backward();
 		});
+
 		return this->output;
 	}
 };
@@ -788,7 +817,7 @@ struct Conv2d3x3 : public Module<T> {
 
 		tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
 		this->output->back.push_back([this, input](){
-			this->tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
+			this->tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
 			input->backward();
 		});
 		

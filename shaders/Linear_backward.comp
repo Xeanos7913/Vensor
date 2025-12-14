@@ -18,6 +18,10 @@
 #define NUM_THREADS 256
 #define WARPSIZE 32
 
+// Kernel type constants
+#define KERNEL_INPUT_GRAD 0
+#define KERNEL_WEIGHT_GRAD 1
+
 layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, scalar) buffer tensor_data {
@@ -54,6 +58,7 @@ struct LinearContext {
     uint m, n, k;
     uint accumulate_grad;
     uint use_bias;
+    uint kernel_type;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
@@ -81,113 +86,6 @@ uint off2or3(const TensorImpl t, uint b, uint i, uint j)
         return i * t.strides.strides[0] + j * t.strides.strides[1];
     } else {
         return b * t.strides.strides[0] + i * t.strides.strides[1] + j * t.strides.strides[2];
-    }
-}
-
-// ========================================================================
-// Step 1: Apply ReLU derivative to output gradients (warp-tiled)
-// ========================================================================
-void applyReLUDerivative(uint B, uint M, uint N) {
-    LinearContext c = push.context.ctx;
-    
-    const uint cRow = gl_WorkGroupID.y;
-    const uint cCol = gl_WorkGroupID.x;
-    const uint batch = gl_WorkGroupID.z;
-    
-    const uint warpIdx = gl_LocalInvocationID.x / WARPSIZE;
-    const uint warpCol = warpIdx % (BN / WN);
-    const uint warpRow = warpIdx / (BN / WN);
-    
-    const uint threadIdxInWarp = gl_LocalInvocationID.x % WARPSIZE;
-    const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
-    const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
-    
-    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
-        for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
-            for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-                for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-                    uint globalRow = cRow * BM + warpRow * WM + wSubRowIdx * WSUBM + 
-                                    threadRowInWarp * TM + resIdxM;
-                    uint globalCol = cCol * BN + warpCol * WN + wSubColIdx * WSUBN + 
-                                    threadColInWarp * TN + resIdxN;
-                    
-                    if (globalRow < M && globalCol < N && batch < B) {
-                        uint idxOut = off2or3(c.out_tensor, batch, globalRow, globalCol);
-                        float output_val = c.out_tensor.data.data[idxOut];
-                        float grad_val = c.out_tensor.grad.grad[idxOut];
-                        
-                        c.out_tensor.grad.grad[idxOut] = (output_val > 0.0) ? grad_val : 0.0;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ========================================================================
-// Helper: Load from global memory with vectorization
-// ========================================================================
-void loadFromGmemTransposed(uint M, uint N, uint K, uint startIdx, uint batch,
-                            uint innerRowA, uint innerColA, uint innerRowB, uint innerColB,
-                            uint actualBatchA, uint actualBatchB,
-                            bool loadA, bool loadB)
-{
-    LinearContext c = push.context.ctx;
-    const uint rowStrideA = (NUM_THREADS * 4) / BK;
-    const uint rowStrideB = NUM_THREADS / (BN / 4);
-    
-    if (loadA) {
-        // Load matrix A with vectorization and transpose
-        for (uint offset = 0; offset < BM; offset += rowStrideA) {
-            uint globalRow = gl_WorkGroupID.y * BM + innerRowA + offset;
-            uint globalCol = startIdx + innerColA * 4;
-            
-            vec4 tmp = vec4(0.0);
-            if (globalRow < M && globalCol < N) {
-                uint idx0 = off2or3(c.out_tensor, batch, globalRow, globalCol);
-                tmp.x = c.out_tensor.grad.grad[idx0];
-                if (globalCol + 1 < N) tmp.y = c.out_tensor.grad.grad[idx0 + 1];
-                if (globalCol + 2 < N) tmp.z = c.out_tensor.grad.grad[idx0 + 2];
-                if (globalCol + 3 < N) tmp.w = c.out_tensor.grad.grad[idx0 + 3];
-            }
-            
-            As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
-            As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
-            As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
-            As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
-        }
-    }
-    
-    if (loadB) {
-        // Load matrix B with vectorization
-        for (uint offset = 0; offset < BK; offset += rowStrideB) {
-            uint globalRow = startIdx + innerRowB + offset;
-            uint globalCol = gl_WorkGroupID.x * BN + innerColB * 4;
-            
-            vec4 tmp = vec4(0.0);
-            if (globalRow < N && globalCol < K) {
-                uint baseIdx = off2or3(c.weight_tensor, actualBatchB, globalRow, globalCol);
-                tmp.x = c.weight_tensor.data.data[baseIdx];
-                if (globalCol + 1 < K) {
-                    uint idx1 = off2or3(c.weight_tensor, actualBatchB, globalRow, globalCol + 1);
-                    tmp.y = c.weight_tensor.data.data[idx1];
-                }
-                if (globalCol + 2 < K) {
-                    uint idx2 = off2or3(c.weight_tensor, actualBatchB, globalRow, globalCol + 2);
-                    tmp.z = c.weight_tensor.data.data[idx2];
-                }
-                if (globalCol + 3 < K) {
-                    uint idx3 = off2or3(c.weight_tensor, actualBatchB, globalRow, globalCol + 3);
-                    tmp.w = c.weight_tensor.data.data[idx3];
-                }
-            }
-            
-            uint smemIdx = (innerRowB + offset) * BN + innerColB * 4;
-            Bs[smemIdx + 0] = tmp.x;
-            Bs[smemIdx + 1] = tmp.y;
-            Bs[smemIdx + 2] = tmp.z;
-            Bs[smemIdx + 3] = tmp.w;
-        }
     }
 }
 
@@ -234,12 +132,12 @@ void processFromSmem(inout float threadResults[WMITER * TM * WNITER * TN],
 }
 
 // ========================================================================
-// Step 2: Compute dInput = dOutput @ Weight (warp-tiled)
+// Kernel 1: Compute dInput = dOutput @ Weight^T and dBias
 // dInput: [B, M, K]
-// dOutput: [B, M, N] (with ReLU derivative applied)
-// Weight: [B, N, K] (stored transposed)
+// dOutput: [B, M, N]
+// Weight: [B, N, K] (stored transposed, so we read as K, N)
 // ========================================================================
-void computeInputGradient(uint B, uint M, uint N, uint K) {
+void computeInputAndBiasGradient(uint B, uint M, uint N, uint K) {
     LinearContext c = push.context.ctx;
     
     const uint cRow = gl_WorkGroupID.y;
@@ -266,15 +164,67 @@ void computeInputGradient(uint B, uint M, uint N, uint K) {
     const uint innerRowB = gl_LocalInvocationID.x / (BN / 4);
     const uint innerColB = gl_LocalInvocationID.x % (BN / 4);
     
+    const uint rowStrideA = (NUM_THREADS * 4) / BK;
+    const uint rowStrideB = NUM_THREADS / (BN / 4);
+    
     float threadResults[WMITER * TM * WNITER * TN];
     for (uint i = 0; i < WMITER * TM * WNITER * TN; ++i) {
         threadResults[i] = 0.0;
     }
     
-    // Tile across N dimension
+    // Tile across N dimension (reduction dimension for dInput computation)
     for (uint nIdx = 0; nIdx < N; nIdx += BK) {
-        loadFromGmemTransposed(M, N, K, nIdx, batch, innerRowA, innerColA, innerRowB, innerColB,
-                               actualInputBatch, actualWeightBatch, true, true);
+        // Load dOutput: tile_A[m, n] transposed to [n, m] in shared memory
+        for (uint offset = 0; offset < BM; offset += rowStrideA) {
+            uint globalRow = cRow * BM + innerRowA + offset;  // M dimension
+            uint globalCol = nIdx + innerColA * 4;             // N dimension
+            
+            vec4 tmp = vec4(0.0);
+            if (globalRow < M && globalCol < N && batch < B) {
+                uint idx0 = off2or3(c.out_tensor, batch, globalRow, globalCol);
+                tmp.x = c.out_tensor.grad.grad[idx0];
+                if (globalCol + 1 < N) tmp.y = c.out_tensor.grad.grad[idx0 + 1];
+                if (globalCol + 2 < N) tmp.z = c.out_tensor.grad.grad[idx0 + 2];
+                if (globalCol + 3 < N) tmp.w = c.out_tensor.grad.grad[idx0 + 3];
+            }
+            
+            // Store transposed: As[n][m]
+            As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
+            As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
+            As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
+            As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
+        }
+        
+        // Load Weight: tile_B[n, k]
+        for (uint offset = 0; offset < BK; offset += rowStrideB) {
+            uint globalRow = nIdx + innerRowB + offset;       // N dimension
+            uint globalCol = cCol * BN + innerColB * 4;       // K dimension
+            
+            vec4 tmp = vec4(0.0);
+            if (globalRow < N && globalCol < K) {
+                uint baseIdx = off2or3(c.weight_tensor, actualWeightBatch, globalRow, globalCol);
+                tmp.x = c.weight_tensor.data.data[baseIdx];
+                if (globalCol + 1 < K) {
+                    uint idx1 = off2or3(c.weight_tensor, actualWeightBatch, globalRow, globalCol + 1);
+                    tmp.y = c.weight_tensor.data.data[idx1];
+                }
+                if (globalCol + 2 < K) {
+                    uint idx2 = off2or3(c.weight_tensor, actualWeightBatch, globalRow, globalCol + 2);
+                    tmp.z = c.weight_tensor.data.data[idx2];
+                }
+                if (globalCol + 3 < K) {
+                    uint idx3 = off2or3(c.weight_tensor, actualWeightBatch, globalRow, globalCol + 3);
+                    tmp.w = c.weight_tensor.data.data[idx3];
+                }
+            }
+            
+            uint smemIdx = (innerRowB + offset) * BN + innerColB * 4;
+            Bs[smemIdx + 0] = tmp.x;
+            Bs[smemIdx + 1] = tmp.y;
+            Bs[smemIdx + 2] = tmp.z;
+            Bs[smemIdx + 3] = tmp.w;
+        }
+        
         barrier();
         
         processFromSmem(threadResults, warpRow, warpCol, threadRowInWarp, threadColInWarp);
@@ -307,10 +257,76 @@ void computeInputGradient(uint B, uint M, uint N, uint K) {
             }
         }
     }
+    
+    // Compute bias gradient if needed (simple reduction)
+    if (c.use_bias == 1u) {
+        for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+            for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+                for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+                    for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                        uint globalRow = cRow * BM + warpRow * WM + wSubRowIdx * WSUBM + 
+                                        threadRowInWarp * TM + resIdxM;
+                        uint globalCol = cCol * BN + warpCol * WN + wSubColIdx * WSUBN + 
+                                        threadColInWarp * TN + resIdxN;
+                        
+                        if (globalRow < M && globalCol < N && batch < B) {
+                            uint idxOut = off2or3(c.out_tensor, batch, globalRow, globalCol);
+                            float grad_val = c.out_tensor.grad.grad[idxOut];
+                            
+                            uint biasIdx = globalCol;  // Bias is 1D [N]
+                            
+                            if (c.accumulate_grad == 0u && batch == 0u && globalRow == 0u) {
+                                c.bias_tensor.grad.grad[biasIdx] = grad_val;
+                            } else {
+                                atomicAdd(c.bias_tensor.grad.grad[biasIdx], grad_val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void applyReLUDerivative(uint B, uint M, uint N) {
+    LinearContext c = push.context.ctx;
+    
+    const uint cRow = gl_WorkGroupID.y;
+    const uint cCol = gl_WorkGroupID.x;
+    const uint batch = gl_WorkGroupID.z;
+    
+    const uint warpIdx = gl_LocalInvocationID.x / WARPSIZE;
+    const uint warpCol = warpIdx % (BN / WN);
+    const uint warpRow = warpIdx / (BN / WN);
+    
+    const uint threadIdxInWarp = gl_LocalInvocationID.x % WARPSIZE;
+    const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
+    const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
+    
+    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+        for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+            for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+                for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                    uint globalRow = cRow * BM + warpRow * WM + wSubRowIdx * WSUBM + 
+                                    threadRowInWarp * TM + resIdxM;
+                    uint globalCol = cCol * BN + warpCol * WN + wSubColIdx * WSUBN + 
+                                    threadColInWarp * TN + resIdxN;
+                    
+                    if (globalRow < M && globalCol < N && batch < B) {
+                        uint idxOut = off2or3(c.out_tensor, batch, globalRow, globalCol);
+                        float output_val = c.out_tensor.data.data[idxOut];
+                        float grad_val = c.out_tensor.grad.grad[idxOut];
+                        
+                        c.out_tensor.grad.grad[idxOut] = (output_val > 0.0) ? grad_val : 0.0;
+                    }
+                }
+            }
+        }
+    }
 }
 
 // ========================================================================
-// Step 3: Compute dWeight = Input^T @ dOutput (warp-tiled)
+// Kernel 2: Compute dWeight = Input^T @ dOutput
 // dWeight: [B, N, K] (stored transposed)
 // Input: [B, M, K]
 // dOutput: [B, M, N]
@@ -342,13 +358,13 @@ void computeWeightGradient(uint B, uint M, uint N, uint K) {
     const uint innerRowB = gl_LocalInvocationID.x / (BN / 4);
     const uint innerColB = gl_LocalInvocationID.x % (BN / 4);
     
+    const uint rowStrideA = (NUM_THREADS * 4) / BK;
+    const uint rowStrideB = NUM_THREADS / (BN / 4);
+    
     float threadResults[WMITER * TM * WNITER * TN];
     for (uint i = 0; i < WMITER * TM * WNITER * TN; ++i) {
         threadResults[i] = 0.0;
     }
-    
-    const uint rowStrideA = (NUM_THREADS * 4) / BK;
-    const uint rowStrideB = NUM_THREADS / (BN / 4);
     
     // Tile across M dimension (reduction)
     for (uint mIdx = 0; mIdx < M; mIdx += BK) {
@@ -361,9 +377,18 @@ void computeWeightGradient(uint B, uint M, uint N, uint K) {
             if (doutRow < M && doutCol < N && batch < B) {
                 uint idx0 = off2or3(c.out_tensor, batch, doutRow, doutCol);
                 tmp.x = c.out_tensor.grad.grad[idx0];
-                if (doutRow + 1 < M) tmp.y = c.out_tensor.grad.grad[idx0 + c.out_tensor.strides.strides[c.out_tensor.ndim - 2]];
-                if (doutRow + 2 < M) tmp.z = c.out_tensor.grad.grad[idx0 + 2 * c.out_tensor.strides.strides[c.out_tensor.ndim - 2]];
-                if (doutRow + 3 < M) tmp.w = c.out_tensor.grad.grad[idx0 + 3 * c.out_tensor.strides.strides[c.out_tensor.ndim - 2]];
+                if (doutRow + 1 < M) {
+                    uint idx1 = off2or3(c.out_tensor, batch, doutRow + 1, doutCol);
+                    tmp.y = c.out_tensor.grad.grad[idx1];
+                }
+                if (doutRow + 2 < M) {
+                    uint idx2 = off2or3(c.out_tensor, batch, doutRow + 2, doutCol);
+                    tmp.z = c.out_tensor.grad.grad[idx2];
+                }
+                if (doutRow + 3 < M) {
+                    uint idx3 = off2or3(c.out_tensor, batch, doutRow + 3, doutCol);
+                    tmp.w = c.out_tensor.grad.grad[idx3];
+                }
             }
             
             As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
@@ -436,70 +461,6 @@ void computeWeightGradient(uint B, uint M, uint N, uint K) {
     }
 }
 
-// ========================================================================
-// Step 4: Compute dBias (warp-tiled)
-// ========================================================================
-void computeBiasGradient(uint B, uint M, uint N) {
-    LinearContext c = push.context.ctx;
-    
-    if (c.use_bias == 0u) return;
-    
-    const uint cRow = gl_WorkGroupID.y;
-    const uint cCol = gl_WorkGroupID.x;
-    const uint batch = gl_WorkGroupID.z;
-    
-    const uint warpIdx = gl_LocalInvocationID.x / WARPSIZE;
-    const uint warpCol = warpIdx % (BN / WN);
-    const uint warpRow = warpIdx / (BN / WN);
-    
-    const uint threadIdxInWarp = gl_LocalInvocationID.x % WARPSIZE;
-    const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
-    const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
-    
-    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
-        for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
-            for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
-                for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
-                    uint globalRow = cRow * BM + warpRow * WM + wSubRowIdx * WSUBM + 
-                                    threadRowInWarp * TM + resIdxM;
-                    uint globalCol = cCol * BN + warpCol * WN + wSubColIdx * WSUBN + 
-                                    threadColInWarp * TN + resIdxN;
-                    
-                    if (globalRow < M && globalCol < N && batch < B) {
-                        uint idxOut = off2or3(c.out_tensor, batch, globalRow, globalCol);
-                        float grad_val = c.out_tensor.grad.grad[idxOut];
-                        
-                        uint biasIdx = off2or3(c.bias_tensor, 0u, globalRow, globalCol);
-                        
-                        if (c.accumulate_grad == 0u) {
-                            c.bias_tensor.grad.grad[biasIdx] = grad_val;
-                        } else {
-                            atomicAdd(c.bias_tensor.grad.grad[biasIdx], grad_val);
-                        }
-                        //c.out_tensor.grad.grad[idxOut] = 0.0f; // make sure to zero out the upstream gradient after all calculations are done
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ========================================================================
-// Main backward pass function
-// ========================================================================
-void backward(uint B, uint M, uint N, uint K) {
-    applyReLUDerivative(B, M, N);
-    barrier();
-    
-    computeInputGradient(B, M, N, K);
-    barrier();
-    
-    computeWeightGradient(B, M, N, K);
-    barrier();
-    
-    computeBiasGradient(B, M, N);
-}
-
 void main() {
     LinearContext c = push.context.ctx;
     uint B = max(c.batch_size, 1u);
@@ -507,5 +468,10 @@ void main() {
     uint N = c.n;
     uint K = c.k;
 
-    backward(B, M, N, K);
+    if (c.kernel_type == KERNEL_INPUT_GRAD) {
+        applyReLUDerivative(B, M, N);
+        computeInputAndBiasGradient(B, M, N, K);
+    } else if (c.kernel_type == KERNEL_WEIGHT_GRAD) {
+        computeWeightGradient(B, M, N, K);
+    }
 }

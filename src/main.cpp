@@ -359,6 +359,37 @@ int main(void){
 }
 */
 
+// Linear test
+/*
+int main(void){
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
+
+	{
+		TensorPool<float> pool(allocator);
+
+		//auto l = Linear<float>(&pool, 28 * 28, 512, 16, "l");
+		auto l2 = Linear<float>(&pool, 512, 28 * 28, 16, "l2");
+
+		auto m = MSEloss<float>(&pool, 1, "m");
+
+		auto &i = pool.createTensor({16, 1, 512}, "i");
+		auto &t = pool.createTensor({16, 1, 28 * 28}, "t");
+		pool.tensor_fill_random("i", 0, 0.0f, 0.0f, -1.0f, 1.0f);
+		pool.tensor_fill_random("t", 0, 0.0f, 0.0f, -1.0f, 1.0f);
+		
+		m.target = &t;
+		auto o = m(l2((&i)));
+		o->backward();
+		l2.weights->printGradient();
+	}
+
+	delete allocator;
+	return 0;
+}
+*/
+
 // Layernorm test
 /*
 int main(void) {
@@ -589,139 +620,65 @@ struct VAE {
 
 	SDGoptim<float> optim;
 
-	uint32_t latent_dim = 64;
+	uint32_t latent_dim = 256;
 
 	std::unique_ptr<MNISTDataloader<float>> dataLoader;
 
 	VAE(Allocator* allocator) : allocator(allocator) {
-
 		tensorPool = TensorPool<float>(allocator);
-
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
-
 		optim = SDGoptim<float>(allocator);
 		optim.batch_size = 16;
 		optim.lr = 1e-03;
 
-		// ------------------------------
-		// Encoder
-		// ------------------------------
 		auto conv1 = std::make_unique<Conv2d<float>>(
-			&tensorPool, 1, 32, 16,
-			28, 28,
-			4, 4,
-			"conv1",
-			2, 2   // stride
+			&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2
 		);
-
 		auto relu1 = std::make_unique<ReLU<float>>(&tensorPool, "relu1");
-
+		
 		auto conv2 = std::make_unique<Conv2d<float>>(
-			&tensorPool, 32, 64, 16,
-			conv1->output_height, conv1->output_width,
-			4, 4,
-			"conv2",
-			2, 2
+			&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2
 		);
-
 		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
-
+		
 		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
-
+		
 		auto enc_fc = std::make_unique<Linear<float>>(
-			&tensorPool,
-			64 * conv2->output_height * conv2->output_width,
-			512,
-			16,
-			"enc_fc"
+			&tensorPool, 64 * conv2->output_height * conv2->output_width, 512, 16, "enc_fc"
 		);
 
-		// mu / logvar heads
-		fc_mu_relu     = ReLU<float>(&tensorPool, "fc_mu_relu");
-		fc_mu          = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_mu");
+		fc_mu_relu = ReLU<float>(&tensorPool, "fc_mu_relu");
+		fc_mu = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_mu");
 		fc_logvar_relu = ReLU<float>(&tensorPool, "fc_logvar_relu");
-		fc_logvar      = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
+		fc_logvar = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
 
-		// ------------------------------
-		// Decoder (replacing ConvTranspose2d)
-		// ------------------------------
 		auto dec_fc = std::make_unique<Linear<float>>(
-			&tensorPool,
-			latent_dim,
-			64 * conv2->output_height * conv2->output_width,
-			16,
-			"dec_fc"
+			&tensorPool, latent_dim, 64 * conv2->output_height * conv2->output_width, 16, "dec_fc"
 		);
-
 		auto relu3 = std::make_unique<ReLU<float>>(&tensorPool, "relu3");
-
+		
 		auto reshape = std::make_unique<ShapeTo<float>>(
-			&tensorPool,
-			vec{16, 64, conv2->output_height, conv2->output_width},
-			"reshape"
+			&tensorPool, vec{16, 64, conv2->output_height, conv2->output_width}, "reshape"
 		);
-
-		// ---- First Upsample + Conv ----
-		uint32_t up1_h = conv2->output_height * 2;
-		uint32_t up1_w = conv2->output_width  * 2;
-
-		auto upsample1 = std::make_unique<Upsample<float>>(
-			&tensorPool,
-			up1_h,
-			up1_w,
-			"upsample1"
+		
+		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(
+			&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 4, 4, "dec_conv1", 2, 2
 		);
-
-		auto dec_conv1 = std::make_unique<Conv2d<float>>(
-			&tensorPool,
-			64, 32,
-			16,
-			up1_h, up1_w,
-			3, 3,
-			"dec_conv1",
-			1, 1,   // stride
-			1, 1    // padding
-		);
-
 		auto relu4 = std::make_unique<ReLU<float>>(&tensorPool, "relu4");
-
-		// ---- Second Upsample + Conv ----
-		uint32_t up2_h = up1_h * 2;
-		uint32_t up2_w = up1_w * 2;
-
-		auto upsample2 = std::make_unique<Upsample<float>>(
-			&tensorPool,
-			up2_h,
-			up2_w,
-			"upsample2"
+		
+		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(
+			&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2
 		);
 
-		auto dec_conv2 = std::make_unique<Conv2d<float>>(
-			&tensorPool,
-			32, 1,
-			16,
-			up2_h, up2_w,
-			3, 3,
-			"dec_conv2",
-			1, 1,
-			1, 1
-		);
-
-		// Xavier for final conv
+		// Xavier/Glorot initialization for the final layer (followed by TanH)
+		uint32_t fan_in = 32 * 4 * 4;   // in_channels * kernel_h * kernel_w = 512
+		uint32_t fan_out = 1 * 4 * 4;   // out_channels * kernel_h * kernel_w = 16
 		tensorPool.tensor_fill_random(
-			dec_conv2->weight_tensor->name,
-			2,                      // Glorot (uniform or normal mode flag)
-			32 * 3 * 3,             // fan_in
-			1  * 3 * 3,             // fan_out
-			0.0f,
-			0.0f
+			dec_conv2->weight_tensor->name, 2, fan_in, fan_out, 0.0f, 0.0f
 		);
 
 		auto tanh = std::make_unique<TanH<float>>(&tensorPool, "tanh");
 
-		// ------------------------------
-		// Build Sequential Networks
-		// ------------------------------
 		enc_conv = Sequential<float>(&tensorPool, "enc");
 		enc_conv.addLayer(std::move(conv1));
 		enc_conv.addLayer(std::move(relu1));
@@ -734,12 +691,8 @@ struct VAE {
 		dec_conv.addLayer(std::move(dec_fc));
 		dec_conv.addLayer(std::move(relu3));
 		dec_conv.addLayer(std::move(reshape));
-
-		dec_conv.addLayer(std::move(upsample1));
 		dec_conv.addLayer(std::move(dec_conv1));
 		dec_conv.addLayer(std::move(relu4));
-
-		dec_conv.addLayer(std::move(upsample2));
 		dec_conv.addLayer(std::move(dec_conv2));
 		dec_conv.addLayer(std::move(tanh));
 
@@ -756,20 +709,20 @@ struct VAE {
 		auto h = enc_conv(input);
 
 		auto mu = fc_mu(h);
-		auto logvar = fc_logvar(h);
+		auto logvar = nullptr;//fc_logvar(h);
 
 		return {mu, logvar};
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		auto &std_tensor = (0.5f * *logvar).exp();
-		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
+		//auto &std_tensor = (0.01f * *logvar).exp();
+		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		
 		// Use Gaussian/Normal distribution N(0, 1) for VAE reparameterization
 		// init_type=1: Normal distribution with mean=0.0, stddev=1.0
-		tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
+		//tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
 		
-		return &(*mu + std_tensor * eps_tensor);
+		return &(*mu);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -785,9 +738,9 @@ struct VAE {
 	Tensor<float>* loss_function(Tensor<float>* recon, Tensor<float>* x, Tensor<float>* mu, Tensor<float>* logvar) {
 		mseLoss.target = x;
 		auto &ml = *mseLoss(recon);
-		kldLoss.logvar_tensor = logvar;
-		kldLoss.mu_tensor = mu;
-		auto &kld = *kldLoss(x);
+		//kldLoss.logvar_tensor = logvar;
+		//kldLoss.mu_tensor = mu;
+		//auto &kld = *kldLoss(x);
 
 		return &(ml);
 	}
@@ -801,9 +754,12 @@ struct VAE {
 		Tensor<float>* loss = nullptr;
 		Tensor<float>* recon = nullptr;
 		progressbar bar(100, true, std::cout);
-		for(int i = 0; i < dataLoader->num_batches; i++){
-			auto* input = dataLoader->imagesBatchTensors[i];
-			
+		for(int i = 0; i < dataLoader->num_batches - 99; i++){
+			//auto* input = dataLoader->imagesBatchTensors[i];
+
+			auto* input = &tensorPool.createTensor({16, 1, 28, 28}, "in");
+			tensorPool.tensor_fill_random("in", 0, .0f, .0f, -1.0f, 1.0f);
+
 			auto [mu, logvar] = encode(input);
 			auto z = reparameterize(mu, logvar);
 			recon = decode(z);
@@ -811,6 +767,9 @@ struct VAE {
 			loss = loss_function(recon, input, mu, logvar);
 			
 			loss->backward();
+
+			//dynamic_cast<Linear<float>*>(dec_conv.layers[2].get())->weights->printGradient();
+			input->printGradient();
 
 			optim.step();
 			tensorPool.zero_out_all_grads();
@@ -824,10 +783,12 @@ struct VAE {
 
 		std::cout << " epoch loss: " << l << "\n";
 		std::cout << " epoch " << epoch << " time: " << elapsed_ms << " ms\n";
+		auto s = recon->shape;
+		recon->view({16, 1, 28, 28});
 		write_tensor_image_png(recon, "recon_" + std::to_string(epoch) + ".png");
+		recon->view(s);
 	}
 };
-
 
 int main(void){
 	
@@ -838,7 +799,7 @@ int main(void){
 	{
 		VAE vae = VAE(allocator);
 
-		for(int i = 0; i < 100; i++){
+		for(int i = 0; i < 100 - 99; i++){
 			vae.train(i);
 		}
 	}
@@ -846,7 +807,6 @@ int main(void){
 	delete allocator;
 	return 0;
 }
-
 
 /*
 int main(void){
@@ -888,7 +848,6 @@ int main(void){
 struct Trainer {
 	
 	// Vulkan stuff:
-	Init init;
 	Allocator* allocator; // need to use heap-allocated allocator for it to work. I don't actually know why this is the case.
 
 	// Data prep:
@@ -902,9 +861,7 @@ struct Trainer {
 	SDGoptim<float> optim;
 
 	// Ctor:
-	Trainer() {
-		device_initialization(init);
-		allocator = new Allocator(&init);
+	Trainer(Allocator* allocator) : allocator(allocator){
 		tensorPool = TensorPool<float>(allocator);
 
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
@@ -935,7 +892,7 @@ struct Trainer {
 			sequence.addLayer(std::make_unique<BatchNorm2d<float>>(&tensorPool, 5, out_w2, out_h2, 16, "bn2"));
 
 			// remaining layers can be constructed inline using conv2 output dims
-			sequence.addLayer(std::make_unique<FlattenTo1d<float>>(&tensorPool, "f"));
+			//sequence.addLayer(std::make_unique<FlattenTo1d<float>>(&tensorPool, "f"));
 			sequence.addLayer(std::make_unique<Linear<float>>(&tensorPool, 5 * out_w2 * out_h2, 1024, 16, "linear1"));
 			sequence.addLayer(std::make_unique<Layernorm<float>>(&tensorPool, vec{16, 1, 1024}, vec{1, 1024}, "ln1"));
 			sequence.addLayer(std::make_unique<ReLU<float>>(&tensorPool, "relu1"));
@@ -950,7 +907,7 @@ struct Trainer {
 
 		Tensor<float>* input;
 		progressbar bar(100, true, std::cout);
-		for (uint32_t i = 0; i < dataLoader->num_batches; i++){
+		for (uint32_t i = 0; i < dataLoader->num_batches - 99; i++){
 			input = dataLoader->imagesBatchTensors[i];
 			sequence.forward(input);
 			softmax->target = dataLoader->labelTensors[i];
@@ -958,6 +915,8 @@ struct Trainer {
 			
 			loss->backward();
 			
+			dynamic_cast<Conv2d<float>*>(sequence.layers[0].get())->weight_tensor->printGradient();
+
 			optim.step();
 			tensorPool.zero_out_all_grads();
 			bar.update();
@@ -992,21 +951,26 @@ struct Trainer {
 		load_stream.close();
 	}
 
-	~Trainer(){
-		delete allocator;
-	}
 };
 
 /*
 int main(void){
 	
-	Trainer t = Trainer();
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
 
-	for (int i = 0; i < 60; i++){
-		t.train_epoch(i);
-		//t.test_epoch();
+	{
+		Trainer t = Trainer(allocator);
+
+		for (int i = 0; i < 60 - 59; i++){
+			t.train_epoch(i);
+			//t.test_epoch();
+		}
+		t.save_model();
 	}
-	t.save_model();
+
+	delete allocator;
 
 	return 0;
 }
