@@ -1,33 +1,29 @@
-#version 460
+#version 450
 #extension GL_ARB_separate_shader_objects : enable
 #extension GL_EXT_buffer_reference : enable
 #extension GL_EXT_buffer_reference_uvec2 : enable
 #extension GL_EXT_scalar_block_layout : enable
 #extension GL_KHR_shader_subgroup_basic : enable
-#extension GL_KHR_shader_subgroup_shuffle : enable
-#extension GL_KHR_shader_subgroup_arithmetic : enable
-#extension GL_EXT_control_flow_attributes : enable
 
-// Workgroup configuration - matches CUDA's thread block
-#define TILE 16
-#define OUT_TILE_X 2
-#define OUT_TILE_Y 2
-#define THREADS_X (TILE / OUT_TILE_X)
-#define THREADS_Y (TILE / OUT_TILE_Y)
+// Warp-tiling parameters (matching CUDA kernel structure)
+#define BM 128      // Block tile size M
+#define BN 128      // Block tile size N
+#define BK 8        // Block tile size K
+#define WM 64       // Warp tile size M
+#define WN 32       // Warp tile size N
+#define WNITER 2    // Number of subwarp tiling steps in N dimension
+#define TM 8        // Thread tile size M
+#define TN 4        // Thread tile size N
+#define NUM_THREADS 256
 
-// Conservative maximums for shared memory allocation
-#define MAX_KERNEL_SIZE 10  // Supports up to 10x10 kernels
-#define MAX_PAD 3           // Maximum padding supported
-#define MAX_DILATION 3      // Maximum dilation supported
-#define MAX_STRIDE 4        // Maximum stride supported
+#define WARPSIZE 32
 
-// For transposed conv, input is smaller and output is larger
-// Shared memory holds the smaller input tile
-#define SHARED_H_MAX (TILE + MAX_PAD * 2)
-#define SHARED_W_MAX (TILE + MAX_PAD * 2)
-#define SHARED_W_PAD (SHARED_W_MAX + 1)  // +1 to avoid bank conflicts
+// Calculated constants
+const uint WMITER = (WM * WN) / (WARPSIZE * TM * TN * WNITER);  // 2
+const uint WSUBM = WM / WMITER;  // 32
+const uint WSUBN = WN / WNITER;  // 16
 
-layout(local_size_x = THREADS_X, local_size_y = THREADS_Y, local_size_z = 1) in;
+layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
 
 layout(buffer_reference, std430, scalar) buffer tensor_data {
     float data[];
@@ -46,246 +42,353 @@ layout(buffer_reference, std430, scalar) buffer tensor_shape {
 };
 
 struct TensorImpl {
-    tensor_data data;
-    tensor_grad grad;
+    tensor_data    data;
+    tensor_grad    grad;
     tensor_strides strides;
-    tensor_shape shape;
+    tensor_shape   shape;
     uint numel, ndim, requires_grad, is_leaf;
 };
 
-struct TransposeConv2dContext {
-    TensorImpl input_tensor;  // [N, C_in, H_in, W_in] - smaller input
-    TensorImpl weight_tensor; // [C_in, C_out, K_h, K_w] - note: C_in first for transposed conv
-    TensorImpl bias_tensor;   // [C_out]
-    TensorImpl out_tensor;    // [N, C_out, H_out, W_out] - larger output
+struct TransposedConv2DContext {
+    TensorImpl input_tensor;   // [B, C_in, H_in, W_in]
+    TensorImpl weight_tensor;  // [C_in, C_out, KH, KW]  // Note: dims swapped from Conv2d
+    TensorImpl bias_tensor;    // [C_out]
+    TensorImpl out_tensor;     // [B, C_out, H_out, W_out]
+    
+    uint batch_size;
+    uint in_channels;
+    uint out_channels;
+    uint in_height;
+    uint in_width;
+    uint out_height;
+    uint out_width;
+    uint kernel_h;
+    uint kernel_w;
     uint stride_h;
     uint stride_w;
-    uint pad_h;
-    uint pad_w;
+    uint padding_h;
+    uint padding_w;
     uint dilation_h;
     uint dilation_w;
-    uint kernel_h;            // Dynamic kernel height
-    uint kernel_w;            // Dynamic kernel width
-    uint output_pad_h;        // Output padding for transposed conv
-    uint output_pad_w;
-    uint groups;
+    uint output_padding_h;
+    uint output_padding_w;
+    
+    uint use_bias;
     uint accumulate_grad;
     uint kernel_type;
+    // GEMM dimensions for TransposedConv2d
+    // M = out_height * out_width (output spatial)
+    // N = out_channels
+    // K = in_channels * in_height * in_width (flattened input)
+    uint m, n, k;
 };
 
-layout(buffer_reference, std430, scalar) buffer ContextBuffer {
-    TransposeConv2dContext ctx;
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    TransposedConv2DContext ctx; 
 };
 
 layout(push_constant) uniform PushConstants {
     ContextBuffer context;
     uvec3 grid_size;
-    uint kernel_type;
+    uint  kernel_type;
 } push;
 
-// Shared memory tile - allocated for maximum size
-shared float sh[SHARED_H_MAX][SHARED_W_PAD];
+// Shared memory for block tiles (transposed layout for A)
+shared float As[BM * BK];  // A tile (transposed: BK x BM)
+shared float Bs[BK * BN];  // B tile (BK x BN)
 
-// Helper function to load 4 floats (vectorized load)
-void load4_shared(int sh_x, int sh_y, int global_offset, int valid_count, tensor_data input_data) {
-    vec4 v = vec4(0.0);
-    
-    if (valid_count >= 4) {
-        // Load all 4 values at once
-        v.x = input_data.data[global_offset + 0];
-        v.y = input_data.data[global_offset + 1];
-        v.z = input_data.data[global_offset + 2];
-        v.w = input_data.data[global_offset + 3];
-    } else if (valid_count > 0) {
-        // Partial load for boundary cases
-        for (int i = 0; i < valid_count; ++i) {
-            v[i] = input_data.data[global_offset + i];
-        }
+// Helper function to get tensor offset
+uint getTensorOffset(const TensorImpl t, uint idx0, uint idx1, uint idx2, uint idx3)
+{
+    if (t.ndim == 4u) {
+        return idx0 * t.strides.strides[0] + 
+               idx1 * t.strides.strides[1] + 
+               idx2 * t.strides.strides[2] + 
+               idx3 * t.strides.strides[3];
+    } else if (t.ndim == 3u) {
+        return idx0 * t.strides.strides[0] + 
+               idx1 * t.strides.strides[1] + 
+               idx2 * t.strides.strides[2];
+    } else if (t.ndim == 2u) {
+        return idx0 * t.strides.strides[0] + 
+               idx1 * t.strides.strides[1];
+    } else {
+        return idx0 * t.strides.strides[0];
     }
-    
-    // Store to shared memory
-    sh[sh_y][sh_x + 0] = v.x;
-    sh[sh_y][sh_x + 1] = v.y;
-    sh[sh_y][sh_x + 2] = v.z;
-    sh[sh_y][sh_x + 3] = v.w;
 }
 
-void main() {
-    TransposeConv2dContext ctx = push.context.ctx;
+// Transposed convolution col2im logic
+// For TransposedConv2d, we compute which input positions contribute to each output position
+// row: output spatial position (0 to M-1) where M = out_height * out_width
+// col: input spatial position combined with filter position (0 to K-1)
+//      where K = in_channels * in_height * in_width
+// Returns weight value for the filter that connects input position to output position
+float getTransposedConvWeight(uint batch, uint row, uint col)
+{
+    TransposedConv2DContext c = push.context.ctx;
     
-    // Extract dimensions from tensor shapes
-    int B = int(ctx.input_tensor.shape.dims[0]);     // batch size
-    int C_in = int(ctx.input_tensor.shape.dims[1]);  // input channels
-    int H_in = int(ctx.input_tensor.shape.dims[2]);  // input height (smaller)
-    int W_in = int(ctx.input_tensor.shape.dims[3]);  // input width (smaller)
-    int C_out = int(ctx.weight_tensor.shape.dims[1]); // output channels
-    int H_out = int(ctx.out_tensor.shape.dims[2]);   // output height (larger)
-    int W_out = int(ctx.out_tensor.shape.dims[3]);   // output width (larger)
+    // Decompose row into output spatial coordinates
+    uint out_w = row % c.out_width;
+    uint out_h = row / c.out_width;
     
-    // Extract transposed convolution parameters
-    int stride_h = int(ctx.stride_h);
-    int stride_w = int(ctx.stride_w);
-    int pad_h = int(ctx.pad_h);
-    int pad_w = int(ctx.pad_w);
-    int dilation_h = int(ctx.dilation_h);
-    int dilation_w = int(ctx.dilation_w);
-    int K_h = int(ctx.kernel_h);  // Dynamic kernel dimensions
-    int K_w = int(ctx.kernel_w);
-    int output_pad_h = int(ctx.output_pad_h);
-    int output_pad_w = int(ctx.output_pad_w);
+    // Decompose col into input coordinates
+    uint in_w = col % c.in_width;
+    uint temp = col / c.in_width;
+    uint in_h = temp % c.in_height;
+    uint in_c = temp / c.in_height;
     
-    // Calculate effective kernel size with dilation
-    int kernel_h_eff = (K_h - 1) * dilation_h + 1;
-    int kernel_w_eff = (K_w - 1) * dilation_w + 1;
+    // For each output position, we need to find which kernel position connects it to the input
+    // out = (in - 1) * stride - 2 * padding + dilation * (kernel - 1) + output_padding + 1
+    // Reverse: given out and in, find kernel position
     
-    // For transposed conv, we tile the OUTPUT space (which is larger)
-    int block_out_x = int(gl_WorkGroupID.x) * TILE;
-    int block_out_y = int(gl_WorkGroupID.y) * TILE;
-    int tx = int(gl_LocalInvocationID.x);
-    int ty = int(gl_LocalInvocationID.y);
+    // Calculate which kernel positions can connect this input to this output
+    // out_h = in_h * stride_h - padding_h + kh * dilation_h
+    // => kh = (out_h + padding_h - in_h * stride_h) / dilation_h
     
-    // Output pixel coordinates for this thread
-    int out_x0 = block_out_x + tx * OUT_TILE_X;
-    int out_y0 = block_out_y + ty * OUT_TILE_Y;
+    int kh_numerator = int(out_h + c.padding_h) - int(in_h * c.stride_h);
+    int kw_numerator = int(out_w + c.padding_w) - int(in_w * c.stride_w);
     
-    // Batch and output channel index from z dimension
-    int b = int(gl_WorkGroupID.z) / C_out;
-    int c_out = int(gl_WorkGroupID.z) % C_out;
-    
-    if (b >= B) return;
-    
-    // Base offsets for this batch
-    int input_b_offset = b * C_in * H_in * W_in;
-    int output_b_offset = b * C_out * H_out * W_out;
-    
-    // Accumulator for output tile (each thread computes OUT_TILE_Y x OUT_TILE_X outputs)
-    float acc[OUT_TILE_Y][OUT_TILE_X];
-    for (int oy = 0; oy < OUT_TILE_Y; ++oy) {
-        for (int ox = 0; ox < OUT_TILE_X; ++ox) {
-            acc[oy][ox] = 0.0;
-        }
+    // Check if this maps to a valid kernel position
+    if (kh_numerator < 0 || kw_numerator < 0 ||
+        kh_numerator % int(c.dilation_h) != 0 ||
+        kw_numerator % int(c.dilation_w) != 0) {
+        return 0.0;
     }
     
-    // Loop over input channels
-    for (int c_in = 0; c_in < C_in; ++c_in) {
-        // Calculate input region needed for this output tile
-        // For transposed conv: out_pos = in_pos * stride - padding
-        // So: in_pos = (out_pos + padding) / stride
+    int kh = kh_numerator / int(c.dilation_h);
+    int kw = kw_numerator / int(c.dilation_w);
+    
+    // Check kernel bounds
+    if (kh < 0 || kh >= int(c.kernel_h) ||
+        kw < 0 || kw >= int(c.kernel_w)) {
+        return 0.0;
+    }
+    
+    // This function is called to get the "A" matrix value
+    // A should be [M x K] where we're computing output positions
+    // We need to return the input value at [batch, in_c, in_h, in_w]
+    uint idx = getTensorOffset(c.input_tensor, batch, in_c, in_h, in_w);
+    return c.input_tensor.data.data[idx];
+}
+
+void loadFromGmem(uint M, uint N, uint K, uint bkIdx, uint batch,
+                  uint innerRowA, uint innerColA, uint innerRowB, uint innerColB)
+{
+    TransposedConv2DContext c = push.context.ctx;
+    const uint rowStrideA = (NUM_THREADS * 4) / BK;
+    const uint rowStrideB = NUM_THREADS / (BN / 4);
+    
+    // Load A matrix - Input reshaped
+    // A is [M x K] where M = out_h * out_w, K = in_c * in_h * in_w
+    // For transposed conv, we load input and implicitly handle the kernel mapping
+    for (uint offset = 0; offset < BM; offset += rowStrideA) {
+        uint globalRow = gl_WorkGroupID.y * BM + innerRowA + offset;
+        uint globalCol = bkIdx + innerColA * 4;
         
-        // Determine input region that contributes to this output tile
-        int in_y_start = (block_out_y - kernel_h_eff + 1 + pad_h + stride_h - 1) / stride_h;
-        int in_x_start = (block_out_x - kernel_w_eff + 1 + pad_w + stride_w - 1) / stride_w;
-        int in_y_end = (block_out_y + TILE + pad_h) / stride_h + 1;
-        int in_x_end = (block_out_x + TILE + pad_w) / stride_w + 1;
+        // Vectorized load (4 floats)
+        vec4 tmp = vec4(0.0);
+        if (globalRow < M && globalCol < K) {
+            tmp.x = getTransposedConvWeight(batch, globalRow, globalCol);
+            if (globalCol + 1 < K) tmp.y = getTransposedConvWeight(batch, globalRow, globalCol + 1);
+            if (globalCol + 2 < K) tmp.z = getTransposedConvWeight(batch, globalRow, globalCol + 2);
+            if (globalCol + 3 < K) tmp.w = getTransposedConvWeight(batch, globalRow, globalCol + 3);
+        }
         
-        // Clamp to valid input range
-        in_y_start = max(0, in_y_start);
-        in_x_start = max(0, in_x_start);
-        in_y_end = min(H_in, in_y_end);
-        in_x_end = min(W_in, in_x_end);
+        // Store transposed: As[col][row] = A[row][col]
+        As[(innerColA * 4 + 0) * BM + innerRowA + offset] = tmp.x;
+        As[(innerColA * 4 + 1) * BM + innerRowA + offset] = tmp.y;
+        As[(innerColA * 4 + 2) * BM + innerRowA + offset] = tmp.z;
+        As[(innerColA * 4 + 3) * BM + innerRowA + offset] = tmp.w;
+    }
+    
+    // Load B matrix (Weight for transposed convolution)
+    // Weight is [C_in, C_out, KH, KW] - NOT contiguous for our access pattern!
+    // We need B as [K x N] where K = in_c * in_h * in_w, N = C_out
+    // We have to brute force this with scalar loads
+    
+    // Each thread loads one element at a time
+    const uint totalElements = BK * BN;
+    const uint elemsPerThread = (totalElements + NUM_THREADS - 1) / NUM_THREADS;
+    
+    for (uint e = 0; e < elemsPerThread; ++e) {
+        uint linearIdx = gl_LocalInvocationID.x * elemsPerThread + e;
+        if (linearIdx >= totalElements) break;
         
-        int shared_h = in_y_end - in_y_start;
-        int shared_w = in_x_end - in_x_start;
+        // Decompose linear index into [k, n] for shared memory
+        uint smem_k = linearIdx / BN;
+        uint smem_n = linearIdx % BN;
         
-        // Clamp to maximum allocated size
-        shared_h = min(shared_h, SHARED_H_MAX);
-        shared_w = min(shared_w, SHARED_W_MAX);
+        // Calculate global indices
+        uint globalK = bkIdx + smem_k;      // K dimension: in_c * in_h * in_w
+        uint globalN = gl_WorkGroupID.x * BN + smem_n;  // N dimension: out_channels
         
-        // Load input data into shared memory (vectorized loads)
-        for (int sy = ty; sy < shared_h; sy += THREADS_Y) {
-            int in_y = in_y_start + sy;
+        float value = 0.0;
+        
+        if (globalK < K && globalN < N) {
+            // Decompose K index into input spatial coordinates
+            uint in_w = globalK % c.in_width;
+            uint temp_k = globalK / c.in_width;
+            uint in_h = temp_k % c.in_height;
+            uint in_c = temp_k / c.in_height;
             
-            for (int sx = tx * 4; sx < shared_w; sx += THREADS_X * 4) {
-                int in_x = in_x_start + sx;
-                
-                // Determine how many valid elements we can load
-                int valid = 0;
-                if (in_y >= 0 && in_y < H_in) {
-                    if (in_x >= 0 && in_x + 3 < W_in) {
-                        valid = 4;  // All 4 elements valid
-                    } else if (in_x >= 0 && in_x < W_in) {
-                        valid = W_in - in_x;  // Partial validity
+            uint out_c = globalN;
+            
+            // For transposed conv, we need to sum over all kernel positions
+            // that could connect input[in_c, in_h, in_w] to any output[out_c, *, *]
+            // Weight layout: [in_c, out_c, kh, kw]
+            // We sum over all (kh, kw) that are valid for this input position
+            
+            for (uint kh = 0; kh < c.kernel_h; ++kh) {
+                for (uint kw = 0; kw < c.kernel_w; ++kw) {
+                    // Calculate which output positions this kernel tap contributes to
+                    // out_h = in_h * stride_h - padding_h + kh * dilation_h
+                    // out_w = in_w * stride_w - padding_w + kw * dilation_w
+                    
+                    int out_h = int(in_h * c.stride_h) - int(c.padding_h) + int(kh * c.dilation_h);
+                    int out_w = int(in_w * c.stride_w) - int(c.padding_w) + int(kw * c.dilation_w);
+                    
+                    // Check if this output position is valid
+                    if (out_h >= 0 && out_h < int(c.out_height) &&
+                        out_w >= 0 && out_w < int(c.out_width)) {
+                        
+                        // Load weight: weight[in_c, out_c, kh, kw]
+                        uint weightIdx = getTensorOffset(c.weight_tensor, in_c, out_c, kh, kw);
+                        value += c.weight_tensor.data.data[weightIdx];
                     }
-                }
-                
-                if (valid > 0) {
-                    int global_offset = input_b_offset + c_in * H_in * W_in + in_y * W_in + in_x;
-                    load4_shared(sx, sy, global_offset, valid, ctx.input_tensor.data);
-                } else {
-                    // Zero padding for out-of-bounds regions
-                    sh[sy][sx + 0] = 0.0;
-                    sh[sy][sx + 1] = 0.0;
-                    sh[sy][sx + 2] = 0.0;
-                    sh[sy][sx + 3] = 0.0;
                 }
             }
         }
         
+        // Store in shared memory Bs[k][n]
+        Bs[smem_k * BN + smem_n] = value;
+    }
+}
+
+void processFromSmem(inout float threadResults[WMITER * TM * WNITER * TN],
+                     uint warpRow, uint warpCol,
+                     uint threadRowInWarp, uint threadColInWarp)
+{
+    float regM[WMITER * TM];
+    float regN[WNITER * TN];
+    
+    for (uint dotIdx = 0; dotIdx < BK; ++dotIdx) {
+        // Populate registers for whole warptile
+        for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+            for (uint i = 0; i < TM; ++i) {
+                regM[wSubRowIdx * TM + i] = 
+                    As[(dotIdx * BM) + warpRow * WM + wSubRowIdx * WSUBM + 
+                       threadRowInWarp * TM + i];
+            }
+        }
+        
+        for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+            for (uint i = 0; i < TN; ++i) {
+                regN[wSubColIdx * TN + i] = 
+                    Bs[(dotIdx * BN) + warpCol * WN + wSubColIdx * WSUBN + 
+                       threadColInWarp * TN + i];
+            }
+        }
+        
+        // Execute warptile matmul
+        for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+            for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+                for (uint resIdxM = 0; resIdxM < TM; ++resIdxM) {
+                    for (uint resIdxN = 0; resIdxN < TN; ++resIdxN) {
+                        threadResults[(wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
+                                     (wSubColIdx * TN) + resIdxN] +=
+                            regM[wSubRowIdx * TM + resIdxM] * 
+                            regN[wSubColIdx * TN + resIdxN];
+                    }
+                }
+            }
+        }
+    }
+}
+
+void forward(uint B, uint M, uint N, uint K)
+{
+    TransposedConv2DContext c = push.context.ctx;
+    
+    const uint cRow = gl_WorkGroupID.y;
+    const uint cCol = gl_WorkGroupID.x;
+    const uint batch = gl_WorkGroupID.z;
+    
+    // Warp placement in threadblock tile
+    const uint warpIdx = gl_LocalInvocationID.x / WARPSIZE;
+    const uint warpCol = warpIdx % (BN / WN);
+    const uint warpRow = warpIdx / (BN / WN);
+    
+    // Thread placement in warp subtile
+    const uint threadIdxInWarp = gl_LocalInvocationID.x % WARPSIZE;
+    const uint threadColInWarp = threadIdxInWarp % (WSUBN / TN);
+    const uint threadRowInWarp = threadIdxInWarp / (WSUBN / TN);
+    
+    // Calculate indices for loading into shared memory
+    const uint innerRowA = gl_LocalInvocationID.x / (BK / 4);
+    const uint innerColA = gl_LocalInvocationID.x % (BK / 4);
+    const uint innerRowB = gl_LocalInvocationID.x / (BN / 4);
+    const uint innerColB = gl_LocalInvocationID.x % (BN / 4);
+    
+    // Allocate thread-local cache for results
+    float threadResults[WMITER * TM * WNITER * TN];
+    for (uint i = 0; i < WMITER * TM * WNITER * TN; ++i) {
+        threadResults[i] = 0.0;
+    }
+    
+    // Outer-most loop over block tiles
+    for (uint bkIdx = 0; bkIdx < K; bkIdx += BK) {
+        loadFromGmem(M, N, K, bkIdx, batch, innerRowA, innerColA, innerRowB, innerColB);
         barrier();
         
-        // Compute transposed convolution with dynamic kernel size
-        // Weight layout: [C_in, C_out, K_h, K_w]
-        int kbase = (c_in * C_out + c_out) * K_h * K_w;
+        processFromSmem(threadResults, warpRow, warpCol, threadRowInWarp, threadColInWarp);
         
-        for (int oy = 0; oy < OUT_TILE_Y; ++oy) {
-            for (int ox = 0; ox < OUT_TILE_X; ++ox) {
-                int out_y = out_y0 + oy;
-                int out_x = out_x0 + ox;
-                
-                if (out_y >= H_out || out_x >= W_out) continue;
-                
-                float sum = 0.0;
-                
-                // For each kernel position, check if there's a corresponding input
-                for (int ky = 0; ky < K_h; ++ky) {
-                    for (int kx = 0; kx < K_w; ++kx) {
-                        // Calculate which input position contributes to this output position
-                        // out_pos = in_pos * stride - padding + kernel_offset * dilation
-                        // So: in_pos = (out_pos + padding - kernel_offset * dilation) / stride
+        barrier();
+    }
+    
+    // Write out the results
+    for (uint wSubRowIdx = 0; wSubRowIdx < WMITER; ++wSubRowIdx) {
+        for (uint wSubColIdx = 0; wSubColIdx < WNITER; ++wSubColIdx) {
+            for (uint resIdxM = 0; resIdxM < TM; resIdxM += 1) {
+                for (uint resIdxN = 0; resIdxN < TN; resIdxN += 1) {
+                    uint globalRow = cRow * BM + warpRow * WM + wSubRowIdx * WSUBM + 
+                                    threadRowInWarp * TM + resIdxM;
+                    uint globalCol = cCol * BN + warpCol * WN + wSubColIdx * WSUBN + 
+                                    threadColInWarp * TN + resIdxN;
+                    
+                    // Bounds check
+                    if (globalRow < M && globalCol < N) {
+                        uint i = (wSubRowIdx * TM + resIdxM) * (WNITER * TN) +
+                                wSubColIdx * TN + resIdxN;
+                        float result = threadResults[i];
                         
-                        int numerator_y = out_y + pad_h - ky * dilation_h;
-                        int numerator_x = out_x + pad_w - kx * dilation_w;
+                        // Decompose globalRow back into spatial coordinates
+                        uint out_w = globalRow % c.out_width;
+                        uint out_h = globalRow / c.out_width;
+                        uint out_c = globalCol;
                         
-                        // Check if this aligns with stride
-                        if (numerator_y % stride_h == 0 && numerator_x % stride_w == 0) {
-                            int in_y = numerator_y / stride_h;
-                            int in_x = numerator_x / stride_w;
-                            
-                            // Check if input position is valid and within our loaded tile
-                            if (in_y >= in_y_start && in_y < in_y_end && 
-                                in_x >= in_x_start && in_x < in_x_end) {
-                                int sy = in_y - in_y_start;
-                                int sx = in_x - in_x_start;
-                                
-                                int widx = kbase + ky * K_w + kx;
-                                sum += sh[sy][sx] * ctx.weight_tensor.data.data[widx];
-                            }
+                        // Add bias if enabled
+                        if (c.use_bias != 0u) {
+                            uint biasIdx = getTensorOffset(c.bias_tensor, out_c, 0, 0, 0);
+                            result += c.bias_tensor.data.data[biasIdx];
                         }
+
+                        // Write output [batch, out_c, out_h, out_w]
+                        uint idxOut = getTensorOffset(c.out_tensor, batch, out_c, out_h, out_w);
+                        c.out_tensor.data.data[idxOut] = result;
                     }
                 }
-                
-                acc[oy][ox] += sum;
             }
         }
-        
-        barrier();
     }
+}
+
+void main()
+{
+    TransposedConv2DContext c = push.context.ctx;
+    uint B = max(c.batch_size, 1u);
+    uint M = c.m;  // out_height * out_width
+    uint N = c.n;  // out_channels
+    uint K = c.k;  // in_channels * in_height * in_width
     
-    // Write outputs with bias
-    for (int oy = 0; oy < OUT_TILE_Y; ++oy) {
-        int out_y = out_y0 + oy;
-        if (out_y < 0 || out_y >= H_out) continue;
-        
-        for (int ox = 0; ox < OUT_TILE_X; ++ox) {
-            int out_x = out_x0 + ox;
-            if (out_x < 0 || out_x >= W_out) continue;
-            
-            int out_idx = output_b_offset + c_out * (H_out * W_out) + out_y * W_out + out_x;
-            
-            // Add bias and write result
-            float result = acc[oy][ox];
-            result += ctx.bias_tensor.data.data[c_out];
-            ctx.out_tensor.data.data[out_idx] = result;
-        }
-    }
+    forward(B, M, N, K);
 }

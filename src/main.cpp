@@ -478,37 +478,32 @@ int main(void){
 	Init init;
 	device_initialization(init);
 	Allocator* allocator = new Allocator(&init);
-	TensorPool<float> tensorPool(allocator);
 
-	auto &inputImage = tensorPool.createTensor({5, 1, 28, 28}, "inputImage");
-	tensorPool.tensor_fill_random("inputImage", -1.0f, 1.0f);
+	{
+		TensorPool<float> tensorPool(allocator);
 
-	Conv2d<float> conv(&tensorPool, 1, 2, 5, 28, 28, 3, 3, "conv1", 1, 1, 0, 0);
-	BatchNorm2d<float> bn(&tensorPool, 2, conv.output_width, conv.output_height, 5, "batchnorm-2d");
-	ShapeTo<float> flatten(&tensorPool, vec{5, 1, 2 * conv.output_height * conv.output_width}, "flatten"); // output is (5, 1, 2 * 26 * 26)
-	Linear<float> linear(&tensorPool, 2 * conv.output_height * conv.output_width, 16, 5, "linear"); // output is (5, 1, 16)
-	BatchNorm1d<float> batchnorm(&tensorPool, 16, 1, 5, "batchnorm");
-	SoftmaxCrossEntropy<float> softmax(&tensorPool, 16, 1, 5, "softmax");
+		auto &inputImage = tensorPool.createTensor({5, 16, 28, 28}, "inputImage");
+		tensorPool.tensor_fill_random("inputImage", 0, 0.0f, 0.0f, -1.0f, 1.0f);
 
-	// set all the labels to be class = 1
-	auto &target = tensorPool.createTensor({5, 1, 16}, "targets");
-	target.dataBuffer->set(1, 1.0f);
-	target.dataBuffer->set(off2or3(target.strides, 1, 0, 1), 1.0f);
-	target.dataBuffer->set(off2or3(target.strides, 2, 0, 1), 1.0f);
-	target.dataBuffer->set(off2or3(target.strides, 3, 0, 1), 1.0f);
-	target.dataBuffer->set(off2or3(target.strides, 4, 0, 1), 1.0f);
-	softmax.target = &target;
+		Conv2d<float> conv(&tensorPool, 16, 16, 5, 28, 28, 3, 3, "conv1", 1, 1, 0, 0);
+		BatchNorm2d<float> bn(&tensorPool, 16, conv.output_width, conv.output_height, 5, "batchnorm-2d");
+		Linear<float> linear(&tensorPool, 16 * conv.output_height * conv.output_width, 16, 5, "linear"); // output is (5, 1, 16)
+		BatchNorm1d<float> batchnorm(&tensorPool, 16, 1, 5, "batchnorm");
+		SoftmaxCrossEntropy<float> softmax(&tensorPool, 16, 1, 5, "softmax");
 
-	softmax(batchnorm(linear(flatten(bn(conv(&inputImage))))));
+		// set all the labels to be class = 1
+		auto &target = tensorPool.createTensor({5, 1, 16}, "targets");
+		target.dataBuffer->set(1, 1.0f);
+		target.dataBuffer->set(off2or3(target.strides, 1, 0, 1), 1.0f);
+		target.dataBuffer->set(off2or3(target.strides, 2, 0, 1), 1.0f);
+		target.dataBuffer->set(off2or3(target.strides, 3, 0, 1), 1.0f);
+		target.dataBuffer->set(off2or3(target.strides, 4, 0, 1), 1.0f);
+		softmax.target = &target;
 
-	softmax.backward(batchnorm.output);
-	batchnorm.backward(linear.output);
-	linear.backward(flatten.output);
-	flatten.backward(bn.output);
-	bn.backward(conv.output);
-	conv.backward(&inputImage);
-
-	conv.weight_tensor->printGradient();
+		//conv.forward(&inputImage)->print();
+		softmax((linear((conv(&inputImage)))))->backward();
+		inputImage.printGradient();
+	}
 
 	delete allocator;
 	return 0;
@@ -629,16 +624,18 @@ struct VAE {
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
 		optim = SDGoptim<float>(allocator);
 		optim.batch_size = 16;
-		optim.lr = 1e-03;
+		optim.lr = 1e-02;
 
 		auto conv1 = std::make_unique<Conv2d<float>>(
 			&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2
 		);
+		auto bn2d_enc =  std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, conv1->output_width, conv1->output_height, 16, "bn2d_enc");
 		auto relu1 = std::make_unique<ReLU<float>>(&tensorPool, "relu1");
 		
 		auto conv2 = std::make_unique<Conv2d<float>>(
 			&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, 4, 4, "conv2", 2, 2
 		);
+		auto bn2d_enc1 =  std::make_unique<BatchNorm2d<float>>(&tensorPool, 64, conv2->output_width, conv2->output_height, 16, "bn2d_enc1");
 		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
 		
 		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
@@ -664,11 +661,16 @@ struct VAE {
 		auto dec_conv1 = std::make_unique<TransposedConv2d<float>>(
 			&tensorPool, 64, 32, 16, conv2->output_height, conv2->output_width, 4, 4, "dec_conv1", 2, 2
 		);
+
+		auto bn2d1 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 32, dec_conv1->output_width, dec_conv1->output_height, 16, "bn2d1");
+
 		auto relu4 = std::make_unique<ReLU<float>>(&tensorPool, "relu4");
 		
 		auto dec_conv2 = std::make_unique<TransposedConv2d<float>>(
 			&tensorPool, 32, 1, 16, dec_conv1->output_height, dec_conv1->output_width, 4, 4, "dec_conv2", 2, 2
 		);
+
+		auto bn2d2 = std::make_unique<BatchNorm2d<float>>(&tensorPool, 1, dec_conv2->output_width, dec_conv2->output_height, 16, "bn2d2");
 
 		// Xavier/Glorot initialization for the final layer (followed by TanH)
 		uint32_t fan_in = 32 * 4 * 4;   // in_channels * kernel_h * kernel_w = 512
@@ -681,8 +683,10 @@ struct VAE {
 
 		enc_conv = Sequential<float>(&tensorPool, "enc");
 		enc_conv.addLayer(std::move(conv1));
+		enc_conv.addLayer(std::move(bn2d_enc));
 		enc_conv.addLayer(std::move(relu1));
 		enc_conv.addLayer(std::move(conv2));
+		enc_conv.addLayer(std::move(bn2d_enc1));
 		enc_conv.addLayer(std::move(relu2));
 		enc_conv.addLayer(std::move(flatten));
 		enc_conv.addLayer(std::move(enc_fc));
@@ -692,8 +696,10 @@ struct VAE {
 		dec_conv.addLayer(std::move(relu3));
 		dec_conv.addLayer(std::move(reshape));
 		dec_conv.addLayer(std::move(dec_conv1));
+		dec_conv.addLayer(std::move(bn2d1));
 		dec_conv.addLayer(std::move(relu4));
 		dec_conv.addLayer(std::move(dec_conv2));
+		dec_conv.addLayer(std::move(bn2d2));
 		dec_conv.addLayer(std::move(tanh));
 
 		mseLoss = MSEloss<float>(&tensorPool, 16, "mse");
@@ -754,11 +760,11 @@ struct VAE {
 		Tensor<float>* loss = nullptr;
 		Tensor<float>* recon = nullptr;
 		progressbar bar(100, true, std::cout);
-		for(int i = 0; i < dataLoader->num_batches - 99; i++){
-			//auto* input = dataLoader->imagesBatchTensors[i];
+		for(int i = 0; i < dataLoader->num_batches; i++){
+			auto* input = dataLoader->imagesBatchTensors[i];
 
-			auto* input = &tensorPool.createTensor({16, 1, 28, 28}, "in");
-			tensorPool.tensor_fill_random("in", 0, .0f, .0f, -1.0f, 1.0f);
+			//auto* input = &tensorPool.createTensor({16, 1, 28, 28}, "in");
+			//tensorPool.tensor_fill_random("in", 0, .0f, .0f, -1.0f, 1.0f);
 
 			auto [mu, logvar] = encode(input);
 			auto z = reparameterize(mu, logvar);
@@ -768,8 +774,8 @@ struct VAE {
 			
 			loss->backward();
 
-			//dynamic_cast<Linear<float>*>(dec_conv.layers[2].get())->weights->printGradient();
-			input->printGradient();
+			//dynamic_cast<TransposedConv2d<float>*>(dec_conv.layers[5].get())->output->printGradient();
+			//input->printGradient();
 
 			optim.step();
 			tensorPool.zero_out_all_grads();
@@ -790,6 +796,7 @@ struct VAE {
 	}
 };
 
+/*
 int main(void){
 	
 	Init init;
@@ -799,7 +806,7 @@ int main(void){
 	{
 		VAE vae = VAE(allocator);
 
-		for(int i = 0; i < 100 - 99; i++){
+		for(int i = 0; i < 100; i++){
 			vae.train(i);
 		}
 	}
@@ -807,6 +814,7 @@ int main(void){
 	delete allocator;
 	return 0;
 }
+*/
 
 /*
 int main(void){
@@ -907,7 +915,7 @@ struct Trainer {
 
 		Tensor<float>* input;
 		progressbar bar(100, true, std::cout);
-		for (uint32_t i = 0; i < dataLoader->num_batches - 99; i++){
+		for (uint32_t i = 0; i < dataLoader->num_batches; i++){
 			input = dataLoader->imagesBatchTensors[i];
 			sequence.forward(input);
 			softmax->target = dataLoader->labelTensors[i];
@@ -915,7 +923,7 @@ struct Trainer {
 			
 			loss->backward();
 			
-			dynamic_cast<Conv2d<float>*>(sequence.layers[0].get())->weight_tensor->printGradient();
+			//dynamic_cast<Conv2d<float>*>(sequence.layers[0].get())->weight_tensor->printGradient();
 
 			optim.step();
 			tensorPool.zero_out_all_grads();
@@ -953,7 +961,6 @@ struct Trainer {
 
 };
 
-/*
 int main(void){
 	
 	Init init;
@@ -963,7 +970,7 @@ int main(void){
 	{
 		Trainer t = Trainer(allocator);
 
-		for (int i = 0; i < 60 - 59; i++){
+		for (int i = 0; i < 4; i++){
 			t.train_epoch(i);
 			//t.test_epoch();
 		}
@@ -974,7 +981,6 @@ int main(void){
 
 	return 0;
 }
-*/
 
 /*
 int main(void) {

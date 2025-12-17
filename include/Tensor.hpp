@@ -321,41 +321,72 @@ struct tensor_conv2d_3x3_context {
 };
 
 struct tensor_conv2d_context {
-    tensor_impl input_tensor;  // [N, C_in, H_in, W_in]
-    tensor_impl weight_tensor; // [C_out, C_in, K_h, K_w]
-    tensor_impl bias_tensor;   // [C_out]
-    tensor_impl out_tensor;    // [N, C_out, H_out, W_out]
+    tensor_impl input_tensor;   // [B, C_in, H_in, W_in]
+    tensor_impl weight_tensor;  // [C_out, C_in, KH, KW]
+    tensor_impl bias_tensor;    // [C_out]
+    tensor_impl out_tensor;     // [B, C_out, H_out, W_out]
+    
+    uint batch_size;
+    uint in_channels;
+    uint out_channels;
+    uint in_height;
+    uint in_width;
+    uint out_height;
+    uint out_width;
+    uint kernel_h;
+    uint kernel_w;
     uint stride_h;
     uint stride_w;
-    uint pad_h;
-    uint pad_w;
+    uint padding_h;
+    uint padding_w;
     uint dilation_h;
     uint dilation_w;
-    uint kernel_h;            // Dynamic kernel height
-    uint kernel_w;            // Dynamic kernel width
-    uint groups;
+    
+    uint use_bias;
     uint accumulate_grad;
     uint kernel_type;
+    
+    // GEMM dimensions
+    // M = out_height * out_width
+    // N = out_channels
+    // K = in_channels * kernel_h * kernel_w
+
+    uint m, n, k;
 };
 
 struct tensor_transposed_conv2d_context {
-    tensor_impl input_tensor;  // [N, C_in, H_in, W_in] - smaller input
-    tensor_impl weight_tensor; // [C_in, C_out, K_h, K_w] - note: C_in first for transposed conv
-    tensor_impl bias_tensor;   // [C_out]
-    tensor_impl out_tensor;    // [N, C_out, H_out, W_out] - larger output
+    tensor_impl input_tensor;   // [B, C_in, H_in, W_in]
+    tensor_impl weight_tensor;  // [C_in, C_out, KH, KW]
+    tensor_impl bias_tensor;    // [C_out]
+    tensor_impl out_tensor;     // [B, C_out, H_out, W_out]
+    
+    uint batch_size;
+    uint in_channels;
+    uint out_channels;
+    uint in_height;
+    uint in_width;
+    uint out_height;
+    uint out_width;
+    uint kernel_h;
+    uint kernel_w;
     uint stride_h;
     uint stride_w;
-    uint pad_h;
-    uint pad_w;
+    uint padding_h;
+    uint padding_w;
     uint dilation_h;
     uint dilation_w;
-    uint kernel_h;            // Dynamic kernel height
-    uint kernel_w;            // Dynamic kernel width
-    uint output_pad_h;        // Output padding for transposed conv
-    uint output_pad_w;
-    uint groups;
+    uint output_padding_h;
+    uint output_padding_w;
+    
+    uint use_bias;
     uint accumulate_grad;
     uint kernel_type;
+    
+    // GEMM dimensions for TransposedConv2d
+    // M = in_height * in_width (input spatial)
+    // N = in_channels
+    // K = out_channels * kernel_h * kernel_w
+    uint m, n, k;
 };
 
 struct tensor_upsample_context {
@@ -949,10 +980,6 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/Upsample.comp.spv"), alloc, nullptr),
             upsampleShaderBackward(
                 readShaderBytecode("compiled_shaders/Upsample_backward.comp.spv"), alloc, nullptr),
-            conv2dShader3x3(
-                readShaderBytecode("compiled_shaders/Conv2d3x3.comp.spv"), alloc, nullptr),
-            conv2dShader3x3Backward(
-                readShaderBytecode("compiled_shaders/Conv2d3x3_backward.comp.spv"), alloc, nullptr),
             conv2dShader(
                 readShaderBytecode("compiled_shaders/Conv2d.comp.spv"), alloc, nullptr),
             conv2dShaderBackward(
@@ -1165,271 +1192,400 @@ struct TensorPool {
         }
     };
 
-    // simple 3x3 convolution with padding 1, stride 1, dilation 1, groups 1
-    void tensor_conv2d_3x3(const std::string& output_tensor, const std::string& input_tensor, const std::string& weight_tensor, const std::string& bias_tensor, uint32_t mode = 0,
-        uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1, uint32_t groups = 1) {
-        tensor_conv2d_3x3_context uniform{};
-        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
-        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
-        uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
-        uniform.out_tensor = tensors[output_tensor]->getTensorImpl();
-        uniform.stride_h = stride_h;
-        uniform.stride_w = stride_w;
-        uniform.pad_h = pad_h;
-        uniform.pad_w = pad_w;
-        uniform.dilation_h = dilation_h;
-        uniform.dilation_w = dilation_w;
-        uniform.groups = groups;
-        uniform.accumulate_grad = 1; // accumulate gradients
-
-        DEBUG_PRINT("Conv2D 3x3 tensor " << input_tensor << " with weights from " << weight_tensor << " into " << output_tensor);
-        
-        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
-        
-        tensor_push_const pushConsts{};
-        if (mode == 0) {
-            uint32_t groupX = cielDiv(tensors[output_tensor]->shape[3], 16u); // W_out
-            uint32_t groupY = cielDiv(tensors[output_tensor]->shape[2], 16u); // H_out
-            uint32_t groupZ = tensors[output_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * Filters
-
-            uint32_t workgroup[3] = { groupX, groupY, groupZ };
-            pushConsts.mode = mode; // forward pass
-            pushConsts.uniformAddress = conv2dShader3x3.uniformBuffer->getBufferAddress();
-            pushConsts.grid_size = { groupX, groupY, groupZ };
-            conv2dShader3x3.loadUniform(uniform, pushConsts);
-            conv2dShader3x3.execute(workgroup);
-        }
-        else if (mode == 1) {
-            pushConsts.uniformAddress = conv2dShader3x3Backward.uniformBuffer->getBufferAddress();
-            
-            // Kernel 0: Compute gradient w.r.t. input
-            {
-                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
-                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
-                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[input_tensor]->shape[1]; // batch * C_in
-                uint32_t workgroup[3] = { groupX, groupY, groupZ };
-                
-                pushConsts.grid_size = { groupX, groupY, groupZ };
-                pushConsts.mode = 0; // input gradient
-                uniform.kernel_type = 0;
-                conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
-                conv2dShader3x3Backward.execute(workgroup);
-            }
-            
-            // Kernel 1: Compute gradient w.r.t. weights
-            {
-                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
-                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
-                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * F
-                uint32_t workgroup[3] = { groupX, groupY, groupZ };
-                
-                pushConsts.grid_size = { groupX, groupY, groupZ };
-                pushConsts.mode = 1; // weight gradient
-                uniform.kernel_type = 1;
-                conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
-                conv2dShader3x3Backward.execute(workgroup);
-            }
-            
-            // Kernel 2: Compute gradient w.r.t. bias
-            {
-                uint32_t groupX = tensors[weight_tensor]->shape[0]; // F (num filters)
-                uint32_t groupY = 1;
-                uint32_t groupZ = 1;
-                uint32_t workgroup[3] = { groupX, groupY, groupZ };
-                
-                pushConsts.grid_size = { groupX, groupY, groupZ };
-                pushConsts.mode = 2; // bias gradient
-                uniform.kernel_type = 2;
-                conv2dShader3x3Backward.loadUniform(uniform, pushConsts);
-                conv2dShader3x3Backward.execute(workgroup);
-            }
-        }
-    };
-
-    // general MxN convolution supporting kernel sizes up to 10x10
-    void tensor_conv2d(const std::string& output_tensor, const std::string& input_tensor, const std::string& weight_tensor, const std::string& bias_tensor, uint32_t kernel_h, uint32_t kernel_w, uint32_t mode = 0,
-        uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1, uint32_t groups = 1) {
+    // general 2d convolution
+    void tensor_conv2d(const std::string& output_tensor,
+                   const std::string& input_tensor,
+                   const std::string& weight_tensor,
+                   const std::string& bias_tensor,
+                   uint32_t kernel_h,
+                   uint32_t kernel_w,
+                   uint32_t mode = 0,
+                   uint32_t stride_w = 1,
+                   uint32_t stride_h = 1,
+                   uint32_t pad_h = 0,
+                   uint32_t pad_w = 0,
+                   uint32_t dilation_h = 1,
+                   uint32_t dilation_w = 1) {
+    
         tensor_conv2d_context uniform{};
+
+        constexpr uint32_t BM = 128;
+        constexpr uint32_t BN = 128;
+        constexpr uint32_t BK = 8;
+        constexpr uint32_t NUM_THREADS = 256;
+
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        // ---------------------------------------------------------------------
+        // Common setup
+        // ---------------------------------------------------------------------
+        const auto& input_shape = tensors[input_tensor]->shape;
+        const auto& weight_shape = tensors[weight_tensor]->shape;
+        const auto& output_shape = tensors[output_tensor]->shape;
+
+        // Validate shapes
+        if (input_shape.size() != 4)
+            throw std::invalid_argument("Input must be 4D [B, C_in, H_in, W_in]");
+        if (weight_shape.size() != 4)
+            throw std::invalid_argument("Weight must be 4D [C_out, C_in, KH, KW]");
+        if (output_shape.size() != 4)
+            throw std::invalid_argument("Output must be 4D [B, C_out, H_out, W_out]");
+
+        uint32_t batch_size = input_shape[0];
+        uint32_t in_channels = input_shape[1];
+        uint32_t in_height = input_shape[2];
+        uint32_t in_width = input_shape[3];
+
+        uint32_t out_channels = weight_shape[0];
+        uint32_t weight_in_channels = weight_shape[1];
+        uint32_t weight_kh = weight_shape[2];
+        uint32_t weight_kw = weight_shape[3];
+
+        uint32_t out_batch = output_shape[0];
+        uint32_t out_c = output_shape[1];
+        uint32_t out_height = output_shape[2];
+        uint32_t out_width = output_shape[3];
+
+        // Validate dimensions
+        if (weight_in_channels != in_channels)
+            throw std::invalid_argument("Weight input channels must match input channels");
+        if (weight_kh != kernel_h || weight_kw != kernel_w)
+            throw std::invalid_argument("Weight kernel size must match provided kernel size");
+        if (out_channels != out_c)
+            throw std::invalid_argument("Output channels must match weight output channels");
+        if (batch_size != out_batch)
+            throw std::invalid_argument("Output batch size must match input batch size");
+
+        // Calculate expected output dimensions
+        uint32_t expected_out_h = (in_height + 2 * pad_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
+        uint32_t expected_out_w = (in_width + 2 * pad_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+
+        if (expected_out_h != out_height || expected_out_w != out_width)
+            throw std::invalid_argument("Output spatial dimensions don't match expected values");
+
+        // Fill uniform context
         uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
         uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
-        uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
         uniform.out_tensor = tensors[output_tensor]->getTensorImpl();
-        uniform.stride_h = stride_h;
-        uniform.stride_w = stride_w;
-        uniform.pad_h = pad_h;
-        uniform.pad_w = pad_w;
-        uniform.dilation_h = dilation_h;
-        uniform.dilation_w = dilation_w;
+
+        if (!bias_tensor.empty()) {
+            const auto& bias_shape = tensors[bias_tensor]->shape;
+            if (bias_shape.size() != 1 || bias_shape[0] != out_channels)
+                throw std::invalid_argument("Bias must be 1D [C_out]");
+            uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+            uniform.use_bias = 1;
+        } else {
+            uniform.use_bias = 0;
+        }
+
+        uniform.batch_size = batch_size;
+        uniform.in_channels = in_channels;
+        uniform.out_channels = out_channels;
+        uniform.in_height = in_height;
+        uniform.in_width = in_width;
+        uniform.out_height = out_height;
+        uniform.out_width = out_width;
         uniform.kernel_h = kernel_h;
         uniform.kernel_w = kernel_w;
-        uniform.groups = groups;
-        uniform.accumulate_grad = 1; // accumulate gradients
+        uniform.stride_h = stride_h;
+        uniform.stride_w = stride_w;
+        uniform.padding_h = pad_h;
+        uniform.padding_w = pad_w;
+        uniform.dilation_h = dilation_h;
+        uniform.dilation_w = dilation_w;
+        uniform.accumulate_grad = 1;
 
-        DEBUG_PRINT("Conv2D tensor " << input_tensor << " with weights from " << weight_tensor << " into " << output_tensor);
+        // GEMM dimensions
+        // M = out_height * out_width (output spatial dimensions flattened)
+        // N = out_channels
+        // K = in_channels * kernel_h * kernel_w
+        uint32_t M = out_height * out_width;
+        uint32_t N = out_channels;
+        uint32_t K = in_channels * kernel_h * kernel_w;
+
+        uniform.m = M;
+        uniform.n = N;
+        uniform.k = K;
+
+        DEBUG_PRINT("Conv2d tensor " << input_tensor << " of shape "
+            << shapeToString(input_shape) << " with transposed weights " << weight_tensor
+            << " of shape " << shapeToString(weight_shape));
         
-        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
-        
-        tensor_push_const pushConsts{};
+        // ---------------------------------------------------------------------
+        // FORWARD
+        // ---------------------------------------------------------------------
         if (mode == 0) {
-            uint32_t groupX = cielDiv(tensors[output_tensor]->shape[3], 16u); // W_out
-            uint32_t groupY = cielDiv(tensors[output_tensor]->shape[2], 16u); // H_out
-            uint32_t groupZ = tensors[output_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * Filters
+            // Grid dimensions for forward pass
+            // GEMM: Output[B, M, N] = Im2Col(Input)[B, M, K] @ Weight[N, K]^T
+            uint32_t groupX = ceilDiv(N, BN);  // Output channels dimension
+            uint32_t groupY = ceilDiv(M, BM);  // Spatial dimension (H_out * W_out)
+            uint32_t groupZ = batch_size;      // Batch dimension
 
             uint32_t workgroup[3] = { groupX, groupY, groupZ };
-            pushConsts.mode = mode; // forward pass
-            pushConsts.uniformAddress = conv2dShader.uniformBuffer->getBufferAddress();
-            pushConsts.grid_size = { groupX, groupY, groupZ };
-            conv2dShader.loadUniform(uniform, pushConsts);
+
+            tensor_push_const pc{};
+            pc.grid_size = { groupX, groupY, groupZ };
+            pc.mode = 0;
+            pc.uniformAddress = conv2dShader.uniformBuffer->getBufferAddress();
+
+            conv2dShader.loadUniform(uniform, pc);
             conv2dShader.execute(workgroup);
+
+            return;
         }
-        else if (mode == 1) {
-            pushConsts.uniformAddress = conv2dShaderBackward.uniformBuffer->getBufferAddress();
-            
-            // Kernel 0: Compute gradient w.r.t. input
-            {
-                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
-                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
-                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[input_tensor]->shape[1]; // batch * C_in
-                uint32_t workgroup[3] = { groupX, groupY, groupZ };
-                
-                pushConsts.grid_size = { groupX, groupY, groupZ };
-                pushConsts.mode = 0; // input gradient
-                uniform.kernel_type = 0;
-                conv2dShaderBackward.loadUniform(uniform, pushConsts);
-                conv2dShaderBackward.execute(workgroup);
-            }
-            
-            // Kernel 1: Compute gradient w.r.t. weights
-            {
-                uint32_t groupX = cielDiv(tensors[input_tensor]->shape[3], 16u); // W_in
-                uint32_t groupY = cielDiv(tensors[input_tensor]->shape[2], 16u); // H_in
-                uint32_t groupZ = tensors[input_tensor]->shape[0] * tensors[weight_tensor]->shape[0]; // batch * F
-                uint32_t workgroup[3] = { groupX, groupY, groupZ };
-                
-                pushConsts.grid_size = { groupX, groupY, groupZ };
-                pushConsts.mode = 1; // weight gradient
-                uniform.kernel_type = 1;
-                conv2dShaderBackward.loadUniform(uniform, pushConsts);
-                conv2dShaderBackward.execute(workgroup);
-            }
-            
-            // Kernel 2: Compute gradient w.r.t. bias
-            {
-                uint32_t groupX = tensors[weight_tensor]->shape[0]; // F (num filters)
-                uint32_t groupY = 1;
-                uint32_t groupZ = 1;
-                uint32_t workgroup[3] = { groupX, groupY, groupZ };
-                
-                pushConsts.grid_size = { groupX, groupY, groupZ };
-                pushConsts.mode = 2; // bias gradient
-                uniform.kernel_type = 2;
-                conv2dShaderBackward.loadUniform(uniform, pushConsts);
-                conv2dShaderBackward.execute(workgroup);
-            }
+
+        // ---------------------------------------------------------------------
+        // BACKWARD
+        // ---------------------------------------------------------------------
+        
+        // ---- Kernel 1: dInput + dBias ----
+        // GEMM for dInput: dInput_col[B, M, K] = dOutput[B, M, N] @ Weight[N, K]
+        // Then scatter dInput_col back to dInput spatial positions
+        {
+            uint32_t groupX = ceilDiv(K, BN);  // Filter dimension (C_in * KH * KW)
+            uint32_t groupY = ceilDiv(M, BM);  // Spatial dimension (H_out * W_out)
+            uint32_t groupZ = batch_size;      // Batch dimension
+
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+            tensor_push_const pc{};
+            pc.grid_size = { groupX, groupY, groupZ };
+            uniform.kernel_type = 0;  // KERNEL_INPUT_GRAD
+            pc.mode = 1;
+            pc.uniformAddress = conv2dShaderBackward.uniformBuffer->getBufferAddress();
+
+            conv2dShaderBackward.loadUniform(uniform, pc);
+            conv2dShaderBackward.execute(workgroup);
+        }
+
+        // ---- Kernel 2: dWeight ----
+        // GEMM: dWeight[N, K] = dOutput^T[N, M] @ Im2Col(Input)[M, K]
+        // Accumulated across batches
+        {
+            uint32_t groupX = ceilDiv(K, BN);  // Filter dimension (C_in * KH * KW)
+            uint32_t groupY = ceilDiv(N, BM);  // Output channels dimension
+            uint32_t groupZ = batch_size;      // Batch dimension (accumulate across)
+
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+            tensor_push_const pc{};
+            pc.grid_size = { groupX, groupY, groupZ };
+            uniform.kernel_type = 1;  // KERNEL_WEIGHT_GRAD
+            pc.mode = 1;
+            pc.uniformAddress = conv2dShaderBackward.uniformBuffer->getBufferAddress();
+
+            conv2dShaderBackward.loadUniform(uniform, pc);
+            conv2dShaderBackward.execute(workgroup);
         }
     };
 
     // general transposed (de)conv2d supporting dynamic kernel sizes
     void tensor_transposed_conv2d(const std::string& output_tensor,
-                                const std::string& input_tensor,
-                                const std::string& weight_tensor,
-                                const std::string& bias_tensor,
-                                uint32_t kernel_h, uint32_t kernel_w,
-                                uint32_t mode = 0,
-                                uint32_t stride_w = 1, uint32_t stride_h = 1,
-                                uint32_t pad_h = 0, uint32_t pad_w = 0,
-                                uint32_t dilation_h = 1, uint32_t dilation_w = 1,
-                                uint32_t output_pad_h = 0, uint32_t output_pad_w = 0,
-                                uint32_t groups = 1) {
+                              const std::string& input_tensor,
+                              const std::string& weight_tensor,
+                              const std::string& bias_tensor,
+                              uint32_t kernel_h,
+                              uint32_t kernel_w,
+                              uint32_t mode = 0,
+                              uint32_t stride_w = 1,
+                              uint32_t stride_h = 1,
+                              uint32_t pad_h = 0,
+                              uint32_t pad_w = 0,
+                              uint32_t dilation_h = 1,
+                              uint32_t dilation_w = 1,
+                              uint32_t output_pad_h = 0,
+                              uint32_t output_pad_w = 0) {
+    
         tensor_transposed_conv2d_context uniform{};
-        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();   // [N, C_in, H_in, W_in]
-        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl(); // [C_in, C_out, K_h, K_w]
-        uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();     // [C_out]
-        uniform.out_tensor = tensors[output_tensor]->getTensorImpl();    // [N, C_out, H_out, W_out]
-        uniform.stride_h = stride_h;
-        uniform.stride_w = stride_w;
-        uniform.pad_h = pad_h;
-        uniform.pad_w = pad_w;
-        uniform.dilation_h = dilation_h;
-        uniform.dilation_w = dilation_w;
+
+        constexpr uint32_t BM = 128;
+        constexpr uint32_t BN = 128;
+        constexpr uint32_t BK = 8;
+        constexpr uint32_t NUM_THREADS = 256;
+
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        // ---------------------------------------------------------------------
+        // Common setup
+        // ---------------------------------------------------------------------
+        const auto& input_shape = tensors[input_tensor]->shape;
+        const auto& weight_shape = tensors[weight_tensor]->shape;
+        const auto& output_shape = tensors[output_tensor]->shape;
+
+        // Validate shapes
+        if (input_shape.size() != 4)
+            throw std::invalid_argument("Input must be 4D [B, C_in, H_in, W_in]");
+        if (weight_shape.size() != 4)
+            throw std::invalid_argument("Weight must be 4D [C_in, C_out, KH, KW]");  // Note: C_in first!
+        if (output_shape.size() != 4)
+            throw std::invalid_argument("Output must be 4D [B, C_out, H_out, W_out]");
+
+        uint32_t batch_size = input_shape[0];
+        uint32_t in_channels = input_shape[1];
+        uint32_t in_height = input_shape[2];
+        uint32_t in_width = input_shape[3];
+
+        uint32_t weight_in_channels = weight_shape[0];  // First dimension is C_in
+        uint32_t out_channels = weight_shape[1];        // Second dimension is C_out
+        uint32_t weight_kh = weight_shape[2];
+        uint32_t weight_kw = weight_shape[3];
+
+        uint32_t out_batch = output_shape[0];
+        uint32_t out_c = output_shape[1];
+        uint32_t out_height = output_shape[2];
+        uint32_t out_width = output_shape[3];
+
+        // Validalte dimensions
+        if (weight_in_channels != in_channels)
+            throw std::invalid_argument("Weight input channels must match input channels");
+        if (weight_kh != kernel_h || weight_kw != kernel_w)
+            throw std::invalid_argument("Weight kernel size must match provided kernel size");
+        if (out_channels != out_c)
+            throw std::invalid_argument("Output channels must match weight output channels");
+        if (batch_size != out_batch)
+            throw std::invalid_argument("Output batch size must match input batch size");
+
+        // Calculate expected output dimensions for transposed convolution
+        // Formula: out = (in - 1) * stride - 2 * padding + dilation * (kernel - 1) + output_padding + 1
+        uint32_t expected_out_h = (in_height - 1) * stride_h - 2 * pad_h + dilation_h * (kernel_h - 1) + output_pad_h + 1;
+        uint32_t expected_out_w = (in_width - 1) * stride_w - 2 * pad_w + dilation_w * (kernel_w - 1) + output_pad_w + 1;
+
+        if (expected_out_h != out_height || expected_out_w != out_width)
+            throw std::invalid_argument("Output spatial dimensions don't match expected values. Expected: " +
+                                        std::to_string(expected_out_h) + "x" + std::to_string(expected_out_w) +
+                                        ", Got: " + std::to_string(out_height) + "x" + std::to_string(out_width));
+
+        // Fill uniform context
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
+        uniform.out_tensor = tensors[output_tensor]->getTensorImpl();
+
+        if (!bias_tensor.empty()) {
+            const auto& bias_shape = tensors[bias_tensor]->shape;
+            if (bias_shape.size() != 1 || bias_shape[0] != out_channels)
+                throw std::invalid_argument("Bias must be 1D [C_out]");
+            uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+            uniform.use_bias = 1;
+        } else {
+            uniform.use_bias = 0;
+        }
+
+        uniform.batch_size = batch_size;
+        uniform.in_channels = in_channels;
+        uniform.out_channels = out_channels;
+        uniform.in_height = in_height;
+        uniform.in_width = in_width;
+        uniform.out_height = out_height;
+        uniform.out_width = out_width;
         uniform.kernel_h = kernel_h;
         uniform.kernel_w = kernel_w;
-        uniform.output_pad_h = output_pad_h;
-        uniform.output_pad_w = output_pad_w;
-        uniform.groups = groups;
-        uniform.accumulate_grad = 1; // accumulate gradients
+        uniform.stride_h = stride_h;
+        uniform.stride_w = stride_w;
+        uniform.padding_h = pad_h;
+        uniform.padding_w = pad_w;
+        uniform.dilation_h = dilation_h;
+        uniform.dilation_w = dilation_w;
+        uniform.output_padding_h = output_pad_h;
+        uniform.output_padding_w = output_pad_w;
+        uniform.accumulate_grad = 1;
 
-        DEBUG_PRINT("TransposedConv2D tensor " << input_tensor << " with weights from " << weight_tensor << " into " << output_tensor);
+        // GEMM dimensions for TransposedConv2d
+        // M = out_height * out_width (output spatial dimensions flattened)
+        // N = out_channels
+        // K = in_channels * in_height * in_width (flattened input)
+        uint32_t M = out_height * out_width;
+        uint32_t N = out_channels;
+        uint32_t K = in_channels * in_height * in_width;
 
-        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uniform.m = M;
+        uniform.n = N;
+        uniform.k = K;
 
-        tensor_push_const pushConsts{};
+        DEBUG_PRINT("TransposedConv2d tensor " << input_tensor << " of shape "
+            << shapeToString(input_shape) << " with transposed weights " << weight_tensor
+            << " of shape " << shapeToString(weight_shape));
+
+        // ---------------------------------------------------------------------
+        // FORWARD
+        // ---------------------------------------------------------------------
         if (mode == 0) {
-            // Forward pass: map threads over output spatial dims and output channels
-            uint32_t groupX = cielDiv(tensors[output_tensor]->shape[3], 16u); // W_out
-            uint32_t groupY = cielDiv(tensors[output_tensor]->shape[2], 16u); // H_out
-            // output channels (C_out) are weight_tensor->shape[1] per your struct
-            uint32_t groupZ = tensors[output_tensor]->shape[0] * tensors[weight_tensor]->shape[1]; // batch * C_out
+            // Grid dimensions for forward pass
+            // GEMM: Output[B, M, N] = Input_reshaped[B, M, K] @ Weight_transformed[K, N]
+            // where the weight transformation implicitly happens via the kernel summation
+            uint32_t groupX = ceilDiv(N, BN);  // Output channels dimension
+            uint32_t groupY = ceilDiv(M, BM);  // Output spatial dimension (H_out * W_out)
+            uint32_t groupZ = batch_size;      // Batch dimension
 
             uint32_t workgroup[3] = { groupX, groupY, groupZ };
-            pushConsts.mode = 0; // forward
-            pushConsts.uniformAddress = transposedConv2dShader.uniformBuffer->getBufferAddress();
-            pushConsts.grid_size = { groupX, groupY, groupZ };
-            transposedConv2dShader.loadUniform(uniform, pushConsts);
+
+            tensor_push_const pc{};
+            pc.grid_size = { groupX, groupY, groupZ };
+            pc.mode = 0;
+            pc.uniformAddress = transposedConv2dShader.uniformBuffer->getBufferAddress();
+
+            transposedConv2dShader.loadUniform(uniform, pc);
             transposedConv2dShader.execute(workgroup);
+
+            return;
         }
-        else if (mode == 1) {
-            const uint32_t TILE = 16u;
-            pushConsts.uniformAddress = transposedConv2dShaderBackward.uniformBuffer->getBufferAddress();
 
-            // Kernel 0: gradient w.r.t. input (smaller input spatial)
-            {
-                uint32_t H_in = tensors[input_tensor]->shape[2];
-                uint32_t W_in = tensors[input_tensor]->shape[3];
-                uint32_t B = tensors[input_tensor]->shape[0];
-                uint32_t C_in = tensors[input_tensor]->shape[1];
+        // ---------------------------------------------------------------------
+        // BACKWARD
+        // ---------------------------------------------------------------------
+        
+        // For TransposedConv2d backward:
+        // M = in_height * in_width (input spatial)
+        // N = in_channels
+        // K = out_channels * kernel_h * kernel_w
+        uint32_t M_back = in_height * in_width;
+        uint32_t N_back = in_channels;
+        uint32_t K_back = out_channels * kernel_h * kernel_w;
+        
+        uniform.m = M_back;
+        uniform.n = N_back;
+        uniform.k = K_back;
+        
+        // ---- Kernel 1: dInput + dBias ----
+        // For TransposedConv2d backward, computing dInput is like doing regular convolution
+        // GEMM: dInput[B, M, N] = dOutput_col[B, M, K] @ Weight[K, N]
+        // where M = in_h * in_w, N = in_channels, K = out_channels * kh * kw
+        {
+            uint32_t groupX = ceilDiv(N_back, BN);  // Input channels dimension
+            uint32_t groupY = ceilDiv(M_back, BM);  // Input spatial dimension (H_in * W_in)
+            uint32_t groupZ = batch_size;           // Batch dimension
 
-                uint32_t grid_x = cielDiv(H_in, TILE); // tile over height
-                uint32_t grid_y = cielDiv(W_in, TILE); // tile over width
-                uint32_t grid_z = B * C_in;            // batch * C_in
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
 
-                uint32_t workgroup[3] = { grid_x, grid_y, grid_z };
-                pushConsts.grid_size = { grid_x, grid_y, grid_z };
-                pushConsts.mode = 0; // input gradient
-                uniform.kernel_type = 0;
-                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
-                transposedConv2dShaderBackward.execute(workgroup);
-            }
+            tensor_push_const pc{};
+            pc.grid_size = { groupX, groupY, groupZ };
+            uniform.kernel_type = 0;  // KERNEL_INPUT_GRAD
+            pc.mode = 1;
+            pc.uniformAddress = transposedConv2dShaderBackward.uniformBuffer->getBufferAddress();
 
-            // Kernel 1: gradient w.r.t. weights
-            {
-                uint32_t H_out = tensors[output_tensor]->shape[2];
-                uint32_t W_out = tensors[output_tensor]->shape[3];
-                uint32_t B = tensors[input_tensor]->shape[0];
-                uint32_t C_in = tensors[input_tensor]->shape[1];
+            transposedConv2dShaderBackward.loadUniform(uniform, pc);
+            transposedConv2dShaderBackward.execute(workgroup);
+        }
 
-                uint32_t grid_x = cielDiv(H_out, TILE); // tile over output height
-                uint32_t grid_y = cielDiv(W_out, TILE); // tile over output width
-                uint32_t grid_z = B * C_in;             // batch * C_in (note: C_in, not C_out)
+        // ---- Kernel 2: dWeight ----
+        // GEMM: dWeight[N, K] = Input^T[N, M] @ dOutput_col[M, K]
+        // where N = in_channels, M = in_h * in_w, K = out_channels * kh * kw
+        // Result stored as [C_in, C_out, KH, KW]
+        // Accumulated across batches
+        {
+            uint32_t groupX = ceilDiv(K_back, BN);  // Output filter dimension (C_out * KH * KW)
+            uint32_t groupY = ceilDiv(N_back, BM);  // Input channels dimension
+            uint32_t groupZ = batch_size;           // Batch dimension (accumulate across)
 
-                uint32_t workgroup[3] = { grid_x, grid_y, grid_z };
-                pushConsts.grid_size = { grid_x, grid_y, grid_z };
-                pushConsts.mode = 1; // weight gradient
-                uniform.kernel_type = 1;
-                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
-                transposedConv2dShaderBackward.execute(workgroup);
-            }
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
 
-            // Kernel 2: gradient w.r.t. bias
-            {
-                uint32_t C_out = tensors[weight_tensor]->shape[1]; // C_out
-                uint32_t workgroup[3] = { C_out, 1u, 1u };
-                pushConsts.grid_size = { C_out, 1u, 1u };
-                pushConsts.mode = 2; // bias gradient
-                uniform.kernel_type = 2;
-                transposedConv2dShaderBackward.loadUniform(uniform, pushConsts);
-                transposedConv2dShaderBackward.execute(workgroup);
-            }
+            tensor_push_const pc{};
+            pc.grid_size = { groupX, groupY, groupZ };
+            uniform.kernel_type = 1;  // KERNEL_WEIGHT_GRAD
+            pc.mode = 1;
+            pc.uniformAddress = transposedConv2dShaderBackward.uniformBuffer->getBufferAddress();
+
+            transposedConv2dShaderBackward.loadUniform(uniform, pc);
+            transposedConv2dShaderBackward.execute(workgroup);
         }
     }
 
@@ -2486,16 +2642,50 @@ struct TensorPool {
         // ---------------------------------------------------------------------
         // BACKWARD
         // ---------------------------------------------------------------------
-        const auto& input_shape  = tensors[input_tensor]->shape;
+        const auto original_shape = tensors[input_tensor]->shape;
+        const uint32_t total_elements = tensors[input_tensor]->get_num_elements();
+
+        if (original_shape.size() < 2)
+            throw std::invalid_argument("Backward: Input rank must be >= 2");
+
+        uint32_t orig_M = original_shape[original_shape.size() - 2];
+        uint32_t orig_K = original_shape.back();
+
         const auto& weight_shape = tensors[weight_tensor]->shape;
+        if (weight_shape.size() < 2)
+            throw std::invalid_argument("Backward: Weight rank must be >= 2");
 
-        if (input_shape.size() < 2 || weight_shape.size() < 2)
-            throw std::invalid_argument("Backward: rank must be >= 2");
+        uint32_t KB = weight_shape.back();
+        uint32_t N  = weight_shape[weight_shape.size() - 2];
 
-        uint32_t M = input_shape[input_shape.size() - 2];
-        uint32_t K = input_shape.back();
-        uint32_t N = weight_shape[weight_shape.size() - 2];
-        uint32_t batch_size = prod(input_shape, 0, input_shape.size() - 2);
+        bool reshaped = false;
+        std::vector<uint32_t> temp_shape;
+
+        uint32_t M = orig_M;
+        uint32_t K = orig_K;
+        uint32_t batch_size = prod(original_shape, 0, original_shape.size() - 2);
+
+        if (KB != orig_K) {
+            const auto& output_shape = tensors[output_tensor]->shape;
+            if (output_shape.size() < 2)
+                throw std::invalid_argument("Backward: Output rank must be >= 2");
+
+            temp_shape = output_shape;
+            temp_shape[temp_shape.size() - 1] = KB;
+
+            M = temp_shape[temp_shape.size() - 2];
+            K = KB;
+
+            uint64_t expected = 1;
+            for (auto d : temp_shape) expected *= d;
+
+            if (expected != total_elements)
+                throw std::invalid_argument("Backward: Inner-dim mismatch cannot be reconciled by view");
+
+            tensors[input_tensor]->view(temp_shape);
+            reshaped = true;
+            batch_size = prod(temp_shape, 0, temp_shape.size() - 2);
+        }
 
         uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
         uniform.m = M;
@@ -2504,40 +2694,48 @@ struct TensorPool {
         uniform.batch_size = batch_size;
 
         // ---- Kernel 1: dInput + dBias ----
-        {
-            uint32_t groupX = ceilDiv(K, BN);
-            uint32_t groupY = ceilDiv(M, BM);
-            uint32_t groupZ = batch_size;
+        try {
+            {
+                uint32_t groupX = ceilDiv(K, BN);
+                uint32_t groupY = ceilDiv(M, BM);
+                uint32_t groupZ = batch_size;
 
-            uint32_t workgroup[3] = { groupX, groupY, groupZ };
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
 
-            tensor_push_const pc{};
-            pc.grid_size = { groupX, groupY, groupZ };
-            uniform.kernel_type = 0;
-            pc.mode = 1;
-            pc.uniformAddress = linearShaderBackward.uniformBuffer->getBufferAddress();
+                tensor_push_const pc{};
+                pc.grid_size = { groupX, groupY, groupZ };
+                uniform.kernel_type = 0;
+                pc.mode = 1;
+                pc.uniformAddress = linearShaderBackward.uniformBuffer->getBufferAddress();
 
-            linearShaderBackward.loadUniform(uniform, pc);
-            linearShaderBackward.execute(workgroup);
+                linearShaderBackward.loadUniform(uniform, pc);
+                linearShaderBackward.execute(workgroup);
+            }
+
+            // ---- Kernel 2: dWeight ----
+            {
+                uint32_t groupX = ceilDiv(K, BN);
+                uint32_t groupY = ceilDiv(N, BM);
+                uint32_t groupZ = batch_size;
+
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+                tensor_push_const pc{};
+                pc.grid_size = { groupX, groupY, groupZ };
+                uniform.kernel_type = 1;
+                pc.mode = 1;
+                pc.uniformAddress = linearShaderBackward.uniformBuffer->getBufferAddress();
+
+                linearShaderBackward.loadUniform(uniform, pc);
+                linearShaderBackward.execute(workgroup);
+            }
+        } catch (...) {
+            if (reshaped) tensors[input_tensor]->view(original_shape);
+            throw;
         }
 
-        // ---- Kernel 2: dWeight ----
-        {
-            uint32_t groupX = ceilDiv(K, BN);
-            uint32_t groupY = ceilDiv(N, BM);
-            uint32_t groupZ = batch_size;
-
-            uint32_t workgroup[3] = { groupX, groupY, groupZ };
-
-            tensor_push_const pc{};
-            pc.grid_size = { groupX, groupY, groupZ };
-            uniform.kernel_type = 1;
-            pc.mode = 1;
-            pc.uniformAddress = linearShaderBackward.uniformBuffer->getBufferAddress();
-
-            linearShaderBackward.loadUniform(uniform, pc);
-            linearShaderBackward.execute(workgroup);
-        }
+        if (reshaped)
+            tensors[input_tensor]->view(original_shape);
     }
 
     // Automatically populates predicted tensor's gradient buffer with a single call. No need to call .backward()
@@ -2830,14 +3028,12 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, tensor_layernorm1d_context> layernorm1dShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShader; // computes embedding lookup
     gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShaderBackward;
-    gpuTaskNoDesc<T, tensor_push_const, tensor_upsample_context> upsampleShader; // upsamples image tensors [B, C, H, W]
+    gpuTaskNoDesc<T, tensor_push_const, tensor_upsample_context> upsampleShader; // upsamples image tensors [B, C, H, W] using bilinear interpolation
     gpuTaskNoDesc<T, tensor_push_const, tensor_upsample_context> upsampleShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, tensor_cmp_context> cmpShader; // compares two tensors for equality
     gpuTaskNoDesc<T, tensor_push_const, mean_context> mean_shader; // compute the mean of a tensor
     gpuTaskNoDesc<T, tensor_push_const, tensor_sample_context> sampleShader; // returns class index of highest probability
     gpuTaskNoDesc<T, tensor_push_const, tensor_fill_rand_uniform_address<T>> fillRandomShader; // fills tensor with random values
-    gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3; // computes 2D convolution with 3x3 kernel
-    gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_3x3_context> conv2dShader3x3Backward; // computes 2D convolution with 3x3 kernel backward pass
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_context> conv2dShader;    // generalized conv2d shader. Supports any kernel size up to 15x15
     gpuTaskNoDesc<T, tensor_push_const, tensor_conv2d_context> conv2dShaderBackward;    // generalized conv2d backward shader. Supports any kernel size up to 15x15
     gpuTaskNoDesc<T, tensor_push_const, tensor_transposed_conv2d_context> transposedConv2dShader;   // generalized transposed conv2d shader.

@@ -46,9 +46,8 @@ layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuff
 };
 
 layout(push_constant) uniform PushConstants {
-    ContextBuffer context;
-    uvec3 grid_size;
-    uint  kernel_type; // 0=forward, 1=backward
+    ContextBuffer context;   // host must match std430 layout
+    uvec3 grid_size;         // number of workgroups dispatched (gl_NumWorkGroups)
 } push;
 
 // Convert flat index to multi-dimensional indices

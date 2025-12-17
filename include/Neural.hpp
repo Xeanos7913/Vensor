@@ -455,7 +455,7 @@ struct BatchNorm1d : public Module<T> {
 			save_var = &tensorPool->createTensor({ channels, features }, name + "-save_var");
 		}
 		
-		tensorPool->tensor_fill_random(weight_tensor->name, 1.0f, 1.0f);
+		tensorPool->tensor_fill_random(weight_tensor->name, 4, 0.0f, 0.0f, 1.0f, 1.0f);
 		// keep bias at zero at initialization
 	}
 
@@ -704,128 +704,6 @@ struct Layernorm : public Module<T> {
 };
 
 template<typename T>
-struct Conv2d3x3 : public Module<T> {
-	//Tensor<T>* output;
-	Tensor<T>* weight_tensor; // [C_out, C_in, K_h, K_w]
-	Tensor<T>* bias_tensor;   // [C_out]
-	TensorPool<T>* tensorPool;
-	std::string name;
-	std::string output_name;
-
-	uint32_t stride_w = 1;
-	uint32_t stride_h = 1;
-	uint32_t pad_h = 1;
-	uint32_t pad_w = 1;
-	uint32_t dilation_h = 1;
-	uint32_t dilation_w = 1;
-	uint32_t groups = 1;
-
-	uint32_t output_height;
-	uint32_t output_width;
-
-	Conv2d3x3(TensorPool<T>* pool, uint32_t in_channels, uint32_t out_channels, uint32_t batch_size, uint32_t height, uint32_t width, const std::string& name,
-    uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1, uint32_t groups = 1) 
-    : tensorPool(pool), name(name) {
-		// Validate parameters
-		if (pad_h > 2 || pad_w > 2) {
-			throw std::invalid_argument("Padding must be 0, 1, or 2");
-		}
-		if (stride_h == 0 || stride_w == 0) {
-			throw std::invalid_argument("Stride must be greater than 0");
-		}
-		if (dilation_h > 2 || dilation_w > 2) {
-			throw std::invalid_argument("Dilation must be 1 or 2");
-		}
-		
-		// Calculate effective kernel size with dilation
-		uint32_t effective_kernel_h = 3 + (3 - 1) * (dilation_h - 1);
-		uint32_t effective_kernel_w = 3 + (3 - 1) * (dilation_w - 1);
-		
-		// Calculate output dimensions
-		this->output_height = ((height + 2 * pad_h - effective_kernel_h) / stride_h) + 1;
-		this->output_width = ((width + 2 * pad_w - effective_kernel_w) / stride_w) + 1;
-		
-		// Validate output dimensions
-		if (this->output_height < 1 || this->output_width < 1) {
-			throw std::invalid_argument("Invalid combination of input size, padding, stride and dilation");
-		}
-		
-		this->stride_w = stride_w;
-		this->stride_h = stride_h;
-		this->pad_w = pad_w;
-		this->pad_h = pad_h;
-		this->dilation_h = dilation_h;
-		this->dilation_w = dilation_w;
-		this->groups = groups;
-		
-		output_name = name + "-output";
-		this->output = &tensorPool->createTensor({ batch_size, out_channels, this->output_height, this->output_width }, output_name);
-		weight_tensor = &tensorPool->createTensor({ out_channels, in_channels, 3, 3 }, name + "-weight");
-		bias_tensor = &tensorPool->createTensor({ out_channels }, name + "-bias");
-		
-		// He initialization for Conv2d (assuming ReLU follows)
-		uint32_t fan_in = in_channels * 3 * 3; // in_channels * kernel_h * kernel_w
-		tensorPool->tensor_fill_random(weight_tensor->name, 3, fan_in, 0, 0.0f, 0.0f);
-		tensorPool->tensor_fill_random(bias_tensor->name, 4, 0, 0, 0.0f, 0.0f);
-	}
-
-	Conv2d3x3(TensorPool<T>* pool, const std::vector<uint32_t>& weight_dims, const std::vector<uint32_t>& output_dims, const std::string& name) 
-		: tensorPool(pool), name(name) {
-		if (weight_dims[2] != 3 || weight_dims[3] != 3) {
-			throw std::invalid_argument("Weight dimensions must be [out_channels, in_channels, 3, 3]");
-		}
-		
-		output_name = name + "-output";
-		this->output = &tensorPool->createTensor(output_dims, output_name);
-		weight_tensor = &tensorPool->createTensor(weight_dims, name + "-weight");
-		bias_tensor = &tensorPool->createTensor({ weight_dims[0] }, name + "-bias");
-		
-		// He initialization
-		uint32_t fan_in = weight_dims[1] * 3 * 3; // in_channels * 3 * 3
-		tensorPool->tensor_fill_random(weight_tensor->name, 3, fan_in, 0, 0.0f, 0.0f);
-		tensorPool->tensor_fill_random(bias_tensor->name, 4, 0, 0, 0.0f, 0.0f);
-	}
-
-	Conv2d3x3(){}; // default empty ctor
-
-	std::vector<Tensor<T>*> getTrainableTensors() override {
-		return {weight_tensor, bias_tensor};
-	}
-
-	void serializeTrainableTensors(std::ofstream& filestream) override {
-		weight_tensor->save_to_stream(filestream);
-		bias_tensor->save_to_stream(filestream);
-	}
-
-	void loadFromSerializedTensor(std::ifstream& filestream) override {
-		weight_tensor->load_from_stream(filestream);
-		bias_tensor->load_from_stream(filestream);
-	}
-
-	// input tensor shape: [N, C_in, H_in, W_in]
-	Tensor<T>* forward(Tensor<T>* input) override {
-		// Ensure input tensor shape matches expected dimensions
-		if (input->shape.size() != 4) {
-			throw std::invalid_argument("Input tensor must have 4 dimensions: [N, C_in, H_in, W_in]");
-		}
-		if (input->shape[1] != weight_tensor->shape[1]) {
-			throw std::invalid_argument("Input channels (C_in) must match weight tensor's input channels");
-		}
-		if (input->shape[2] < 3 || input->shape[3] < 3) {
-			throw std::invalid_argument("Input height and width must be at least 3 to apply a 3x3 convolution");
-		}
-
-		tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
-		this->output->back.push_back([this, input](){
-			this->tensorPool->tensor_conv2d_3x3(output_name, input->name, weight_tensor->name, bias_tensor->name, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
-			input->backward();
-		});
-		
-		return this->output;
-	}
-};
-
-template<typename T>
 struct Conv2d : public Module<T> {
 	//Tensor<T>* output;
 	Tensor<T>* weight_tensor; // [C_out, C_in, K_h, K_w]
@@ -840,14 +718,13 @@ struct Conv2d : public Module<T> {
 	uint32_t pad_w = 1;
 	uint32_t dilation_h = 1;
 	uint32_t dilation_w = 1;
-	uint32_t groups = 1;
 	uint32_t kernel_h, kernel_w;
 
 	uint32_t output_height;
 	uint32_t output_width;
 
 	Conv2d(TensorPool<T>* pool, uint32_t in_channels, uint32_t out_channels, uint32_t batch_size, uint32_t height, uint32_t width, uint32_t kernel_h, uint32_t kernel_w, const std::string& name,
-    uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1, uint32_t groups = 1) 
+    uint32_t stride_w = 1, uint32_t stride_h = 1, uint32_t pad_h = 1, uint32_t pad_w = 1, uint32_t dilation_h = 1, uint32_t dilation_w = 1) 
     : tensorPool(pool), name(name), kernel_h(kernel_h), kernel_w(kernel_w) {
 		// Validate parameters
 		if (pad_h > 2 || pad_w > 2) {
@@ -882,7 +759,6 @@ struct Conv2d : public Module<T> {
 		this->pad_h = pad_h;
 		this->dilation_h = dilation_h;
 		this->dilation_w = dilation_w;
-		this->groups = groups;
 		
 		output_name = name + "-output";
 		this->output = &tensorPool->createTensor({ batch_size, out_channels, this->output_height, this->output_width }, output_name);
@@ -945,9 +821,9 @@ struct Conv2d : public Module<T> {
 			throw std::invalid_argument("Input height and width must be at least 3 to apply a 3x3 convolution");
 		}
 
-		tensorPool->tensor_conv2d(output_name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
+		tensorPool->tensor_conv2d(this->output->name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 0, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w);
 		this->output->back.push_back([this, input](){
-			this->tensorPool->tensor_conv2d(output_name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w, groups);
+			this->tensorPool->tensor_conv2d(this->output->name, input->name, weight_tensor->name, bias_tensor->name, kernel_h, kernel_w, 1, stride_w, stride_h, pad_h, pad_w, dilation_h, dilation_w);
 			input->backward();
 		});
 		
@@ -996,7 +872,6 @@ struct TransposedConv2d : public Module<T> {
     uint32_t dilation_w = 1;
     uint32_t output_pad_h = 0;
     uint32_t output_pad_w = 0;
-    uint32_t groups = 1;
     uint32_t kernel_h, kernel_w;
 
     uint32_t output_height;
@@ -1018,8 +893,7 @@ struct TransposedConv2d : public Module<T> {
                  uint32_t dilation_h = 1,
                  uint32_t dilation_w = 1,
                  uint32_t output_pad_h = 0,
-                 uint32_t output_pad_w = 0,
-                 uint32_t groups = 1)
+                 uint32_t output_pad_w = 0)
     : tensorPool(pool), name(name), kernel_h(kernel_h), kernel_w(kernel_w)
 	{
 		if (stride_h == 0 || stride_w == 0)
@@ -1043,7 +917,6 @@ struct TransposedConv2d : public Module<T> {
 		this->dilation_w = dilation_w;
 		this->output_pad_h = output_pad_h;
 		this->output_pad_w = output_pad_w;
-		this->groups = groups;
 		
 		output_name = name + "-output";
 		this->output = &tensorPool->createTensor({ batch_size, out_channels, output_height, output_width }, output_name);
@@ -1116,8 +989,7 @@ struct TransposedConv2d : public Module<T> {
             stride_w, stride_h,
             pad_h, pad_w,
             dilation_h, dilation_w,
-            output_pad_h, output_pad_w,
-            groups
+            output_pad_h, output_pad_w
         );
 
 		this->output->back.push_back([this, input](){
@@ -1131,8 +1003,7 @@ struct TransposedConv2d : public Module<T> {
 				stride_w, stride_h,
 				pad_h, pad_w,
 				dilation_h, dilation_w,
-				output_pad_h, output_pad_w,
-				groups
+				output_pad_h, output_pad_w
         	);
 			input->backward();
 		});
