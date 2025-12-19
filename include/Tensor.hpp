@@ -566,10 +566,8 @@ struct Tensor {
 
     void backward() {
         for (size_t i = back.size(); i-- > 0; ) {
-            if (back[i]) {
-                DEBUG_PRINT("Calling backward " << i << " for tensor: " << name);
-                back[i]();
-            }
+            DEBUG_PRINT("Calling backward " << i << " for tensor: " << name);
+            back[i]();
         }
     }
 
@@ -2267,42 +2265,88 @@ struct TensorPool {
             return *output;
         }
     }
-
-    void tensor_upsample(const std::string& input_tensor, const std::string& output_tensor, uint32_t mode = 0){
+    
+    void tensor_upsample(const std::string& input_tensor, const std::string& output_tensor, 
+                        uint32_t height_in, uint32_t width_in, 
+                        uint32_t height_out, uint32_t width_out, 
+                        uint32_t mode = 0){
         auto inp = tensors[input_tensor].get();
         auto ou = tensors[output_tensor].get();
-
-        if((inp->shape.size() != ou->shape.size()) || inp->shape.size() != 4){
-            throw std::invalid_argument("Can only upsample tensors of shape [B, N, H, W]");
+        
+        const auto original_shape = inp->shape;
+        const uint32_t total_elements = inp->get_num_elements();
+        
+        if(original_shape.size() < 1){
+            throw std::invalid_argument("Input tensor must have at least 1 dimension");
         }
-
+        
+        uint32_t batch_size = original_shape[0];
+        
+        // Calculate required channels based on input elements and dimensions
+        uint32_t required_elements_per_batch = height_in * width_in;
+        if(total_elements % batch_size != 0){
+            throw std::invalid_argument("Total elements must be divisible by batch size");
+        }
+        
+        uint32_t elements_per_batch = total_elements / batch_size;
+        if(elements_per_batch % required_elements_per_batch != 0){
+            throw std::invalid_argument("Elements per batch incompatible with height_in * width_in");
+        }
+        
+        uint32_t channels = elements_per_batch / required_elements_per_batch;
+        
+        // Create the required 4D view [B, C, H, W]
+        std::vector<uint32_t> temp_shape = {batch_size, channels, height_in, width_in};
+        
+        // Verify the view is valid
+        uint64_t expected = 1;
+        for (auto d : temp_shape) expected *= d;
+        
+        if (expected != total_elements){
+            throw std::invalid_argument("Cannot create valid [B, C, H, W] view with given dimensions");
+        }
+        
+        bool reshaped = (temp_shape != original_shape);
+        
+        if(reshaped){
+            tensors[input_tensor]->view(temp_shape);
+        }
+        
         tensor_upsample_context uniform;
         uniform.input_tensor = inp->getTensorImpl();
         uniform.output_tensor = ou->getTensorImpl();
-        uniform.batch_size = inp->shape[0];
-        uniform.channels = inp->shape[1];
-        uniform.height_in = inp->shape[2];
-        uniform.width_in = inp->shape[3];
-        uniform.height_out = ou->shape[2];
-        uniform.width_out = ou->shape[3];
+        uniform.batch_size = batch_size;
+        uniform.channels = channels;
+        uniform.height_in = height_in;
+        uniform.width_in = width_in;
+        uniform.height_out = height_out;
+        uniform.width_out = width_out;
         
         uint32_t numElements = uniform.output_tensor.num_elements;
-
-        auto cielDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
-        uint32_t grpx = cielDiv(numElements, 256u);
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+        uint32_t grpx = ceilDiv(numElements, 256u);
         uint32_t wrkgrp[3] = {grpx, 1, 1};
-
+        
         tensor_push_const push;
-        if(mode == 0){
-            push.uniformAddress = upsampleShader.uniformBuffer->getBufferAddress();
-            upsampleShader.loadUniform(uniform, push);
-            upsampleShader.execute(wrkgrp);
+        
+        try {
+            if(mode == 0){
+                push.uniformAddress = upsampleShader.uniformBuffer->getBufferAddress();
+                upsampleShader.loadUniform(uniform, push);
+                upsampleShader.execute(wrkgrp);
+            }
+            else{
+                push.uniformAddress = upsampleShaderBackward.uniformBuffer->getBufferAddress();
+                upsampleShaderBackward.loadUniform(uniform, push);
+                upsampleShaderBackward.execute(wrkgrp);
+            }
+        } catch (...) {
+            if (reshaped) tensors[input_tensor]->view(original_shape);
+            throw;
         }
-        else{
-            push.uniformAddress = upsampleShaderBackward.uniformBuffer->getBufferAddress();
-            upsampleShaderBackward.loadUniform(uniform, push);
-            upsampleShaderBackward.execute(wrkgrp);
-        }
+        
+        if (reshaped)
+            tensors[input_tensor]->view(original_shape);
     }
 
     // computes output = exp(input)

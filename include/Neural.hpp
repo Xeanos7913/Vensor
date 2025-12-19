@@ -835,20 +835,33 @@ struct Conv2d : public Module<T> {
 template<typename T>
 struct Upsample : public Module<T>{
 	TensorPool<float>* tensorPool;
-	uint32_t height_out;
-	uint32_t width_out;
+	uint32_t height_out, height_in;
+	uint32_t width_out, width_in;
 	std::string name;
-	Upsample(TensorPool<float>* tensorPool, uint32_t height_out, uint32_t width_out, const std::string& name) 
-	: tensorPool(tensorPool), height_out(height_out), width_out(width_out), name(name) {}
+	Upsample(TensorPool<float>* tensorPool, uint32_t height_in, uint32_t width_in, uint32_t height_out, uint32_t width_out, const std::string& name) 
+	: tensorPool(tensorPool), height_out(height_out), width_out(width_out), height_in(height_in), width_in(width_in), name(name) {}
 	Upsample(){}
 
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(this->output == nullptr){
-			this->output = &tensorPool->createTensor({input->shape[0], input->shape[1], height_out, width_out}, name + "-output");
+			uint32_t batch_size = input->shape[0];
+			const uint32_t total_elements = input->get_num_elements();
+			uint32_t required_elements_per_batch = height_in * width_in;
+			if(total_elements % batch_size != 0){
+				throw std::invalid_argument("Total elements must be divisible by batch size");
+			}
+			
+			uint32_t elements_per_batch = total_elements / batch_size;
+			if(elements_per_batch % required_elements_per_batch != 0){
+				throw std::invalid_argument("Elements per batch incompatible with height_in * width_in");
+			}
+			
+			uint32_t channels = elements_per_batch / required_elements_per_batch;
+			this->output = &tensorPool->createTensor({batch_size, channels, height_out, width_out}, name + "-output");
 		}
-		tensorPool->tensor_upsample(input->name, this->output->name);
+		tensorPool->tensor_upsample(input->name, this->output->name, height_in, width_in, height_out, width_out);
 		this->output->back.push_back([this, input](){
-			this->tensorPool->tensor_upsample(input->name, this->output->name, 1);
+			this->tensorPool->tensor_upsample(input->name, this->output->name, height_in, width_in, height_out, width_out, 1);
 			input->backward();
 		});
 
@@ -1115,15 +1128,13 @@ struct ShapeTo : public Module<T> {
 	ShapeTo(){};
 
 	Tensor<T>* forward(Tensor<T>* input) override {
-		original_shape = input->shape;
-		input->view(new_shape);
-
-		auto saved_shape = original_shape;   // COPY
+		auto saved_shape = input->shape;   // COPY
 
 		input->back.push_back([input, saved_shape]() mutable {
 			input->view(saved_shape);
 		});
-
+		input->view(new_shape);
+		
 		this->output = input;
 		return this->output;
 	}
