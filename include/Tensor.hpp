@@ -2867,7 +2867,7 @@ struct TensorPool {
         uniform.mu_tensor = tensors[mu_tensor]->getTensorImpl();
         uniform.elements_per_batch = std::accumulate(tensors[mu_tensor]->shape.begin() + 1, tensors[mu_tensor]->shape.end(), 1, std::multiplies<uint32_t>());
         uniform.loss_tensor = tensors[loss_tensor]->getTensorImpl();
-        uniform.beta = 0.1f;
+        uniform.beta = 0.001f;
 
         uint32_t grpx = (uniform.elements_per_batch + (256 * 4) - 1)/(256 * 4);
         uint32_t wrkgrp[3] = {grpx, 1, uniform.batch_size};

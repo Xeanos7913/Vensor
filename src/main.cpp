@@ -597,7 +597,7 @@ static void write_tensor_image_png(Tensor<float>* tensor,
 	std::cout << "Wrote image: " << out_path << "\n";
 }
 
-// WIP vae for the MNIST dataset
+// Working vae for the MNIST dataset
 struct VAE {
 
 	Allocator* allocator;
@@ -607,15 +607,13 @@ struct VAE {
 	Sequential<float> enc_conv;
 	Sequential<float> dec_conv;
 	Linear<float> fc_mu;
-	ReLU<float> fc_mu_relu;
 	Linear<float> fc_logvar;
-	ReLU<float> fc_logvar_relu;
 	MSEloss<float> mseLoss;
 	KLDloss<float> kldLoss;
 
 	SDGoptim<float> optim;
 
-	uint32_t latent_dim = 256;
+	uint32_t latent_dim = 64;
 
 	std::unique_ptr<MNISTDataloader<float>> dataLoader;
 
@@ -627,7 +625,7 @@ struct VAE {
 
 		optim = SDGoptim<float>(allocator);
 		optim.batch_size = 16;
-		optim.lr = 1e-05;
+		optim.lr = 5e-04;
 
 		// ------------------------------
 		// Encoder
@@ -652,8 +650,6 @@ struct VAE {
 
 		auto relu2 = std::make_unique<ReLU<float>>(&tensorPool, "relu2");
 
-		auto flatten = std::make_unique<FlattenTo1d<float>>(&tensorPool, "flatten1");
-
 		auto enc_fc = std::make_unique<Linear<float>>(
 			&tensorPool,
 			64 * conv2->output_height * conv2->output_width,
@@ -663,17 +659,15 @@ struct VAE {
 		);
 
 		// mu / logvar heads
-		fc_mu_relu     = ReLU<float>(&tensorPool, "fc_mu_relu");
 		fc_mu          = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_mu");
-		fc_logvar_relu = ReLU<float>(&tensorPool, "fc_logvar_relu");
 		fc_logvar      = Linear<float>(&tensorPool, 512, latent_dim, 16, "fc_logvar");
 
 		// ------------------------------
-		// Decoder (replacing ConvTranspose2d)
+		// Decoder
 		// ------------------------------
 		auto dec_fc = std::make_unique<Linear<float>>(
 			&tensorPool,
-			28 * 28,
+			latent_dim,
 			64 * conv2->output_height * conv2->output_width,
 			16,
 			"dec_fc"
@@ -747,20 +741,15 @@ struct VAE {
 		enc_conv = Sequential<float>(&tensorPool, "enc");
 		enc_conv.addLayer(std::move(conv1));
 		enc_conv.addLayer(std::move(relu1));
-
 		enc_conv.addLayer(std::move(conv2));
 		enc_conv.addLayer(std::move(relu2));
-		
 		enc_conv.addLayer(std::move(enc_fc));
 
 		dec_conv = Sequential<float>(&tensorPool, "dec");
 		dec_conv.addLayer(std::move(dec_fc));
 		dec_conv.addLayer(std::move(relu3));
-
 		dec_conv.addLayer(std::move(upsample1));
 		dec_conv.addLayer(std::move(dec_conv1));
-		//dec_conv.addLayer(std::move(relu4));
-
 		dec_conv.addLayer(std::move(upsample2));
 		dec_conv.addLayer(std::move(dec_conv2));
 		dec_conv.addLayer(std::move(tanh));
@@ -775,23 +764,23 @@ struct VAE {
 	}
 
 	std::pair<Tensor<float>*, Tensor<float>*> encode(Tensor<float>* input) {
-		auto h = dec_conv(input);
+		
+		auto h = enc_conv(input);
+		auto mu = fc_mu(h);
+		auto logvar = fc_logvar(h);
 
-		//auto mu = fc_mu(h);
-		auto logvar = nullptr;//fc_logvar(h);
-
-		return {h, logvar};
+		return {mu, logvar};
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		//auto &std_tensor = (0.01f * *logvar).exp();
-		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
+		auto &std_tensor = (0.5f * *logvar).exp();
+		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		
 		// Use Gaussian/Normal distribution N(0, 1) for VAE reparameterization
 		// init_type=1: Normal distribution with mean=0.0, stddev=1.0
-		//tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
+		tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
 		
-		return &(*mu);
+		return &(*mu + std_tensor * eps_tensor);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -807,50 +796,75 @@ struct VAE {
 	Tensor<float>* loss_function(Tensor<float>* recon, Tensor<float>* x, Tensor<float>* mu, Tensor<float>* logvar) {
 		mseLoss.target = x;
 		auto &ml = *mseLoss(recon);
-		//kldLoss.logvar_tensor = logvar;
-		//kldLoss.mu_tensor = mu;
-		//auto &kld = *kldLoss(x);
+		kldLoss.logvar_tensor = logvar;
+		kldLoss.mu_tensor = mu;
+		auto &kld = *kldLoss(x);
 
-		return &(ml);
+		return &(ml + kld);
 	}
 
 	void train(int epoch){
-		using namespace std::chrono;
-		auto epoch_start = high_resolution_clock::now();
+		using clock = std::chrono::high_resolution_clock;
+		using ms    = std::chrono::duration<double, std::milli>;
+
+		auto epoch_start = clock::now();
 
 		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
 
-		Tensor<float>* loss = nullptr;
+		Tensor<float>* loss  = nullptr;
 		Tensor<float>* recon = nullptr;
+
+		double fwd_ms = 0.0;
+		double bwd_ms = 0.0;
+		double opt_ms = 0.0;
+
 		progressbar bar(100, true, std::cout);
+
 		for(int i = 0; i < dataLoader->num_batches; i++){
 			auto* input = dataLoader->imagesBatchTensors[i];
 
-			//auto* input = &tensorPool.createTensor({16, 1, 28, 28}, "in");
-			//tensorPool.tensor_fill_random("in", 0, .0f, .0f, -1.0f, 1.0f);
+			// ---- forward pass ----
+			auto t0 = clock::now();
+			auto [mu, logvar] = encode(input);
+			auto z = reparameterize(mu, logvar);
+			recon = decode(z);
+			loss  = loss_function(recon, input, mu, logvar);
+			auto t1 = clock::now();
+			fwd_ms += ms(t1 - t0).count();
 
-			recon = encode(input).first;
-
-			loss = loss_function(recon, input, nullptr, nullptr);
-			
+			// ---- backward pass ----
+			auto t2 = clock::now();
 			loss->backward();
+			auto t3 = clock::now();
+			bwd_ms += ms(t3 - t2).count();
 
-			//fc_mu.output->printGradient();
-			//dynamic_cast<Conv2d<float>*>(dec_conv.layers[3].get())->output->printGradient();
-			//input->printGradient();
-
+			// ---- optimizer step ----
+			auto t4 = clock::now();
 			optim.step();
 			tensorPool.zero_out_all_grads();
+			auto t5 = clock::now();
+			opt_ms += ms(t5 - t4).count();
+
 			bar.update();
 		}
-		
+
+		int n = dataLoader->num_batches;
+
+		auto epoch_end = clock::now();
+		double epoch_ms = ms(epoch_end - epoch_start).count();
+
+		double avg_fwd = fwd_ms / n;
+		double avg_bwd = bwd_ms / n;
+		double avg_opt = opt_ms / n;
+
 		auto l = tensorPool.find_mean_of_tensor(loss->name);
 
-		auto epoch_end = high_resolution_clock::now();
-		double elapsed_ms = duration_cast<duration<double, std::milli>>(epoch_end - epoch_start).count();
+		std::cout << "epoch loss: " << l << "\n";
+		std::cout << "epoch time: " << epoch_ms << " ms\n";
+		std::cout << "avg forward:  " << avg_fwd << " ms/batch\n";
+		std::cout << "avg backward: " << avg_bwd << " ms/batch\n";
+		std::cout << "avg optim:    " << avg_opt << " ms/batch\n";
 
-		std::cout << " epoch loss: " << l << "\n";
-		std::cout << " epoch " << epoch << " time: " << elapsed_ms << " ms\n";
 		auto s = recon->shape;
 		recon->view({16, 1, 28, 28});
 		write_tensor_image_png(recon, "recon_" + std::to_string(epoch) + ".png");
@@ -858,6 +872,7 @@ struct VAE {
 	}
 };
 
+/*
 int main(void){
 	
 	Init init;
@@ -875,6 +890,7 @@ int main(void){
 	delete allocator;
 	return 0;
 }
+*/
 
 /*
 int main(void){
