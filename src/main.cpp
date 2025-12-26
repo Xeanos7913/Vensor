@@ -873,6 +873,7 @@ struct VAE {
 	}
 };
 
+/*
 int main(void){
 	
 	Init init;
@@ -890,6 +891,7 @@ int main(void){
 	delete allocator;
 	return 0;
 }
+*/
 
 /*
 int main(void){
@@ -1133,41 +1135,6 @@ int main(void) {
 	return 0;
 }
 */
-
-// Handwritten image generation model using a VAE
-/*
-struct Trainer {
-
-	Init init;
-	Allocator* allocator;
-	TensorPool<float> tensorPool;
-
-	MNISTDataloader<float> dataLoader;
-
-	Sequential<float> sequence;
-	MSEloss<float> mseLoss;
-
-	Trainer() {
-		device_initialization(init);
-		allocator = new Allocator(&init);
-		tensorPool = TensorPool<float>(allocator);
-		dataLoader = MNISTDataloader<float>(&tensorPool, 16, 200);
-
-		// build the VAE encoder-decoder
-		{
-			// encode
-			auto encoder = std::make_unique<Sequential<float>>(&tensorPool);
-			auto conv1 = std::make_unique<Conv2d<float>>(&tensorPool, 1, 32, 16, 28, 28, 4, 4, "conv1", 2, 2);
-			auto flatten1 = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 32 * conv1->output_height * conv1->output_width}, "flatten1");
-			auto ReLU1 = std::make_unique<ReLU<float>>(&tensorPool, 32 * conv1->output_height * conv1->output_width, 16, "relu-1");
-			auto reshape1 = std::make_unique<ShapeTo<float>>(&tensorPool, vec{16, 32, conv1->output_height, conv1->output_width}, "reshape1");
-			auto conv2 = std::make_unique<Conv2d<float>>(&tensorPool, 32, 64, 16, conv1->output_height, conv1->output_width, "conv2d-2", 2, 2);
-		}
-	}
-};
-*/
-
-// dataloader sanity check:
 
 // Example usage: load MNIST batch and write the first image to output_images/mnist_sample.png
 /*

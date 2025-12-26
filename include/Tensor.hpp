@@ -2426,16 +2426,6 @@ struct TensorPool {
         uint32_t mode = 0) {
 
         linear_context uniform{};
-        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
-        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
-        if (!bias_tensor.empty()) {
-            uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
-            uniform.use_bias = 1;
-        } else {
-            uniform.use_bias = 0;
-        }
-        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
-        uniform.mode = 0; // Tiling mode
 
         auto prod = [](const std::vector<uint32_t>& v, size_t l, size_t r)->uint32_t {
             uint64_t p = 1;
@@ -2444,121 +2434,211 @@ struct TensorPool {
             return static_cast<uint32_t>(p);
         };
 
-        // Input shape X[..., M, K]
-        const auto& shape = tensors[input_tensor]->shape;
-        if (shape.size() < 2)
-            throw std::invalid_argument("Rank must be >= 2");
-        uint32_t M = shape[shape.size() - 2];
-        uint32_t K = shape.back();
+        // ---------------------------------------------------------------------
+        // Common setup
+        // ---------------------------------------------------------------------
+        uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
 
-        // Weight shape W[..., N, K] (transposed)
+        if (!bias_tensor.empty()) {
+            uniform.bias_tensor = tensors[bias_tensor]->getTensorImpl();
+            uniform.use_bias = 1;
+        } else {
+            uniform.use_bias = 0;
+        }
+
+        uniform.output_tensor = tensors[output_tensor]->getTensorImpl();
+        uniform.mode = mode;
+        uniform.accumulate_grad = 1;
+
+        constexpr uint32_t BM = 128;
+        constexpr uint32_t BN = 128;
+        constexpr uint32_t BK = 8;
+        constexpr uint32_t NUM_THREADS = 256;
+
+        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+
+        // ---------------------------------------------------------------------
+        // FORWARD
+        // ---------------------------------------------------------------------
+        if (mode == 0) {
+            const auto original_shape = tensors[input_tensor]->shape;
+            const uint32_t total_elements = tensors[input_tensor]->get_num_elements();
+
+            if (original_shape.size() < 2)
+                throw std::invalid_argument("Input rank must be >= 2");
+
+            uint32_t orig_M = original_shape[original_shape.size() - 2];
+            uint32_t orig_K = original_shape.back();
+
+            const auto& weight_shape = tensors[weight_tensor]->shape;
+            if (weight_shape.size() < 2)
+                throw std::invalid_argument("Weight rank must be >= 2");
+
+            uint32_t KB = weight_shape.back();
+            uint32_t N  = weight_shape[weight_shape.size() - 2];
+
+            bool reshaped = false;
+            std::vector<uint32_t> temp_shape;
+
+            uint32_t M = orig_M;
+            uint32_t K = orig_K;
+            uint32_t batch_size = prod(original_shape, 0, original_shape.size() - 2);
+
+            if (KB != orig_K) {
+                const auto& output_shape = tensors[output_tensor]->shape;
+                if (output_shape.size() < 2)
+                    throw std::invalid_argument("Output rank must be >= 2");
+
+                temp_shape = output_shape;
+                temp_shape[temp_shape.size() - 1] = KB;
+
+                M = temp_shape[temp_shape.size() - 2];
+                K = KB;
+
+                uint64_t expected = 1;
+                for (auto d : temp_shape) expected *= d;
+
+                if (expected != total_elements)
+                    throw std::invalid_argument("Inner-dim mismatch cannot be reconciled by view");
+
+                tensors[input_tensor]->view(temp_shape);
+                reshaped = true;
+                batch_size = prod(temp_shape, 0, temp_shape.size() - 2);
+            }
+
+            uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
+            uniform.m = M;
+            uniform.n = N;
+            uniform.k = K;
+            uniform.batch_size = batch_size;
+
+            const auto& output_shape = tensors[output_tensor]->shape;
+            uint32_t dispatchM = output_shape[output_shape.size() - 2];
+            uint32_t dispatchN = output_shape.back();
+            uint32_t dispatchB = prod(output_shape, 0, output_shape.size() - 2);
+
+            uint32_t groupX = ceilDiv(dispatchN, BN);
+            uint32_t groupY = ceilDiv(dispatchM, BM);
+            uint32_t groupZ = dispatchB;
+
+            uint32_t workgroup[3] = { groupX, groupY, groupZ };
+
+            tensor_push_const pc{};
+            pc.grid_size = { groupX, groupY, groupZ };
+            pc.mode = 0;
+            pc.uniformAddress = linearReLUShader.uniformBuffer->getBufferAddress();
+
+            try {
+                linearReLUShader.loadUniform(uniform, pc);
+                linearReLUShader.execute(workgroup);
+            } catch (...) {
+                if (reshaped) tensors[input_tensor]->view(original_shape);
+                throw;
+            }
+
+            if (reshaped)
+                tensors[input_tensor]->view(original_shape);
+
+            return;
+        }
+
+        // ---------------------------------------------------------------------
+        // BACKWARD
+        // ---------------------------------------------------------------------
+        const auto original_shape = tensors[input_tensor]->shape;
+        const uint32_t total_elements = tensors[input_tensor]->get_num_elements();
+
+        if (original_shape.size() < 2)
+            throw std::invalid_argument("Backward: Input rank must be >= 2");
+
+        uint32_t orig_M = original_shape[original_shape.size() - 2];
+        uint32_t orig_K = original_shape.back();
+
         const auto& weight_shape = tensors[weight_tensor]->shape;
         if (weight_shape.size() < 2)
-            throw std::invalid_argument("Weight rank must be >= 2");
+            throw std::invalid_argument("Backward: Weight rank must be >= 2");
+
         uint32_t KB = weight_shape.back();
-        uint32_t N = weight_shape[weight_shape.size() - 2];
-        if (KB != K)
-            throw std::invalid_argument("Inner dims mismatch: X[...,M,K] @ W[...,N,K] (transposed)");
+        uint32_t N  = weight_shape[weight_shape.size() - 2];
 
-        uint32_t batch_size = prod(shape, 0, shape.size() - 2);
+        bool reshaped = false;
+        std::vector<uint32_t> temp_shape;
 
-        DEBUG_PRINT("Linear'ing tensor " << input_tensor << " of shape "
-            << shapeToString(shape) << " with transposed weights " << weight_tensor
-            << " of shape " << shapeToString(weight_shape));
+        uint32_t M = orig_M;
+        uint32_t K = orig_K;
+        uint32_t batch_size = prod(original_shape, 0, original_shape.size() - 2);
 
+        if (KB != orig_K) {
+            const auto& output_shape = tensors[output_tensor]->shape;
+            if (output_shape.size() < 2)
+                throw std::invalid_argument("Backward: Output rank must be >= 2");
+
+            temp_shape = output_shape;
+            temp_shape[temp_shape.size() - 1] = KB;
+
+            M = temp_shape[temp_shape.size() - 2];
+            K = KB;
+
+            uint64_t expected = 1;
+            for (auto d : temp_shape) expected *= d;
+
+            if (expected != total_elements)
+                throw std::invalid_argument("Backward: Inner-dim mismatch cannot be reconciled by view");
+
+            tensors[input_tensor]->view(temp_shape);
+            reshaped = true;
+            batch_size = prod(temp_shape, 0, temp_shape.size() - 2);
+        }
+
+        uniform.input_tensor = tensors[input_tensor]->getTensorImpl();
         uniform.m = M;
         uniform.n = N;
         uniform.k = K;
         uniform.batch_size = batch_size;
-        uniform.accumulate_grad = 1; // add
 
-        // --- Warp-tiling parameters (must match shader) ---
-        constexpr uint32_t BM = 128;  // Block tile size M
-        constexpr uint32_t BN = 128;  // Block tile size N
-        constexpr uint32_t BK = 8;    // Block tile size K
-        constexpr uint32_t NUM_THREADS = 256;  // Threads per workgroup
+        // ---- Kernel 1: dInput + dBias ----
+        try {
+            {
+                uint32_t groupX = ceilDiv(K, BN);
+                uint32_t groupY = ceilDiv(M, BM);
+                uint32_t groupZ = batch_size;
 
-        // --- Compute dispatch grid based on mode ---
-        auto ceilDiv = [](uint32_t a, uint32_t b) { return (a + b - 1) / b; };
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
 
-        uint32_t dispatchM, dispatchN, dispatchBatch;
+                tensor_push_const pc{};
+                pc.grid_size = { groupX, groupY, groupZ };
+                uniform.kernel_type = 0;
+                pc.mode = 1;
+                pc.uniformAddress = linearReLUShaderBackward.uniformBuffer->getBufferAddress();
 
-        if (mode == 0) {
-            // Mode 0: Use output tensor dimensions
-            const auto& output_shape = tensors[output_tensor]->shape;
-            if (output_shape.size() < 2)
-                throw std::invalid_argument("Output rank must be >= 2");
-
-            dispatchM = output_shape[output_shape.size() - 2];
-            dispatchN = output_shape[output_shape.size() - 1];
-            dispatchBatch = prod(output_shape, 0, output_shape.size() - 2);
-
-            DEBUG_PRINT("Dispatch (output dims): ");
-        }
-        else {
-            // Mode 1: Use max dimensions of all tensors
-            auto maxDim = [](const std::vector<uint32_t>& a,
-                const std::vector<uint32_t>& b) {
-                    size_t L = std::max(a.size(), b.size());
-                    std::vector<uint32_t> res(L, 1);
-                    for (size_t i = 0; i < L; i++) {
-                        uint32_t av = (i < a.size() ? a[i] : 1);
-                        uint32_t bv = (i < b.size() ? b[i] : 1);
-                        res[i] = std::max(av, bv);
-                    }
-                    return res;
-                };
-
-            std::vector<uint32_t> maxShape = tensors[input_tensor]->shape;
-            auto transposedWeightShape = tensors[weight_tensor]->shape;
-            if (transposedWeightShape.size() >= 2) {
-                std::swap(transposedWeightShape[transposedWeightShape.size() - 1], 
-                         transposedWeightShape[transposedWeightShape.size() - 2]);
+                linearReLUShaderBackward.loadUniform(uniform, pc);
+                linearReLUShaderBackward.execute(workgroup);
             }
-            maxShape = maxDim(maxShape, transposedWeightShape);
-            if (!bias_tensor.empty())
-                maxShape = maxDim(maxShape, tensors[bias_tensor]->shape);
-            maxShape = maxDim(maxShape, tensors[output_tensor]->shape);
 
-            if (maxShape.size() < 2)
-                throw std::invalid_argument("Max rank must be >= 2");
+            // ---- Kernel 2: dWeight ----
+            {
+                uint32_t groupX = ceilDiv(K, BN);
+                uint32_t groupY = ceilDiv(N, BM);
+                uint32_t groupZ = batch_size;
 
-            dispatchM = maxShape[maxShape.size() - 2];
-            dispatchN = maxShape[maxShape.size() - 1];
-            dispatchBatch = prod(maxShape, 0, maxShape.size() - 2);
+                uint32_t workgroup[3] = { groupX, groupY, groupZ };
 
-            DEBUG_PRINT("Dispatch (max dims): ");
+                tensor_push_const pc{};
+                pc.grid_size = { groupX, groupY, groupZ };
+                uniform.kernel_type = 1;
+                pc.mode = 1;
+                pc.uniformAddress = linearReLUShaderBackward.uniformBuffer->getBufferAddress();
+
+                linearReLUShaderBackward.loadUniform(uniform, pc);
+                linearReLUShaderBackward.execute(workgroup);
+            }
+        } catch (...) {
+            if (reshaped) tensors[input_tensor]->view(original_shape);
+            throw;
         }
 
-        // Calculate workgroup dimensions based on warp-tiling parameters
-        // Each workgroup processes a BM x BN tile with NUM_THREADS threads
-        uint32_t groupX = ceilDiv(dispatchN, BN);
-        uint32_t groupY = ceilDiv(dispatchM, BM);
-        uint32_t groupZ = dispatchBatch;
-
-        DEBUG_PRINT(groupX << " × " << groupY
-            << " × " << groupZ << " workgroups (covering " << dispatchM << "×"
-            << dispatchN << " per batch)" << "Workgroup size: " << NUM_THREADS << " threads (" 
-            << BM << "×" << BN << " tile)");
-
-        uint32_t workgroup[3] = { groupX, groupY, groupZ };
-
-        tensor_push_const pushConsts{};
-        pushConsts.grid_size = { groupX, groupY, groupZ };
-
-        if (mode == 0) {
-            pushConsts.mode = mode;
-            uniform.weight_tensor = tensors[weight_tensor]->getTensorImpl();
-            pushConsts.uniformAddress = linearReLUShader.uniformBuffer->getBufferAddress();
-            linearReLUShader.loadUniform(uniform, pushConsts);
-            linearReLUShader.execute(workgroup);
-        }
-        else if (mode == 1) {
-            pushConsts.mode = mode;
-            pushConsts.uniformAddress = linearReLUShaderBackward.uniformBuffer->getBufferAddress();
-            linearReLUShaderBackward.loadUniform(uniform, pushConsts);
-            linearReLUShaderBackward.execute(workgroup);
-        }
+        if (reshaped)
+            tensors[input_tensor]->view(original_shape);
     }
 
     void tensor_linear(const std::string& output_tensor,
