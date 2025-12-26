@@ -1,0 +1,115 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+// Workgroup size [dispatch = (cielDiv(num_elements, 256u), 1, 1)]
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer tensor_shape {
+    int dims[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer first_m {
+    float m[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer second_v {
+    float v[];
+};
+
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel;
+    uint ndim;
+    uint requires_grad;
+    uint is_leaf;
+};
+
+struct Uniform {
+    TensorImpl tensor;    // param + grad
+    first_m m;            // first moment
+    second_v v;           // second moment
+    float lr;
+    float beta1;
+    float beta2;
+    float inv_bias1;
+    float inv_bias2;
+    float lambda;
+    float epsilon;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer UniformBuffer {
+    Uniform u;
+};
+
+layout(push_constant) uniform PushConstants {
+    UniformBuffer ctx;
+} push;
+
+uint off2or3(const TensorImpl t, uint b, uint i, uint j) {
+    if (t.ndim == 2u) {
+        return i * t.strides.strides[0] + j * t.strides.strides[1];
+    } else {
+        return b * t.strides.strides[0] + i * t.strides.strides[1] + j * t.strides.strides[2];
+    }
+}
+
+void main() {
+    // Get global thread ID
+    uint gid = gl_GlobalInvocationID.x;
+    
+    // Load uniform data
+    Uniform u = push.ctx.u;
+    TensorImpl t = u.tensor;
+
+    // Bounds check
+    if (gid >= t.numel) {
+        return;
+    }
+    
+    // Load
+    float param = t.data.data[gid];
+    float g     = t.grad.grad[gid];
+    float m     = u.m.m[gid];
+    float v     = u.v.v[gid];
+
+    // ---- Adam moments ----
+    m = u.beta1 * m + (1.0 - u.beta1) * g;
+    v = u.beta2 * v + (1.0 - u.beta2) * (g * g);
+
+    float m_hat = m * u.inv_bias1;
+    float v_hat = v * u.inv_bias2;
+
+    // ---- AdamW update ----
+    // Decoupled weight decay
+    param *= (1.0 - u.lr * u.lambda);
+
+    // Adaptive step
+    param -= u.lr * m_hat / (sqrt(v_hat) + u.epsilon);
+
+    // Store back
+    t.data.data[gid] = param;
+    u.m.m[gid] = m;
+    u.v.v[gid] = v;
+
+    // Zero gradient
+    t.grad.grad[gid] = 0.0;
+}

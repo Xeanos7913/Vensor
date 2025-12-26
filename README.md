@@ -17,7 +17,8 @@ A C++ machine learning library utilizing Vulkan for GPU acceleration. Developed 
 - Utility Layers: EmbeddingLookup, ResidualConnect, MaxPooling, Bilinear interpolation Upsampling
 
 ### Optimizers
-- Stochastic Gradient Descent (SGD)
+- Stochastic Gradient Descent (SGD) [there's a typo in my code, it's actually "SDG" instead of "SGD" xp ]
+- AdamW
 
 ### Core Operations
 - Matrix multiplication with backward pass

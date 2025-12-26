@@ -1262,7 +1262,7 @@ struct Sequential : public Module<T> {
 };
 
 template<typename T>
-struct SDGoptim : public Optimiser<T>{
+struct SDGoptim final : public Optimiser<T>{
 
 	struct uniform{
 		tensor_impl tensor;
@@ -1312,4 +1312,90 @@ struct SDGoptim : public Optimiser<T>{
 			optimiser_shader.execute(workgroup);
 		}
 	}
+};
+
+template<typename T>
+struct AdamW final : public Optimiser<T> {
+
+    struct uniform {
+        tensor_impl tensor;          // param + grad
+        VkDeviceAddress m;           // first moment
+        VkDeviceAddress v;           // second moment
+        float lr;
+        float beta1;
+        float beta2;
+        float inv_bias1;
+        float inv_bias2;
+        float lambda;
+        float epsilon;
+    };
+
+    float lr      = 1e-3f;
+    float beta1   = 0.9f;
+    float beta2   = 0.999f;
+    float lambda  = 1e-2f;
+    float epsilon = 1e-8f;
+
+    uint64_t step = 0;
+    float beta1_pow = 1.0f;
+    float beta2_pow = 1.0f;
+
+    gpuTaskNoDesc<T, tensor_push_const, uniform> shader;
+
+    std::vector<Tensor<T>*> tensors;
+    std::vector<std::unique_ptr<StandaloneBuffer<float>>> m;
+    std::vector<std::unique_ptr<StandaloneBuffer<float>>> v;
+
+    Allocator* allocator;
+
+    AdamW(Allocator* alloc)
+        : allocator(alloc),
+          shader(readShaderBytecode("compiled_shaders/AdamW.comp.spv"),
+                 alloc, nullptr) {}
+
+    void loadTensors(Module<T>& module) {
+        for (auto* t : module.getTrainableTensors()) {
+            tensors.push_back(t);
+
+            m.push_back(std::make_unique<StandaloneBuffer<float>>(
+                t->get_num_elements(), allocator, /*zero_init=*/true));
+
+            v.push_back(std::make_unique<StandaloneBuffer<float>>(
+                t->get_num_elements(), allocator, /*zero_init=*/true));
+        }
+    }
+
+    void step() override {
+        step++;
+
+        beta1_pow *= beta1;
+        beta2_pow *= beta2;
+
+        const float inv_bias1 = 1.0f / (1.0f - beta1_pow);
+        const float inv_bias2 = 1.0f / (1.0f - beta2_pow);
+
+        uniform u;
+        u.lr = lr;
+        u.beta1 = beta1;
+        u.beta2 = beta2;
+        u.lambda = lambda;
+        u.epsilon = epsilon;
+        u.inv_bias1 = inv_bias1;
+        u.inv_bias2 = inv_bias2;
+
+        tensor_push_const pc;
+        pc.uniformAddress = shader.uniformBuffer->getBufferAddress();
+
+        for (size_t i = 0; i < tensors.size(); ++i) {
+            uint32_t n = tensors[i]->get_num_elements();
+            uint32_t wg = (n + 255u) / 256u;
+
+            u.tensor = tensors[i]->getTensorImpl();
+            u.m = m[i]->getBufferAddress();
+            u.v = v[i]->getBufferAddress();
+
+            shader.loadUniform(u, pc);
+            shader.execute({wg, 1, 1});
+        }
+    }
 };

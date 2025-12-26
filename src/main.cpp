@@ -1,5 +1,6 @@
 /*
-This main file contains some testing code (in the commented out parts) and an example MNIST handwritten digit recognision neural network training loop.
+This main file contains some testing code (in the commented out parts), an example MNIST handwritten digit recognision neural network training loop, 
+and a VAE implementation for MNIST handwritten digit data generation.
 */
 #define VOLK_IMPLEMENTATION
 #include <iostream>
@@ -872,7 +873,6 @@ struct VAE {
 	}
 };
 
-/*
 int main(void){
 	
 	Init init;
@@ -890,7 +890,6 @@ int main(void){
 	delete allocator;
 	return 0;
 }
-*/
 
 /*
 int main(void){
