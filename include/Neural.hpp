@@ -635,7 +635,6 @@ struct ResidualConnect : public Module<T>{
 template<typename T>
 struct Layernorm : public Module<T> {
 	//Tensor<T>* output;
-	Tensor<T>* input_tensor;    // [B, M, N]
     Tensor<T>* weight_tensor;   // [N] - normalized shape
     Tensor<T>* bias_tensor;     // [N] - normalized shape
     Tensor<T>* save_mean;       // [B, M] - mean for each sample
@@ -701,6 +700,19 @@ struct Layernorm : public Module<T> {
 		}
 		return this->output;
 	}
+};
+
+template<typename T>
+struct FlashAttention : public Module<T> {
+
+	Tensor<T>* W_qkv;
+	Tensor<T>* Out;
+	Tensor<T>* tmp_qkv;
+	std::unique_ptr<StandaloneBuffer<T>> delta;
+	std::unique_ptr<StandaloneBuffer<T>> L;
+	std::unique_ptr<StandaloneBuffer<T>> M;
+
+	
 };
 
 template<typename T>

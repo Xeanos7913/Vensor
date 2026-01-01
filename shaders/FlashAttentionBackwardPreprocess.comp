@@ -1,0 +1,161 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+
+#define NUM_THREADS 256
+#define BLOCK_M 128
+#define BLOCK_DMODEL 64
+
+layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+layout(buffer_reference, std430, scalar) buffer DEL {
+    float delta[];
+};
+
+layout(buffer_reference, std430, scalar) buffer softmaxDenom {
+    float vals[];
+};
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct FlashAttentionBackwardPreprocessContext {
+    TensorImpl Out;      // Output from forward pass (Out.data.data)
+    softmaxDenom L;      // Softmax denominator from forward pass
+    DEL Delta;           // Delta values (sum of o * do)
+    uint N_CTX;
+    uint Z;              // batch size
+    uint H;              // number of heads
+    int stride_oz, stride_oh, stride_om, stride_on;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    FlashAttentionBackwardPreprocessContext ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint  kernel_type;
+} push;
+
+shared float o_tile[BLOCK_M][BLOCK_DMODEL];
+shared float do_tile[BLOCK_M][BLOCK_DMODEL];
+shared float denom[BLOCK_M];
+shared float delta_vals[BLOCK_M];
+
+void main() {
+    FlashAttentionBackwardPreprocessContext c = push.context.ctx;
+    
+    uint start_m = gl_WorkGroupID.x;
+    uint off_hz = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    
+    uint base_m = start_m * BLOCK_M;
+    
+    // Load O (from Out.data.data) and DO (from Out.grad.grad) tiles
+    uint num_loads = (BLOCK_M * BLOCK_DMODEL) / NUM_THREADS;
+    for (uint i = 0; i < num_loads; i++) {
+        uint flat_idx = tid + i * NUM_THREADS;
+        uint m_idx = flat_idx / BLOCK_DMODEL;
+        uint d_idx = flat_idx % BLOCK_DMODEL;
+        
+        if (m_idx < BLOCK_M && d_idx < BLOCK_DMODEL) {
+            uint offs_m = base_m + m_idx;
+            if (offs_m < c.N_CTX) {
+                uint offset = off_hz * c.stride_oh + offs_m * c.stride_om + d_idx * c.stride_on;
+                o_tile[m_idx][d_idx] = c.Out.data.data[offset];
+                do_tile[m_idx][d_idx] = c.Out.grad.grad[offset];  // Upstream gradient
+            } else {
+                o_tile[m_idx][d_idx] = 0.0;
+                do_tile[m_idx][d_idx] = 0.0;
+            }
+        }
+    }
+    
+    // Load L (denominator) values
+    uint rows_per_thread = (BLOCK_M + NUM_THREADS - 1) / NUM_THREADS;
+    for (uint i = 0; i < rows_per_thread; i++) {
+        uint m_idx = tid + i * NUM_THREADS;
+        if (m_idx < BLOCK_M) {
+            uint offs_m = base_m + m_idx;
+            if (offs_m < c.N_CTX) {
+                uint l_offset = off_hz * c.N_CTX + offs_m;
+                denom[m_idx] = c.L.vals[l_offset];
+            } else {
+                denom[m_idx] = 1.0;
+            }
+        }
+    }
+    
+    barrier();
+    
+    // Normalize DO by L and compute delta
+    for (uint i = 0; i < rows_per_thread; i++) {
+        uint m_idx = tid + i * NUM_THREADS;
+        if (m_idx < BLOCK_M) {
+            float denom_val = denom[m_idx];
+            float delta_sum = 0.0;
+            
+            // Normalize do and compute delta = sum(o * do)
+            for (uint d = 0; d < BLOCK_DMODEL; d++) {
+                do_tile[m_idx][d] /= denom_val;
+                delta_sum += o_tile[m_idx][d] * do_tile[m_idx][d];
+            }
+            
+            delta_vals[m_idx] = delta_sum;
+        }
+    }
+    
+    barrier();
+    
+    // Write back normalized gradient
+    for (uint i = 0; i < num_loads; i++) {
+        uint flat_idx = tid + i * NUM_THREADS;
+        uint m_idx = flat_idx / BLOCK_DMODEL;
+        uint d_idx = flat_idx % BLOCK_DMODEL;
+        
+        if (m_idx < BLOCK_M && d_idx < BLOCK_DMODEL) {
+            uint offs_m = base_m + m_idx;
+            if (offs_m < c.N_CTX) {
+                uint offset = off_hz * c.stride_oh + offs_m * c.stride_om + d_idx * c.stride_on;
+                c.Out.grad.grad[offset] = do_tile[m_idx][d_idx];
+            }
+        }
+    }
+    
+    // Write back Delta
+    for (uint i = 0; i < rows_per_thread; i++) {
+        uint m_idx = tid + i * NUM_THREADS;
+        if (m_idx < BLOCK_M) {
+            uint offs_m = base_m + m_idx;
+            if (offs_m < c.N_CTX) {
+                uint delta_offset = off_hz * c.N_CTX + offs_m;
+                c.Delta.delta[delta_offset] = delta_vals[m_idx];
+            }
+        }
+    }
+}

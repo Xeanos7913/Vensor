@@ -1,0 +1,301 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+#define NUM_THREADS 256
+#define BLOCK_M 128
+#define BLOCK_DMODEL 64  // Set appropriately based on your model (e.g., 64, 128)
+#define BLOCK_N 128
+#define WARPSIZE 32
+
+layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer tensor_data {
+    float data[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_grad {
+    float grad[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_strides {
+    int strides[];
+};
+
+layout(buffer_reference, std430, scalar) buffer tensor_shape {
+    int dims[];
+};
+
+layout(buffer_reference, std430, scalar) buffer softmaxMaxVals {
+    float vals[];
+};
+
+layout(buffer_reference, std430, scalar) buffer softmaxDenoms {
+    float vals[];
+};
+
+
+struct TensorImpl {
+    tensor_data    data;
+    tensor_grad    grad;
+    tensor_strides strides;
+    tensor_shape   shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct FlashAttentionContext {
+    TensorImpl Q;
+    TensorImpl K;
+    TensorImpl V;
+    softmaxDenoms L;   // Softmax demonimators
+    softmaxMaxVals M;  // Softmax max values
+    TensorImpl Out;
+    uint N_CTX;
+    uint Z;  // batch size
+    uint H;  // number of heads
+    float sm_scale;  // softmax scale (typically 1/sqrt(d_k))
+    int stride_qz, stride_qh, stride_qm, stride_qk;
+    int stride_kz, stride_kh, stride_kn, stride_kk;
+    int stride_vz, stride_vh, stride_vk, stride_vn;
+    int stride_oz, stride_oh, stride_om, stride_on;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    FlashAttentionContext ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+    uvec3 grid_size;
+    uint  kernel_type;
+} push;
+
+// Shared memory for tile computation
+shared float q_tile[BLOCK_M][BLOCK_DMODEL];
+shared float k_tile[BLOCK_N][BLOCK_DMODEL];
+shared float v_tile[BLOCK_N][BLOCK_DMODEL];
+shared float qk_tile[BLOCK_M][BLOCK_N];
+shared float acc_tile[BLOCK_M][BLOCK_DMODEL];
+
+// Thread-local storage for statistics
+shared float m_i[BLOCK_M];
+shared float l_i[BLOCK_M];
+
+void load_q_tile(FlashAttentionContext c, uint off_hz, uint start_m) {
+    uint tid = gl_LocalInvocationID.x;
+    uint num_loads = (BLOCK_M * BLOCK_DMODEL) / NUM_THREADS;
+    
+    for (uint i = 0; i < num_loads; i++) {
+        uint flat_idx = tid + i * NUM_THREADS;
+        uint m_idx = flat_idx / BLOCK_DMODEL;
+        uint d_idx = flat_idx % BLOCK_DMODEL;
+        
+        if (m_idx < BLOCK_M && d_idx < BLOCK_DMODEL) {
+            uint offs_m = start_m * BLOCK_M + m_idx;
+            if (offs_m < c.N_CTX) {
+                uint q_offset = off_hz * c.stride_qh + offs_m * c.stride_qm + d_idx * c.stride_qk;
+                q_tile[m_idx][d_idx] = c.Q.data.data[q_offset];
+            } else {
+                q_tile[m_idx][d_idx] = 0.0;
+            }
+        }
+    }
+}
+
+void load_k_tile(FlashAttentionContext c, uint off_hz, uint start_n) {
+    uint tid = gl_LocalInvocationID.x;
+    uint num_loads = (BLOCK_N * BLOCK_DMODEL) / NUM_THREADS;
+    
+    for (uint i = 0; i < num_loads; i++) {
+        uint flat_idx = tid + i * NUM_THREADS;
+        uint n_idx = flat_idx / BLOCK_DMODEL;
+        uint d_idx = flat_idx % BLOCK_DMODEL;
+        
+        if (n_idx < BLOCK_N && d_idx < BLOCK_DMODEL) {
+            uint offs_n = start_n + n_idx;
+            if (offs_n < c.N_CTX) {
+                uint k_offset = off_hz * c.stride_kh + offs_n * c.stride_kn + d_idx * c.stride_kk;
+                k_tile[n_idx][d_idx] = c.K.data.data[k_offset];
+            } else {
+                k_tile[n_idx][d_idx] = 0.0;
+            }
+        }
+    }
+}
+
+void load_v_tile(FlashAttentionContext c, uint off_hz, uint start_n) {
+    uint tid = gl_LocalInvocationID.x;
+    uint num_loads = (BLOCK_N * BLOCK_DMODEL) / NUM_THREADS;
+    
+    for (uint i = 0; i < num_loads; i++) {
+        uint flat_idx = tid + i * NUM_THREADS;
+        uint n_idx = flat_idx / BLOCK_DMODEL;
+        uint d_idx = flat_idx % BLOCK_DMODEL;
+        
+        if (n_idx < BLOCK_N && d_idx < BLOCK_DMODEL) {
+            uint offs_n = start_n + n_idx;
+            if (offs_n < c.N_CTX) {
+                uint v_offset = off_hz * c.stride_vh + offs_n * c.stride_vk + d_idx * c.stride_vn;
+                v_tile[n_idx][d_idx] = c.V.data.data[v_offset];
+            } else {
+                v_tile[n_idx][d_idx] = 0.0;
+            }
+        }
+    }
+}
+
+void compute_qk(FlashAttentionContext c, uint start_m, uint start_n) {
+    uint tid = gl_LocalInvocationID.x;
+    uint num_elements = BLOCK_M * BLOCK_N;
+    uint num_iters = (num_elements + NUM_THREADS - 1) / NUM_THREADS;
+    
+    for (uint iter = 0; iter < num_iters; iter++) {
+        uint flat_idx = tid + iter * NUM_THREADS;
+        if (flat_idx < num_elements) {
+            uint m_idx = flat_idx / BLOCK_N;
+            uint n_idx = flat_idx % BLOCK_N;
+            
+            float sum = 0.0;
+            for (uint d = 0; d < BLOCK_DMODEL; d++) {
+                sum += q_tile[m_idx][d] * k_tile[n_idx][d];
+            }
+            
+            sum *= c.sm_scale;
+            
+            // Apply causal mask
+            uint offs_m = start_m * BLOCK_M + m_idx;
+            uint offs_n = start_n + n_idx;
+            if (offs_m < offs_n) {
+                sum = -1e10;  // Approximate -inf
+            }
+            
+            qk_tile[m_idx][n_idx] = sum;
+        }
+    }
+}
+
+void main() {
+    FlashAttentionContext c = push.context.ctx;
+    
+    uint start_m = gl_WorkGroupID.x;
+    uint off_hz = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    
+    // Initialize m_i and l_i for this thread's rows
+    uint rows_per_thread = (BLOCK_M + NUM_THREADS - 1) / NUM_THREADS;
+    for (uint i = 0; i < rows_per_thread; i++) {
+        uint m_idx = tid + i * NUM_THREADS;
+        if (m_idx < BLOCK_M) {
+            m_i[m_idx] = -1e10;  // Approximate -inf
+            l_i[m_idx] = 0.0;
+        }
+    }
+    
+    // Initialize accumulator
+    uint acc_elements = BLOCK_M * BLOCK_DMODEL;
+    uint acc_iters = (acc_elements + NUM_THREADS - 1) / NUM_THREADS;
+    for (uint i = 0; i < acc_iters; i++) {
+        uint flat_idx = tid + i * NUM_THREADS;
+        if (flat_idx < acc_elements) {
+            uint m_idx = flat_idx / BLOCK_DMODEL;
+            uint d_idx = flat_idx % BLOCK_DMODEL;
+            acc_tile[m_idx][d_idx] = 0.0;
+        }
+    }
+    
+    barrier();
+    
+    // Load Q tile (stays in shared memory)
+    load_q_tile(c, off_hz, start_m);
+    barrier();
+    
+    // Loop over K, V tiles
+    uint max_n = min((start_m + 1) * BLOCK_M, c.N_CTX);
+    for (uint start_n = 0; start_n < max_n; start_n += BLOCK_N) {
+        // Load K and V tiles
+        load_k_tile(c, off_hz, start_n);
+        load_v_tile(c, off_hz, start_n);
+        barrier();
+        
+        // Compute QK^T
+        compute_qk(c, start_m, start_n);
+        barrier();
+        
+        // Compute statistics and update accumulator per row
+        for (uint i = 0; i < rows_per_thread; i++) {
+            uint m_idx = tid + i * NUM_THREADS;
+            if (m_idx < BLOCK_M) {
+                // Compute m_ij (row max)
+                float m_ij = -1e10;
+                for (uint n = 0; n < BLOCK_N; n++) {
+                    m_ij = max(m_ij, qk_tile[m_idx][n]);
+                }
+                
+                // Compute softmax and l_ij (row sum)
+                float l_ij = 0.0;
+                for (uint n = 0; n < BLOCK_N; n++) {
+                    float p_val = exp(qk_tile[m_idx][n] - m_ij);
+                    qk_tile[m_idx][n] = p_val;
+                    l_ij += p_val;
+                }
+                
+                // Update m_i and l_i
+                float m_i_new = max(m_i[m_idx], m_ij);
+                float alpha = exp(m_i[m_idx] - m_i_new);
+                float beta = exp(m_ij - m_i_new);
+                float l_i_new = alpha * l_i[m_idx] + beta * l_ij;
+                
+                // Scale accumulator
+                float acc_scale = (l_i[m_idx] / l_i_new) * alpha;
+                for (uint d = 0; d < BLOCK_DMODEL; d++) {
+                    acc_tile[m_idx][d] *= acc_scale;
+                }
+                
+                // Scale P and update accumulator
+                float p_scale = beta / l_i_new;
+                for (uint d = 0; d < BLOCK_DMODEL; d++) {
+                    float sum = 0.0;
+                    for (uint n = 0; n < BLOCK_N; n++) {
+                        sum += qk_tile[m_idx][n] * v_tile[n][d];
+                    }
+                    acc_tile[m_idx][d] += p_scale * sum;
+                }
+                
+                l_i[m_idx] = l_i_new;
+                m_i[m_idx] = m_i_new;
+            }
+        }
+        barrier();
+    }
+    
+    // Write back L and M
+    for (uint i = 0; i < rows_per_thread; i++) {
+        uint m_idx = tid + i * NUM_THREADS;
+        if (m_idx < BLOCK_M) {
+            uint offs_m = start_m * BLOCK_M + m_idx;
+            if (offs_m < c.N_CTX) {
+                uint lm_offset = off_hz * c.N_CTX + offs_m;
+                c.L.vals[lm_offset] = l_i[m_idx];
+                c.M.vals[lm_offset] = m_i[m_idx];
+            }
+        }
+    }
+    
+    // Write back output
+    for (uint i = 0; i < acc_iters; i++) {
+        uint flat_idx = tid + i * NUM_THREADS;
+        if (flat_idx < acc_elements) {
+            uint m_idx = flat_idx / BLOCK_DMODEL;
+            uint d_idx = flat_idx % BLOCK_DMODEL;
+            
+            uint offs_m = start_m * BLOCK_M + m_idx;
+            if (offs_m < c.N_CTX) {
+                uint out_offset = off_hz * c.stride_oh + offs_m * c.stride_om + d_idx * c.stride_on;
+                c.Out.data.data[out_offset] = acc_tile[m_idx][d_idx];
+            }
+        }
+    }
+}
