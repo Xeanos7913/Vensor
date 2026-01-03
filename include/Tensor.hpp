@@ -987,7 +987,7 @@ struct TensorPool {
             flashAttentionBackwardPreprocess(
                 readShaderBytecode("compiled_shaders/FlashAttentionBackwardPreprocess.comp.spv"), alloc, nullptr),
             flashAttentionBackward(
-                readShaderBytecode("compiled_shaders/FlashAttentionBackward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("compiled_shaders/FlashAttentionBackwardPass.comp.spv"), alloc, nullptr),
             logvarToStdShader(
                 readShaderBytecode("compiled_shaders/logvar_to_std.comp.spv"), alloc, nullptr),
             logvarToStdShaderBackward(
@@ -2919,7 +2919,7 @@ struct TensorPool {
         tensor_flash_attention_fwd_ctx uniform;
     
         // Get input tensor to determine batch size
-        Tensor* input = tensors[input_seq];
+        Tensor<T>* input = tensors[input_seq].get();
         uint32_t batch_size = input->shape[0];
         uint32_t seq_len = input->shape[1];  // actual sequence length
         
@@ -3044,7 +3044,7 @@ struct TensorPool {
     {
         tensor_flash_attention_bwd_preprocess_ctx uniform;
         
-        Tensor* output = tensors[output_name];
+        Tensor<T>* output = tensors[output_name].get();
         uint32_t batch_size = output->shape[0];
         uint32_t d_k = d_model / n_heads;
         
@@ -3079,9 +3079,9 @@ struct TensorPool {
         uint32_t wrkgrp[3] = {grid_total, 1, 1};
         
         tensor_push_const p;
-        p.uniformAddress = flashAttentionBwdPreprocess.uniformBuffer->getBufferAddress();
-        flashAttentionBwdPreprocess.loadUniform(uniform, p);
-        flashAttentionBwdPreprocess.execute(wrkgrp);
+        p.uniformAddress = flashAttentionBackwardPreprocess.uniformBuffer->getBufferAddress();
+        flashAttentionBackwardPreprocess.loadUniform(uniform, p);
+        flashAttentionBackwardPreprocess.execute(wrkgrp);
     }
 
     // Backward kernel - computes dQ, dK, dV gradients
@@ -3096,8 +3096,8 @@ struct TensorPool {
     {
         tensor_flash_attention_bwd_ctx uniform;
         
-        Tensor* qkv_tensor = tensors[qkv_combined_name];
-        Tensor* output = tensors[output_name];
+        Tensor<T>* qkv_tensor = tensors[qkv_combined_name].get();
+        Tensor<T>* output = tensors[output_name].get();
         uint32_t batch_size = qkv_tensor->shape[0];
         uint32_t d_k = d_model / n_heads;
         
@@ -3173,9 +3173,9 @@ struct TensorPool {
         uint32_t wrkgrp[3] = {grid_y, 1, 1};
         
         tensor_push_const p;
-        p.uniformAddress = flashAttentionBwd.uniformBuffer->getBufferAddress();
-        flashAttentionBwd.loadUniform(uniform, p);
-        flashAttentionBwd.execute(wrkgrp);
+        p.uniformAddress = flashAttentionBackward.uniformBuffer->getBufferAddress();
+        flashAttentionBackward.loadUniform(uniform, p);
+        flashAttentionBackward.execute(wrkgrp);
     }
 
     // Combined backward pass function

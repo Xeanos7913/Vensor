@@ -705,6 +705,8 @@ struct Layernorm : public Module<T> {
 template<typename T>
 struct FlashAttention : public Module<T> {
 
+	std::string& name;
+	TensorPool<T>* tensorPool;
 	Tensor<T>* W_qkv;
 	Tensor<T>* Out;
 	Tensor<T>* tmp_qkv;
@@ -712,7 +714,31 @@ struct FlashAttention : public Module<T> {
 	std::unique_ptr<StandaloneBuffer<T>> L;
 	std::unique_ptr<StandaloneBuffer<T>> M;
 
-	
+	uint32_t d_model, n_heads, seq_len, in_features, batch_size;
+
+	FlashAttention(TensorPool<T>* pool, uint32_t d_model, uint32_t in_features, uint32_t n_heads, uint32_t seq_len, uint32_t batch_size, const std::string& name) :
+		tensorPool(pool), d_model(d_model), n_heads(n_heads), seq_len(seq_len), batch_size(batch_size), name(name), in_features(in_features) {
+
+		W_qkv = &pool->createTensor({in_features, 3 * n_heads * d_model}, name + "W_qkv");
+		tmp_qkv = &pool->createTensor({batch_size, seq_len, 3 * n_heads * d_model}, name + "-tmp_qkv");
+		Out = &pool->createTensor({batch_size, n_heads, seq_len, d_model / n_heads}, name + "-output");
+
+		L = std::make_unique<StandaloneBuffer<T>>(batch_size * n_heads * seq_len, &pool->allocator);
+		M = std::make_unique<StandaloneBuffer<T>>(batch_size * n_heads * seq_len, &pool->allocator);
+		delta = std::make_unique<StandaloneBuffer<T>>(528 ,&pool->allocator); // need to find exact allocation size later
+	}
+
+	Tensor<T>* forward(Tensor<T>* input) override {
+		
+		tensorPool->tensor_flash_attention(input->name, W_qkv->name, tmp_qkv->name, Out->name, L->getBufferAddress(), M->getBufferAddress(), d_model, seq_len, n_heads);
+
+		Out->back.push_back([this, input](){
+			this->tensorPool->tensor_flash_attention_bwd(tmp_qkv->name, Out->name, M->getDeviceAddress(), delta->getDeviceAddress(), d_model, seq_len, n_heads);
+			input->backward();
+		});
+
+		return Out;
+	}
 };
 
 template<typename T>
@@ -1274,7 +1300,7 @@ struct Sequential : public Module<T> {
 };
 
 template<typename T>
-struct SDGoptim final : public Optimiser<T>{
+struct SDGoptim : public Optimiser<T>{
 
 	struct uniform{
 		tensor_impl tensor;
@@ -1327,7 +1353,7 @@ struct SDGoptim final : public Optimiser<T>{
 };
 
 template<typename T>
-struct AdamW final : public Optimiser<T> {
+struct AdamW : public Optimiser<T> {
 
     struct uniform {
         tensor_impl tensor;          // param + grad
@@ -1348,7 +1374,7 @@ struct AdamW final : public Optimiser<T> {
     float lambda  = 1e-2f;
     float epsilon = 1e-8f;
 
-    uint64_t step = 0;
+    uint64_t stepCount = 0;
     float beta1_pow = 1.0f;
     float beta2_pow = 1.0f;
 
@@ -1360,25 +1386,27 @@ struct AdamW final : public Optimiser<T> {
 
     Allocator* allocator;
 
+	AdamW(){};
+
     AdamW(Allocator* alloc)
         : allocator(alloc),
           shader(readShaderBytecode("compiled_shaders/AdamW.comp.spv"),
                  alloc, nullptr) {}
 
-    void loadTensors(Module<T>& module) {
+    void load_tensors(Module<T>& module) {
         for (auto* t : module.getTrainableTensors()) {
             tensors.push_back(t);
 
             m.push_back(std::make_unique<StandaloneBuffer<float>>(
-                t->get_num_elements(), allocator, /*zero_init=*/true));
+                t->get_num_elements(), allocator));
 
             v.push_back(std::make_unique<StandaloneBuffer<float>>(
-                t->get_num_elements(), allocator, /*zero_init=*/true));
+                t->get_num_elements(), allocator));
         }
     }
 
     void step() override {
-        step++;
+        stepCount++;
 
         beta1_pow *= beta1;
         beta2_pow *= beta2;
@@ -1405,9 +1433,10 @@ struct AdamW final : public Optimiser<T> {
             u.tensor = tensors[i]->getTensorImpl();
             u.m = m[i]->getBufferAddress();
             u.v = v[i]->getBufferAddress();
+			uint32_t wrkgrp[3] = {wg, 1, 1};
 
             shader.loadUniform(u, pc);
-            shader.execute({wg, 1, 1});
+            shader.execute(wrkgrp);
         }
     }
 };

@@ -612,9 +612,9 @@ struct VAE {
 	MSEloss<float> mseLoss;
 	KLDloss<float> kldLoss;
 
-	SDGoptim<float> optim;
+	AdamW<float> optim;
 
-	uint32_t latent_dim = 64;
+	uint32_t latent_dim = 256;
 
 	std::unique_ptr<MNISTDataloader<float>> dataLoader;
 
@@ -624,9 +624,8 @@ struct VAE {
 
 		dataLoader = std::make_unique<MNISTDataloader<float>>(&tensorPool, 16, 100);
 
-		optim = SDGoptim<float>(allocator);
-		optim.batch_size = 16;
-		optim.lr = 5e-04;
+		optim = AdamW<float>(allocator);
+		optim.lr = 1e-04;
 
 		// ------------------------------
 		// Encoder
@@ -774,14 +773,14 @@ struct VAE {
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		auto &std_tensor = (0.5f * *logvar).exp();
-		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
+		//auto &std_tensor = (0.5f * *logvar).exp();
+		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		
 		// Use Gaussian/Normal distribution N(0, 1) for VAE reparameterization
 		// init_type=1: Normal distribution with mean=0.0, stddev=1.0
-		tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
+		//tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
 		
-		return &(*mu + std_tensor * eps_tensor);
+		return &(*mu);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -797,11 +796,11 @@ struct VAE {
 	Tensor<float>* loss_function(Tensor<float>* recon, Tensor<float>* x, Tensor<float>* mu, Tensor<float>* logvar) {
 		mseLoss.target = x;
 		auto &ml = *mseLoss(recon);
-		kldLoss.logvar_tensor = logvar;
-		kldLoss.mu_tensor = mu;
-		auto &kld = *kldLoss(x);
+		//kldLoss.logvar_tensor = logvar;
+		//kldLoss.mu_tensor = mu;
+		//auto &kld = *kldLoss(x);
 
-		return &(ml + kld);
+		return &(ml);
 	}
 
 	void train(int epoch){
@@ -873,7 +872,6 @@ struct VAE {
 	}
 };
 
-/*
 int main(void){
 	
 	Init init;
@@ -891,7 +889,6 @@ int main(void){
 	delete allocator;
 	return 0;
 }
-*/
 
 /*
 int main(void){
