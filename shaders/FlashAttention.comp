@@ -6,9 +6,9 @@
 #extension GL_KHR_shader_subgroup_basic : enable
 
 #define NUM_THREADS 256
-#define BLOCK_M 128
+#define BLOCK_M 32
 #define BLOCK_DMODEL 64  // Set appropriately based on your model (e.g., 64, 128)
-#define BLOCK_N 128
+#define BLOCK_N 32
 #define WARPSIZE 32
 
 layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;

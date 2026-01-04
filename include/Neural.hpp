@@ -705,7 +705,7 @@ struct Layernorm : public Module<T> {
 template<typename T>
 struct FlashAttention : public Module<T> {
 
-	std::string& name;
+	std::string name;
 	TensorPool<T>* tensorPool;
 	Tensor<T>* W_qkv;
 	Tensor<T>* Out;
@@ -717,15 +717,17 @@ struct FlashAttention : public Module<T> {
 	uint32_t d_model, n_heads, seq_len, in_features, batch_size;
 
 	FlashAttention(TensorPool<T>* pool, uint32_t d_model, uint32_t in_features, uint32_t n_heads, uint32_t seq_len, uint32_t batch_size, const std::string& name) :
-		tensorPool(pool), d_model(d_model), n_heads(n_heads), seq_len(seq_len), batch_size(batch_size), name(name), in_features(in_features) {
+		tensorPool(pool), d_model(d_model), n_heads(n_heads), seq_len(seq_len), batch_size(batch_size), in_features(in_features), name(name) {
 
-		W_qkv = &pool->createTensor({in_features, 3 * n_heads * d_model}, name + "W_qkv");
+		W_qkv = &pool->createTensor({3 * n_heads * d_model, in_features}, name + "W_qkv");
+		pool->tensor_fill_random(W_qkv->name, 2, in_features, 3 * n_heads * d_model, 0, 0);
+
 		tmp_qkv = &pool->createTensor({batch_size, seq_len, 3 * n_heads * d_model}, name + "-tmp_qkv");
 		Out = &pool->createTensor({batch_size, n_heads, seq_len, d_model / n_heads}, name + "-output");
 
-		L = std::make_unique<StandaloneBuffer<T>>(batch_size * n_heads * seq_len, &pool->allocator);
-		M = std::make_unique<StandaloneBuffer<T>>(batch_size * n_heads * seq_len, &pool->allocator);
-		delta = std::make_unique<StandaloneBuffer<T>>(528 ,&pool->allocator); // need to find exact allocation size later
+		L = std::make_unique<StandaloneBuffer<T>>(batch_size * n_heads * seq_len, pool->allocator);
+		M = std::make_unique<StandaloneBuffer<T>>(batch_size * n_heads * seq_len, pool->allocator);
+		delta = std::make_unique<StandaloneBuffer<T>>(batch_size * n_heads * seq_len ,pool->allocator);
 	}
 
 	Tensor<T>* forward(Tensor<T>* input) override {
@@ -733,7 +735,7 @@ struct FlashAttention : public Module<T> {
 		tensorPool->tensor_flash_attention(input->name, W_qkv->name, tmp_qkv->name, Out->name, L->getBufferAddress(), M->getBufferAddress(), d_model, seq_len, n_heads);
 
 		Out->back.push_back([this, input](){
-			this->tensorPool->tensor_flash_attention_bwd(tmp_qkv->name, Out->name, M->getDeviceAddress(), delta->getDeviceAddress(), d_model, seq_len, n_heads);
+			this->tensorPool->tensor_flash_attention_bwd(tmp_qkv->name, Out->name, M->getBufferAddress(), delta->getBufferAddress(), d_model, seq_len, n_heads);
 			input->backward();
 		});
 

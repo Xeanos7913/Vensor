@@ -6,9 +6,9 @@
 #extension GL_EXT_shader_atomic_float : enable
 
 #define NUM_THREADS 256
-#define BLOCK_M 128
+#define BLOCK_M 16
 #define BLOCK_DMODEL 64
-#define BLOCK_N 128
+#define BLOCK_N 16
 
 layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
 

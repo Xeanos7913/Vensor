@@ -3014,7 +3014,7 @@ struct TensorPool {
         // q.shape = [B, n_heads, T, d_k]
         // So grid = (cdiv(T, BLOCK), B * n_heads)
         
-        const uint32_t BLOCK = 128;  // BLOCK_M = BLOCK_N = 128
+        const uint32_t BLOCK = 32;  // BLOCK_M = BLOCK_N = 128
         
         
         // Dispatch will be: (grid_x, grid_y, grid_z)
@@ -3070,7 +3070,7 @@ struct TensorPool {
         
         // Calculate dispatch dimensions
         // Grid from forward: (cdiv(T, BLOCK), B * n_heads)
-        const uint32_t BLOCK = 128;
+        const uint32_t BLOCK = 64;
         uint32_t grid_x = (max_seq_len + BLOCK - 1) / BLOCK;
         uint32_t grid_y = batch_size * n_heads;
         
@@ -3162,7 +3162,7 @@ struct TensorPool {
         uniform.stride_vz = stride_batch;         // stride along B dimension
         
         // Calculate dispatch dimensions
-        const uint32_t BLOCK = 128;
+        const uint32_t BLOCK = 16;
         uint32_t grid_x = (max_seq_len + BLOCK - 1) / BLOCK;
         uint32_t grid_y = batch_size * n_heads;
         

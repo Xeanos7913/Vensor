@@ -872,6 +872,7 @@ struct VAE {
 	}
 };
 
+/*
 int main(void){
 	
 	Init init;
@@ -889,6 +890,7 @@ int main(void){
 	delete allocator;
 	return 0;
 }
+*/
 
 /*
 int main(void){
@@ -1185,3 +1187,26 @@ int main(void){
 	return 0;
 }
 */
+
+// Flash Attention check
+int main(void) {
+
+	Init init;
+	device_initialization(init);
+	Allocator* allocator = new Allocator(&init);
+
+	{
+		TensorPool<float> pool(allocator);
+
+		FlashAttention<float> aten(&pool, 64, 64, 32, 64, 5, "aten");
+
+		auto input = &pool.createTensor({5, 32, 64}, "input");
+		pool.tensor_fill_random(input->name, 0, 0, 0, -1.0f, 1.0f);
+
+		aten(input)->print();
+	}
+
+	delete allocator;
+
+	return 0;
+}
