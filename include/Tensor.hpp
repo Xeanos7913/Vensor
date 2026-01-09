@@ -417,20 +417,16 @@ struct tensor_flash_attention_bwd_preprocess_ctx{
 };
 
 struct tensor_flash_attention_bwd_ctx {
-    tensor_impl Q;        // Q.data.data for forward values, Q.grad.grad for gradients (output)
-    tensor_impl K;        // K.data.data for forward values, K.grad.grad for gradients (output)
-    tensor_impl V;        // V.data.data for forward values, V.grad.grad for gradients (output)
-    VkDeviceAddress M;    // Softmax max values
-    tensor_impl Out;      // Normalized gradient from preprocess lives in the out tensor
-    VkDeviceAddress Delta;// Delta values from preprocess
-    uint N_CTX;
-    uint Z;              // batch size
-    uint H;              // number of heads
-    float sm_scale;      // softmax scale
-    uint num_block;      // number of blocks
+    tensor_impl Q, K, V, Out;
+    VkDeviceAddress M, Delta;
+    uint N_CTX, Z, H;
+    float sm_scale;
+    int stride_h;
     int stride_qz, stride_qh, stride_qm, stride_qk;
     int stride_kz, stride_kh, stride_kn, stride_kk;
     int stride_vz, stride_vh, stride_vk, stride_vn;
+    int stride_oz, stride_oh, stride_om, stride_on;
+    uint causal;
 };
 
 struct tensor_upsample_context {
@@ -986,8 +982,10 @@ struct TensorPool {
                 readShaderBytecode("compiled_shaders/FlashAttention.comp.spv"), alloc, nullptr),
             flashAttentionBackwardPreprocess(
                 readShaderBytecode("compiled_shaders/FlashAttentionBackwardPreprocess.comp.spv"), alloc, nullptr),
-            flashAttentionBackward(
-                readShaderBytecode("compiled_shaders/FlashAttentionBackwardPass.comp.spv"), alloc, nullptr),
+            flashAttentionBackwardQ(
+                readShaderBytecode("compiled_shaders/FlashAttentionBackwardDq.comp.spv"), alloc, nullptr),
+            flashAttentionBackwardDkDv(
+                readShaderBytecode("compiled_shaders/FlashAttentionBackwardDkDv.comp.spv"), alloc, nullptr),
             logvarToStdShader(
                 readShaderBytecode("compiled_shaders/logvar_to_std.comp.spv"), alloc, nullptr),
             logvarToStdShaderBackward(
@@ -1708,17 +1706,7 @@ struct TensorPool {
     };
 
     void tensor_cross_entropy(const std::string& loss_tensor, const std::string& logits_tensor, const std::string& target_tensor, const std::string& softmax_tensor = "", uint32_t mode = 0) {
-        // Check if shapes match
-        try {
-            broadcastShapes(tensors[logits_tensor]->shape, tensors[target_tensor]->shape, Operation::ADDITION);
-            if (!softmax_tensor.empty()) {
-                broadcastShapes(tensors[logits_tensor]->shape, tensors[softmax_tensor]->shape, Operation::ADDITION);
-            }
-        }
-        catch (const std::invalid_argument& e) {
-            std::cerr << "Error in tensor_cross_entropy: " << e.what() << "\n";
-            throw;
-        }
+        
         tensor_cross_entropy_context uniform{};
         uniform.logits_tensor = tensors[logits_tensor]->getTensorImpl();
         uniform.target_tensor = tensors[target_tensor]->getTensorImpl();
@@ -2931,8 +2919,8 @@ struct TensorPool {
         uint32_t d_k = d_model / n_heads;  // head dimension
         
         // Memory layout strides for the combined QKV buffer
-        // Shape is [B, T, 3 * n_heads * d_k]
-        uint32_t stride_qkv = 3 * n_heads * d_k;  // stride along the feature dimension
+        // Shape is [B, T, 3 * d_model]
+        uint32_t stride_qkv = 3 * d_model;  // stride along the feature dimension
         uint32_t stride_seq = stride_qkv;          // stride along sequence dimension
         uint32_t stride_batch = max_seq_len * stride_seq;  // stride along batch dimension
         
@@ -3084,7 +3072,7 @@ struct TensorPool {
         flashAttentionBackwardPreprocess.execute(wrkgrp);
     }
 
-    // Backward kernel - computes dQ, dK, dV gradients
+    // Backward kernel - computes dQ, dK, dV gradients using two-pass approach
     void tensor_flash_attention_bwd(
         const std::string& qkv_combined_name, // Combined QKV buffer from forward
         const std::string& output_name,       // O tensor (normalized dO is in O.grad after preprocess)
@@ -3092,7 +3080,8 @@ struct TensorPool {
         VkDeviceAddress Delta_buffer,         // Delta from preprocess
         uint32_t d_model,
         uint32_t max_seq_len,
-        uint32_t n_heads)
+        uint32_t n_heads,
+        bool causal = true)
     {
         tensor_flash_attention_bwd_ctx uniform;
         
@@ -3102,9 +3091,9 @@ struct TensorPool {
         uint32_t d_k = d_model / n_heads;
         
         // Memory layout strides for the combined QKV buffer
-        // Shape is [B, T, 3 * n_heads * d_k]
-        uint32_t stride_qkv = 3 * n_heads * d_k;
-        uint32_t stride_seq = stride_qkv;
+        // Shape is [B, T, 3 * d_model]
+        uint32_t stride_qkv = d_model;
+        uint32_t stride_seq = 3 * stride_qkv;
         uint32_t stride_batch = max_seq_len * stride_seq;
         
         // Base addresses
@@ -3114,20 +3103,28 @@ struct TensorPool {
         // Q tensor: forward values in Q.data, gradients written to Q.grad
         uniform.Q.data = base;
         uniform.Q.grad = gradientBase;
-        uniform.Q.num_dims = 3;
+        uniform.Q.num_elements = batch_size * n_heads * max_seq_len * d_k;
+        uniform.Q.num_dims = 4;
         uniform.Q.requires_gradient = 1;
+        uniform.Q.is_leaf = 0;
         
         // K tensor: forward values in K.data, gradients written to K.grad
+        // Note: K is pre-scaled by sm_scale * RCP_LN2 in the forward pass
+        // For backward, we need to read the original K values
         uniform.K.data = base + sizeof(float) * n_heads * d_k;
         uniform.K.grad = gradientBase + sizeof(float) * n_heads * d_k;
-        uniform.K.num_dims = 3;
+        uniform.K.num_elements = batch_size * n_heads * max_seq_len * d_k;
+        uniform.K.num_dims = 4;
         uniform.K.requires_gradient = 1;
+        uniform.K.is_leaf = 0;
         
         // V tensor: forward values in V.data, gradients written to V.grad
         uniform.V.data = base + sizeof(float) * 2 * n_heads * d_k;
         uniform.V.grad = gradientBase + sizeof(float) * 2 * n_heads * d_k;
-        uniform.V.num_dims = 3;
+        uniform.V.num_elements = batch_size * n_heads * max_seq_len * d_k;
+        uniform.V.num_dims = 4;
         uniform.V.requires_gradient = 1;
+        uniform.V.is_leaf = 0;
         
         // Out tensor: normalized dO gradient lives in Out.grad after preprocess
         uniform.Out = output->getTensorImpl();
@@ -3142,8 +3139,9 @@ struct TensorPool {
         uniform.N_CTX = max_seq_len;
         uniform.Z = batch_size;
         uniform.H = n_heads;
+        uniform.causal = causal ? 1 : 0;
         
-        // Q strides: [B, n_heads, T, d_k] - viewing the [B, T, 3*n_heads*d_k] buffer
+        // Q strides: [B, n_heads, T, d_k] - viewing the [B, T, 3 * d_model] buffer
         uniform.stride_qk = 1;                    // stride along d_k dimension
         uniform.stride_qm = stride_seq;           // stride along T (sequence) dimension
         uniform.stride_qh = d_k;                  // stride along n_heads dimension
@@ -3160,22 +3158,56 @@ struct TensorPool {
         uniform.stride_vk = stride_seq;           // stride along T dimension
         uniform.stride_vh = d_k;                  // stride along n_heads dimension
         uniform.stride_vz = stride_batch;         // stride along B dimension
+
+        // O strides: [B, n_heads, T, d_k]
+        uniform.stride_on = 1;                           // stride along d_k dimension
+        uniform.stride_om = d_k;                         // stride along T dimension
+        uniform.stride_oh = max_seq_len * d_k;           // stride along n_heads dimension
+        uniform.stride_oz = n_heads * max_seq_len * d_k; // stride along B dimension
+
+        uniform.stride_h = d_k;
         
-        // Calculate dispatch dimensions
-        const uint32_t BLOCK = 16;
-        uint32_t grid_x = (max_seq_len + BLOCK - 1) / BLOCK;
-        uint32_t grid_y = batch_size * n_heads;
+        // Block sizes from shader
+        const uint32_t BLOCK_M1 = 16;
+        const uint32_t BLOCK_N1 = 32;
+        const uint32_t BLOCK_M2 = 32;
+        const uint32_t BLOCK_N2 = 16;
         
-        // Store num_block (grid[0] from forward pass)
-        uniform.num_block = grid_x;
+        // ========================================================================
+        // Pass 1: Compute dK and dV
+        // ========================================================================
+        // Grid: (N_CTX / BLOCK_N1, BATCH * N_HEAD)
+        // Each workgroup processes a block of K/V (BLOCK_N1 rows)
         
-        // Backward kernel dispatches grid_y workgroups (one per batch * head)
-        uint32_t wrkgrp[3] = {grid_y, 1, 1};
+        uint32_t grid_dkdv_x = (max_seq_len + BLOCK_N1 - 1) / BLOCK_N1;
+        uint32_t grid_dkdv_y = batch_size * n_heads;
+        uint32_t wrkgrp_dkdv[3] = {grid_dkdv_x, grid_dkdv_y, 1};
         
-        tensor_push_const p;
-        p.uniformAddress = flashAttentionBackward.uniformBuffer->getBufferAddress();
-        flashAttentionBackward.loadUniform(uniform, p);
-        flashAttentionBackward.execute(wrkgrp);
+        tensor_push_const p_dkdv;
+        p_dkdv.uniformAddress = flashAttentionBackwardDkDv.uniformBuffer->getBufferAddress();
+        flashAttentionBackwardDkDv.loadUniform(uniform, p_dkdv);
+        flashAttentionBackwardDkDv.execute(wrkgrp_dkdv);
+        
+        // ========================================================================
+        // Pass 2: Compute dQ
+        // ========================================================================
+        // Grid: (N_CTX / BLOCK_M2, BATCH * N_HEAD)
+        // Each workgroup processes a block of Q (BLOCK_M2 rows)
+        
+        uint32_t grid_dq_x = (max_seq_len + BLOCK_M2 - 1) / BLOCK_M2;
+        uint32_t grid_dq_y = batch_size * n_heads;
+        uint32_t wrkgrp_dq[3] = {grid_dq_x, grid_dq_y, 1};
+        
+        tensor_push_const p_dq;
+        p_dq.uniformAddress = flashAttentionBackwardQ.uniformBuffer->getBufferAddress();
+        flashAttentionBackwardQ.loadUniform(uniform, p_dq);
+        flashAttentionBackwardQ.execute(wrkgrp_dq);
+        
+        // Gradients are now computed:
+        // - dQ is at gradientBase + 0
+        // - dK is at gradientBase + sizeof(float) * n_heads * d_k
+        // - dV is at gradientBase + sizeof(float) * 2 * n_heads * d_k
+        // All in the qkv_tensor->gradientBuffer
     }
 
     // Combined backward pass function
@@ -3203,13 +3235,13 @@ struct TensorPool {
         // Step 2: Backward kernel
         // This computes dQ, dK, dV using the normalized dO from Out.grad
         tensor_flash_attention_bwd(
-            qkv_combined_name,
-            output_name,
-            M_buffer,
-            Delta_buffer,
-            d_model,
-            max_seq_len,
-            n_heads
+        qkv_combined_name,
+        output_name,
+        M_buffer,
+        Delta_buffer,
+        d_model,
+        max_seq_len,
+        n_heads
         );
         
         // Gradients are now computed:
@@ -3218,7 +3250,6 @@ struct TensorPool {
         // - dV is at gradientBase + sizeof(float) * 2 * n_heads * d_k
         // All in the qkv_tensor->gradientBuffer
     }
-
 
     // Automatically populates predicted tensor's gradient buffer with a single call. No need to call .backward()
     void mse_loss(const std::string& predicted, const std::string& target, const std::string& loss) {
@@ -3510,7 +3541,8 @@ private:
     gpuTaskNoDesc<T, tensor_push_const, tensor_layernorm1d_context> layernorm1dShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, tensor_flash_attention_fwd_ctx> flashAttention; // computes flash attention forward pass
     gpuTaskNoDesc<T, tensor_push_const, tensor_flash_attention_bwd_preprocess_ctx> flashAttentionBackwardPreprocess; // computes flash attention backward preprocess pass
-    gpuTaskNoDesc<T, tensor_push_const, tensor_flash_attention_bwd_ctx> flashAttentionBackward; // computes flash attention backward pass
+    gpuTaskNoDesc<T, tensor_push_const, tensor_flash_attention_bwd_ctx> flashAttentionBackwardDkDv; // computes flash attention gradients for K, V
+    gpuTaskNoDesc<T, tensor_push_const, tensor_flash_attention_bwd_ctx> flashAttentionBackwardQ; // computes flash attention gradients for K, V
     gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShader; // computes embedding lookup
     gpuTaskNoDesc<T, tensor_push_const, embedding_lookup_context> embedLookupShaderBackward;
     gpuTaskNoDesc<T, tensor_push_const, tensor_upsample_context> upsampleShader; // upsamples image tensors [B, C, H, W] using bilinear interpolation

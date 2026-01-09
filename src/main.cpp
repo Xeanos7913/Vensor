@@ -773,14 +773,14 @@ struct VAE {
 	}
 
 	Tensor<float>* reparameterize(Tensor<float>* mu, Tensor<float>* logvar){
-		//auto &std_tensor = (0.5f * *logvar).exp();
-		//auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
+		auto &std_tensor = (0.5f * *logvar).exp();
+		auto &eps_tensor = tensorPool.createTensor({16, 1, latent_dim}, "eps");
 		
 		// Use Gaussian/Normal distribution N(0, 1) for VAE reparameterization
 		// init_type=1: Normal distribution with mean=0.0, stddev=1.0
-		//tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
+		tensorPool.tensor_fill_random("eps", 1, 0, 0, 0.0f, 1.0f);
 		
-		return &(*mu);
+		return &(*mu + std_tensor * eps_tensor);
 	}
 
 	Tensor<float>* decode(Tensor<float>* z){
@@ -796,11 +796,11 @@ struct VAE {
 	Tensor<float>* loss_function(Tensor<float>* recon, Tensor<float>* x, Tensor<float>* mu, Tensor<float>* logvar) {
 		mseLoss.target = x;
 		auto &ml = *mseLoss(recon);
-		//kldLoss.logvar_tensor = logvar;
-		//kldLoss.mu_tensor = mu;
-		//auto &kld = *kldLoss(x);
+		kldLoss.logvar_tensor = logvar;
+		kldLoss.mu_tensor = mu;
+		auto &kld = *kldLoss(x);
 
-		return &(ml);
+		return &(ml + kld);
 	}
 
 	void train(int epoch){
@@ -1198,12 +1198,25 @@ int main(void) {
 	{
 		TensorPool<float> pool(allocator);
 
-		FlashAttention<float> aten(&pool, 64, 64, 32, 64, 5, "aten");
+		FlashAttention<float> aten(&pool, 512, 64, 8, 1, 3, "aten");
+		SoftmaxCrossEntropy<float> soft(&pool, aten.output->shape[1], aten.output->shape[2], 3, "soft");
+		
+		auto input = &pool.createTensor({3, 1, 64}, "input");
+		pool.tensor_fill_random("input", 1, 0, 0, 0.0f, 1.0f);
 
-		auto input = &pool.createTensor({5, 32, 64}, "input");
-		pool.tensor_fill_random(input->name, 0, 0, 0, -1.0f, 1.0f);
+		auto target = &pool.createTensor({3, aten.output->shape[1], aten.output->shape[2]}, "target");
 
-		aten(input)->print();
+		target->setElement(1.0f, {0, 0, 0});
+		target->setElement(1.0f, {1, 0, 0});
+		target->setElement(1.0f, {2, 0, 0});
+		//target->setElement(1.0f, {3, 0, 0});
+		//target->setElement(1.0f, {4, 0, 0});
+		//target->setElement(1.0f, {5, 0, 0});
+
+		soft.target = target;
+
+		soft(aten(input))->backward();
+		aten.tmp_qkv->printGradient();
 	}
 
 	delete allocator;

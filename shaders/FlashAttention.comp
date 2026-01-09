@@ -13,36 +13,19 @@
 
 layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
 
-layout(buffer_reference, std430, scalar) buffer tensor_data {
+layout(buffer_reference, std430, scalar) buffer FloatBuffer {
     float data[];
 };
 
-layout(buffer_reference, std430, scalar) buffer tensor_grad {
-    float grad[];
+layout(buffer_reference, std430, scalar) buffer IntBuffer {
+    int data[];
 };
-
-layout(buffer_reference, std430, scalar) buffer tensor_strides {
-    int strides[];
-};
-
-layout(buffer_reference, std430, scalar) buffer tensor_shape {
-    int dims[];
-};
-
-layout(buffer_reference, std430, scalar) buffer softmaxMaxVals {
-    float vals[];
-};
-
-layout(buffer_reference, std430, scalar) buffer softmaxDenoms {
-    float vals[];
-};
-
 
 struct TensorImpl {
-    tensor_data    data;
-    tensor_grad    grad;
-    tensor_strides strides;
-    tensor_shape   shape;
+    FloatBuffer    data;
+    FloatBuffer    grad;
+    IntBuffer strides;
+    IntBuffer   shape;
     uint numel, ndim, requires_grad, is_leaf;
 };
 
@@ -50,8 +33,8 @@ struct FlashAttentionContext {
     TensorImpl Q;
     TensorImpl K;
     TensorImpl V;
-    softmaxDenoms L;   // Softmax demonimators
-    softmaxMaxVals M;  // Softmax max values
+    FloatBuffer L;   // Softmax demonimators
+    FloatBuffer M;  // Softmax max values
     TensorImpl Out;
     uint N_CTX;
     uint Z;  // batch size
@@ -278,8 +261,8 @@ void main() {
             uint offs_m = start_m * BLOCK_M + m_idx;
             if (offs_m < c.N_CTX) {
                 uint lm_offset = off_hz * c.N_CTX + offs_m;
-                c.L.vals[lm_offset] = l_i[m_idx];
-                c.M.vals[lm_offset] = m_i[m_idx];
+                c.L.data[lm_offset] = l_i[m_idx];
+                c.M.data[lm_offset] = m_i[m_idx];
             }
         }
     }

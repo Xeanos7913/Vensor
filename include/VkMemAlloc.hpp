@@ -1192,6 +1192,13 @@ struct StandaloneBuffer {
 		return data;
     }
 
+    void printBuffer(){
+        auto d = downloadBuffer();
+        for (auto i : d){std::cout << " " << i;};
+
+        std::cout << "\n\n";
+    }
+
     /*
     void operator=(const StandaloneBuffer& other) const {
         if (this != &other) {

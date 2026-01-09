@@ -1,0 +1,192 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+#define NUM_THREADS 256
+#define BLOCK_M1 16
+#define BLOCK_N1 32
+#define BLOCK_M2 32
+#define BLOCK_N2 16
+#define HEAD_DIM 64
+#define BLK_SLICE_FACTOR 2
+
+layout(local_size_x = NUM_THREADS, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, scalar) buffer FloatBuffer { float data[]; };
+layout(buffer_reference, std430, scalar) buffer IntBuffer { int data[]; };
+
+struct TensorImpl {
+    FloatBuffer data;
+    FloatBuffer grad;
+    IntBuffer stride;
+    IntBuffer shape;
+    uint numel, ndim, requires_grad, is_leaf;
+};
+
+struct FlashAttentionBackwardContext {
+    TensorImpl Q, K, V, Out;
+    FloatBuffer M, Delta;
+    uint N_CTX, Z, H;
+    float sm_scale;
+    int stride_h;
+    int stride_qz, stride_qh, stride_qm, stride_qk;
+    int stride_kz, stride_kh, stride_kn, stride_kk;
+    int stride_vz, stride_vh, stride_vk, stride_vn;
+    int stride_oz, stride_oh, stride_om, stride_on;
+    uint causal;
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer ContextBuffer { 
+    FlashAttentionBackwardContext ctx; 
+};
+
+layout(push_constant) uniform PushConstants {
+    ContextBuffer context;
+} push;
+
+const float LN2 = 0.6931471824645996;
+
+// smem for dK/dV computation
+shared float sK[BLOCK_N1][HEAD_DIM];
+shared float sV[BLOCK_N1][HEAD_DIM];
+shared float sDK[BLOCK_N1][HEAD_DIM];
+shared float sDV[BLOCK_N1][HEAD_DIM];
+shared float sQT[HEAD_DIM][BLOCK_M1];
+shared float sDO[BLOCK_M1][HEAD_DIM];
+shared float sM[BLOCK_M1];
+shared float sDi[BLOCK_M1];
+
+void compute_dkdv() {
+    FlashAttentionBackwardContext c = push.context.ctx;
+    uint pid = gl_WorkGroupID.x;
+    uint bhid = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    
+    uint head  = bhid % c.H;
+    uint batch = bhid / c.H;
+
+    int adj = int(batch * c.stride_qz + head * c.stride_h);
+    uint off_chz = batch * c.N_CTX;
+
+    uint start_n = pid * BLOCK_N1;
+    
+    // Init accumulators and load K, V
+    for (uint i = tid; i < BLOCK_N1 * HEAD_DIM; i += NUM_THREADS) {
+        uint n = i / HEAD_DIM, k = i % HEAD_DIM;
+        uint offs_n = start_n + n;
+        sDK[n][k] = 0.0;
+        sDV[n][k] = 0.0;
+        if (offs_n < c.N_CTX) {
+            sK[n][k] = c.K.data.data[uint(adj) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)];
+            sV[n][k] = c.V.data.data[uint(adj) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)];
+        } else {
+            sK[n][k] = 0.0;
+            sV[n][k] = 0.0;
+        }
+    }
+    barrier();
+    
+    uint start_m = c.causal != 0 ? start_n : 0;
+    uint MASK_M1 = BLOCK_M1 / BLK_SLICE_FACTOR;
+    
+    // Process Q blocks
+    for (uint curr_m = start_m; curr_m < c.N_CTX; curr_m += BLOCK_M1) {
+        uint bsz = min(BLOCK_M1, c.N_CTX - curr_m);
+        bool is_first = (c.causal != 0 && curr_m == start_n);
+        
+        uint num_steps = is_first ? (BLOCK_N1 / MASK_M1) : 1;
+        uint step_size = is_first ? MASK_M1 : bsz;
+        
+        for (uint step = 0; step < num_steps; step++) {
+            uint local_m = is_first ? (start_n + step * MASK_M1) : curr_m;
+            uint block_m = is_first ? MASK_M1 : bsz;
+            if (local_m >= c.N_CTX) break;
+            
+            // Load Q^T, DO, M, Delta
+            for (uint i = tid; i < block_m * HEAD_DIM; i += NUM_THREADS) {
+                uint m = i / HEAD_DIM, k = i % HEAD_DIM;
+                uint offs_m = local_m + m;
+                if (offs_m < c.N_CTX) {
+                    uint off = uint(adj) + offs_m * uint(c.stride_qm) + k * uint(c.stride_qk);
+                    uint out_off = bhid * c.stride_oh + offs_m * uint(c.stride_om) + k * uint(c.stride_on);
+                    sQT[k][m] = c.Q.data.data[off];
+                    sDO[m][k] = c.Out.grad.data[out_off];
+                } else {
+                    sQT[k][m] = 0.0;
+                    sDO[m][k] = 0.0;
+                }
+            }
+            
+            for (uint i = tid; i < block_m; i += NUM_THREADS) {
+                uint offs_m = local_m + i;
+                if (offs_m < c.N_CTX) {
+                    sM[i] = c.M.data[off_chz + offs_m];
+                    sDi[i] = c.Delta.data[off_chz + offs_m];
+                }
+            }
+            barrier();
+            
+            // Compute contributions
+            for (uint i = tid; i < BLOCK_N1 * block_m; i += NUM_THREADS) {
+                uint n = i / block_m, m = i % block_m;
+                
+                float qk = 0.0;
+                for (uint k = 0; k < HEAD_DIM; k++) qk += sK[n][k] * sQT[k][m];
+                
+                float p = exp(qk - sM[m]);
+                
+                if (is_first) {
+                    uint offs_m = local_m + m;
+                    uint offs_n = start_n + n;
+                    if (offs_m < offs_n) p = 0.0;
+                }
+                
+                // dV += P^T @ dO
+                for (uint k = 0; k < HEAD_DIM; k++)
+                    atomicAdd(sDV[n][k], p * sDO[m][k]);
+            }
+            barrier();
+            
+            // dK += dS^T @ Q
+            for (uint i = tid; i < BLOCK_N1 * block_m; i += NUM_THREADS) {
+                uint n = i / block_m, m = i % block_m;
+                
+                float qk = 0.0;
+                for (uint k = 0; k < HEAD_DIM; k++) qk += sK[n][k] * sQT[k][m];
+                float p = exp(qk - sM[m]);
+                
+                if (is_first) {
+                    uint offs_m = local_m + m;
+                    uint offs_n = start_n + n;
+                    if (offs_m < offs_n) p = 0.0;
+                }
+                
+                float dp = 0.0;
+                for (uint k = 0; k < HEAD_DIM; k++) dp += sDO[m][k] * sV[n][k];
+                
+                float ds = p * (dp - (sDi[m] / c.sm_scale));
+                
+                for (uint k = 0; k < HEAD_DIM; k++)
+                    atomicAdd(sDK[n][k], ds * sQT[k][m]);
+            }
+            barrier();
+        }
+    }
+    
+    // Write dK, dV
+    for (uint i = tid; i < BLOCK_N1 * HEAD_DIM; i += NUM_THREADS) {
+        uint n = i / HEAD_DIM, k = i % HEAD_DIM;
+        uint offs_n = start_n + n;
+        if (offs_n < c.N_CTX) {
+            c.K.grad.data[(uint(adj) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk))] = sDK[n][k] * c.sm_scale;
+            c.V.grad.data[uint(adj) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)] = sDV[n][k];
+        }
+    }
+}
+
+void main() {
+    compute_dkdv();
+}

@@ -10,8 +10,8 @@ A C++ machine learning library utilizing Vulkan for GPU acceleration. Developed 
 ## Implemented Components
 
 ### Layers
-- Neural Network Layers: Linear, Conv2d, Conv2d Transposed
-- Activation Functions: ReLU, Softmax
+- Neural Network Layers: Linear, Conv2d, Conv2d Transposed, FlashAttention (Causal self-attention)
+- Activation Functions: ReLU, Softmax, TanH
 - Normalization: BatchNorm1d/2d, LayerNorm
 - Loss Functions: MSE, Cross-Entropy, KL-Divergence (for VAEs only)
 - Utility Layers: EmbeddingLookup, ResidualConnect, MaxPooling, Bilinear interpolation Upsampling
