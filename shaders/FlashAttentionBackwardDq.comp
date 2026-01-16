@@ -70,6 +70,12 @@ void compute_dq() {
     int adj = int(batch * c.stride_qz + head * c.stride_h);
     uint off_chz = batch * c.N_CTX;
 
+    // Separate offsets for forward and gradient tensors
+    int adj_q = int(batch * c.stride_qz + head * c.stride_h);
+    int adj_k = int(batch * c.stride_kz + head * c.stride_h);
+    int adj_v = int(batch * c.stride_vz + head * c.stride_h);
+    int adj_o = int(batch * c.stride_oz + head * c.stride_oh);
+
     uint start_m = pid * BLOCK_M2;
     if (start_m >= c.N_CTX) return;
     
@@ -79,10 +85,10 @@ void compute_dq() {
         uint offs_m = start_m + m;
         sDQ[m][k] = 0.0;
         if (offs_m < c.N_CTX) {
-            uint off = uint(adj) + offs_m * uint(c.stride_qm) + k * uint(c.stride_qk);
-            uint out_off = bhid * c.stride_oh + offs_m * uint(c.stride_om) + k * uint(c.stride_on);
-            sQ[m][k] = c.Q.data.data[off];
-            sDO2[m][k] = c.Out.grad.data[out_off];
+            uint off_q = uint(adj_q) + offs_m * uint(c.stride_qm) + k * uint(c.stride_qk);
+            uint off_o = uint(adj_o) + offs_m * uint(c.stride_om) + k * uint(c.stride_on);
+            sQ[m][k] = c.Q.data.data[off_q];
+            sDO2[m][k] = c.Out.grad.data[off_o];
         } else {
             sQ[m][k] = 0.0;
             sDO2[m][k] = 0.0;
@@ -116,8 +122,8 @@ void compute_dq() {
                 uint k = i / MASK_N2, n = i % MASK_N2;
                 uint offs_n = curr_n + n;
                 if (offs_n < c.N_CTX) {
-                    sKT[k][n] = c.K.data.data[uint(adj) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)];
-                    sVT[k][n] = c.V.data.data[uint(adj) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)];
+                    sKT[k][n] = c.K.data.data[uint(adj_k) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)];
+                    sVT[k][n] = c.V.data.data[uint(adj_v) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)];
                 } else {
                     sKT[k][n] = 0.0;
                     sVT[k][n] = 0.0;
@@ -155,8 +161,8 @@ void compute_dq() {
             uint k = i / bsz, n = i % bsz;
             uint offs_n = curr_n + n;
             if (offs_n < c.N_CTX) {
-                sKT[k][n] = c.K.data.data[uint(adj) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)];
-                sVT[k][n] = c.V.data.data[uint(adj) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)];
+                sKT[k][n] = c.K.data.data[uint(adj_k) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)];
+                sVT[k][n] = c.V.data.data[uint(adj_v) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)];
             } else {
                 sKT[k][n] = 0.0;
                 sVT[k][n] = 0.0;
@@ -186,7 +192,7 @@ void compute_dq() {
         uint m = i / HEAD_DIM, k = i % HEAD_DIM;
         uint offs_m = start_m + m;
         if (offs_m < c.N_CTX) {
-            c.Q.grad.data[uint(adj) + offs_m * uint(c.stride_qm) + k * uint(c.stride_qk)] = sDQ[m][k] * LN2;
+            c.Q.grad.data[uint(adj_q) + offs_m * uint(c.stride_qm) + k * uint(c.stride_qk)] = sDQ[m][k] * LN2;
         }
     }
 }

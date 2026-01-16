@@ -68,20 +68,25 @@ void compute_dkdv() {
     uint head  = bhid % c.H;
     uint batch = bhid / c.H;
 
-    int adj = int(batch * c.stride_qz + head * c.stride_h);
+    // Separate offsets for each tensor type
+    int adj_q = int(batch * c.stride_qz + head * c.stride_h);
+    int adj_k = int(batch * c.stride_kz + head * c.stride_h);
+    int adj_v = int(batch * c.stride_vz + head * c.stride_h);
+    int adj_o = int(batch * c.stride_oz + head * c.stride_oh);
+    
     uint off_chz = batch * c.N_CTX;
 
     uint start_n = pid * BLOCK_N1;
     
-    // Init accumulators and load K, V
+    // Init accumulators and load K, V (use correct offsets)
     for (uint i = tid; i < BLOCK_N1 * HEAD_DIM; i += NUM_THREADS) {
         uint n = i / HEAD_DIM, k = i % HEAD_DIM;
         uint offs_n = start_n + n;
         sDK[n][k] = 0.0;
         sDV[n][k] = 0.0;
         if (offs_n < c.N_CTX) {
-            sK[n][k] = c.K.data.data[uint(adj) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)];
-            sV[n][k] = c.V.data.data[uint(adj) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)];
+            sK[n][k] = c.K.data.data[uint(adj_k) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)];
+            sV[n][k] = c.V.data.data[uint(adj_v) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)];
         } else {
             sK[n][k] = 0.0;
             sV[n][k] = 0.0;
@@ -105,15 +110,15 @@ void compute_dkdv() {
             uint block_m = is_first ? MASK_M1 : bsz;
             if (local_m >= c.N_CTX) break;
             
-            // Load Q^T, DO, M, Delta
+            // Load Q^T, DO, M, Delta (use correct offsets)
             for (uint i = tid; i < block_m * HEAD_DIM; i += NUM_THREADS) {
                 uint m = i / HEAD_DIM, k = i % HEAD_DIM;
                 uint offs_m = local_m + m;
                 if (offs_m < c.N_CTX) {
-                    uint off = uint(adj) + offs_m * uint(c.stride_qm) + k * uint(c.stride_qk);
-                    uint out_off = bhid * c.stride_oh + offs_m * uint(c.stride_om) + k * uint(c.stride_on);
-                    sQT[k][m] = c.Q.data.data[off];
-                    sDO[m][k] = c.Out.grad.data[out_off];
+                    uint off_q = uint(adj_q) + offs_m * uint(c.stride_qm) + k * uint(c.stride_qk);
+                    uint off_o = uint(adj_o) + offs_m * uint(c.stride_om) + k * uint(c.stride_on);
+                    sQT[k][m] = c.Q.data.data[off_q];
+                    sDO[m][k] = c.Out.grad.data[off_o];
                 } else {
                     sQT[k][m] = 0.0;
                     sDO[m][k] = 0.0;
@@ -129,7 +134,7 @@ void compute_dkdv() {
             }
             barrier();
             
-            // Compute contributions
+            // Compute contributions (no changes needed here)
             for (uint i = tid; i < BLOCK_N1 * block_m; i += NUM_THREADS) {
                 uint n = i / block_m, m = i % block_m;
                 
@@ -176,13 +181,13 @@ void compute_dkdv() {
         }
     }
     
-    // Write dK, dV
+    // Write dK, dV (use correct offsets)
     for (uint i = tid; i < BLOCK_N1 * HEAD_DIM; i += NUM_THREADS) {
         uint n = i / HEAD_DIM, k = i % HEAD_DIM;
         uint offs_n = start_n + n;
         if (offs_n < c.N_CTX) {
-            c.K.grad.data[(uint(adj) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk))] = sDK[n][k] * c.sm_scale;
-            c.V.grad.data[uint(adj) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)] = sDV[n][k];
+            c.K.grad.data[uint(adj_k) + offs_n * uint(c.stride_kn) + k * uint(c.stride_kk)] = sDK[n][k] * c.sm_scale;
+            c.V.grad.data[uint(adj_v) + offs_n * uint(c.stride_vk) + k * uint(c.stride_vn)] = sDV[n][k];
         }
     }
 }

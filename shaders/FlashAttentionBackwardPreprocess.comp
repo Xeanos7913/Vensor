@@ -70,9 +70,21 @@ shared float delta_vals[BLOCK_M];
 void main() {
     FlashAttentionBackwardPreprocessContext c = push.context.ctx;
     
-    uint start_m = gl_WorkGroupID.x;
-    uint off_hz = gl_WorkGroupID.y;
+    uint flat_wg_id = gl_WorkGroupID.x;  // This is the flattened workgroup ID
     uint tid = gl_LocalInvocationID.x;
+    
+    // Unflatten the workgroup ID
+    // grid_x = (N_CTX + BLOCK_M - 1) / BLOCK_M
+    // grid_y = Z * H
+    // flat_wg_id = start_m + off_hz * grid_x
+    uint grid_x = (c.N_CTX + BLOCK_M - 1) / BLOCK_M;
+    
+    uint start_m = flat_wg_id % grid_x;
+    uint off_hz = flat_wg_id / grid_x;
+    
+    // Decompose off_hz into batch and head indices
+    uint head = off_hz % c.H;
+    uint batch = off_hz / c.H;
     
     uint base_m = start_m * BLOCK_M;
     
@@ -86,7 +98,8 @@ void main() {
         if (m_idx < BLOCK_M && d_idx < BLOCK_DMODEL) {
             uint offs_m = base_m + m_idx;
             if (offs_m < c.N_CTX) {
-                uint offset = off_hz * c.stride_oh + offs_m * c.stride_om + d_idx * c.stride_on;
+                // Use proper batch and head offsets
+                uint offset = batch * c.stride_oz + head * c.stride_oh + offs_m * c.stride_om + d_idx * c.stride_on;
                 o_tile[m_idx][d_idx] = c.Out.data.data[offset];
                 do_tile[m_idx][d_idx] = c.Out.grad.grad[offset];  // Upstream gradient
             } else {
@@ -103,6 +116,7 @@ void main() {
         if (m_idx < BLOCK_M) {
             uint offs_m = base_m + m_idx;
             if (offs_m < c.N_CTX) {
+                // L is indexed as [batch * n_heads + head][sequence]
                 uint l_offset = off_hz * c.N_CTX + offs_m;
                 denom[m_idx] = c.L.vals[l_offset];
             } else {
@@ -141,7 +155,8 @@ void main() {
         if (m_idx < BLOCK_M && d_idx < BLOCK_DMODEL) {
             uint offs_m = base_m + m_idx;
             if (offs_m < c.N_CTX) {
-                uint offset = off_hz * c.stride_oh + offs_m * c.stride_om + d_idx * c.stride_on;
+                // Use proper batch and head offsets
+                uint offset = batch * c.stride_oz + head * c.stride_oh + offs_m * c.stride_om + d_idx * c.stride_on;
                 c.Out.grad.grad[offset] = do_tile[m_idx][d_idx];
             }
         }
@@ -153,6 +168,7 @@ void main() {
         if (m_idx < BLOCK_M) {
             uint offs_m = base_m + m_idx;
             if (offs_m < c.N_CTX) {
+                // Delta is indexed as [batch * n_heads + head][sequence]
                 uint delta_offset = off_hz * c.N_CTX + offs_m;
                 c.Delta.delta[delta_offset] = delta_vals[m_idx];
             }

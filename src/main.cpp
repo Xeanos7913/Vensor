@@ -1216,7 +1216,7 @@ int main(void) {
 		soft.target = target;
 
 		soft(aten(input))->backward();
-		aten.tmp_qkv->printGradient();
+		input->printGradient();
 	}
 
 	delete allocator;

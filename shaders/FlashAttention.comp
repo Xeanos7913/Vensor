@@ -39,7 +39,7 @@ struct FlashAttentionContext {
     uint N_CTX;
     uint Z;  // batch size
     uint H;  // number of heads
-    float sm_scale;  // softmax scale (typically 1/sqrt(d_k))
+    float sm_scale;  // softmax scale (1/sqrt(d_k))
     int stride_qz, stride_qh, stride_qm, stride_qk;
     int stride_kz, stride_kh, stride_kn, stride_kk;
     int stride_vz, stride_vh, stride_vk, stride_vn;
