@@ -10,6 +10,7 @@ and a VAE implementation for MNIST handwritten digit data generation.
 #include "../include/Neural.hpp"
 #include "../include/Dataloader.hpp"
 #include "../include/progressbar.hpp"
+#include "../include/Livia.hpp"
 #include <memory>
 #include <initializer_list>
 
@@ -1189,6 +1190,7 @@ int main(void){
 */
 
 // Flash Attention check
+/*
 int main(void) {
 
 	Init init;
@@ -1223,3 +1225,65 @@ int main(void) {
 
 	return 0;
 }
+*/
+
+// Livia test
+/*
+int main(void) {
+    Shader s;
+
+    s.version = 450;
+    s.request_extention("GL_ARB_seperate_shader_objects");
+    s.request_extention("GL_EXT_buffer_reference");
+    s.request_extention("GL_EXT_scalar_block_layout");
+    s.set_block_size(1, 1, 1);
+
+    Shader::uniform::entry e;
+    e.name = "K";
+    e.type = types::UINT32;
+    s.uniform_buffer.add_item(e);
+
+    auto g = s.declare_buffer(types::FLOAT32, "FloatBuffer");
+    auto n = s.declare_buffer(types::FLOAT32, "NewBuffer");
+
+    auto sr = s.declare_shared(types::FLOAT32, "shared_mem", 512);
+    
+    std::string glsl;
+
+    s.decl_main(glsl);
+
+    auto cRow = idx::program_id(1);
+    auto cCol = idx::program_id(0);
+    auto batch = idx::program_id(2);
+
+    auto K = idx::from_uniform(s.uniform_buffer, "K");
+
+    auto start = idx("0");
+    auto ran = idx::arange(start, K);
+    auto bkIdx = idx("bkIdx");
+
+    auto res = var("res", types::FLOAT32, idx::scalar("128"));
+    glsl += res.decl();
+
+    loop outer(bkIdx, ran);
+    outer.add_instruction(s.load(g, sr, outer.iterator + idx::arange(0, 128)));
+
+    auto dotIdx = idx("dotIdx");
+    auto inner_ran = idx::arange(0, 128);
+    loop inner(dotIdx, inner_ran);
+    inner.add_instruction(res.add_assign(inner.iterator, sr.at(inner.iterator + outer.iterator)));
+    inner.end_for_loop();
+
+    outer.add_instruction(
+        inner.get_loop_code()
+    );
+    outer.end_for_loop();
+
+    outer.serialize_for_loop(glsl);
+    
+	glsl + "}"; // add the final scope for void main(){} in glsl
+    std::cout << glsl;
+
+    return 0;
+}
+*/

@@ -1,0 +1,30 @@
+#version 450
+#extension GL_ARB_separate_shader_objects : enable
+#extension GL_EXT_buffer_reference : enable
+#extension GL_EXT_buffer_reference_uvec2 : enable
+#extension GL_EXT_scalar_block_layout : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+layout(buffer_reference, std430, scalar) buffer FloatBuffer { float data[]; };
+layout(buffer_reference, std430, scalar) buffer NewBuffer { float data[]; };
+struct uniform_buffer { 
+    FloatBuffer buffer0; 
+    NewBuffer buffer1; 
+};
+layout(buffer_reference, std430, scalar) buffer UniformBuffer{ uniform_buffer ub; };
+layout(push_constant) uniform PushConstants { UniformBuffer ctx; } push;
+shared float shared_mem[512];
+void main(){ 
+    uniform_buffer ctx = push.ctx.ub;
+    // Triton-style vectorized load
+    for (uint i = 0; i < 128; ++i) {
+        uint idx = (uint(gl_WorkGroupID.x) + i);
+        shared_mem[i] = ctx.buffer0.data[idx];
+    }
+    // Triton-style vectorized store
+    for (uint i = 0; i < 128; ++i) {
+        uint idx = (uint(gl_WorkGroupID.x) + i);
+        ctx.buffer1.data[idx] = shared_mem[i];
+    }
+}
