@@ -6,6 +6,7 @@ A C++ machine learning library utilizing Vulkan for GPU acceleration. Developed 
 - GPU-accelerated tensor operations
 - MNIST implementation example included
 - Basic graphics engine (VkCalcium.hpp) included
+- Basic shader writing DSL (Livia.hpp) included
 
 ## Implemented Components
 
@@ -35,11 +36,11 @@ A C++ machine learning library utilizing Vulkan for GPU acceleration. Developed 
 - GLFW (optional, for VkCalcium)
 - glslang compiler
 
-## Roadmap
-- MUCH MORE SAFETY IS NEEDED. because currently. if you're not careful about your tensor's shapes, there's a high probability that it'll actually just crash your GPU.
-- Model weight import/export functionality. (There's very limited model weight import/export currently.)
-- PyTorch model compatibility.
-- Additional optimizers and layers.
+## Livia
+- Livia.hpp contains a work in progress implementation of a shader generator. You can use Livia to write compute shaders in glsl from c++. I created it because I was inspired by Triton. It's a Domain Specific Language (is it? I don't know what it is but it generates usable shaders) for writing compute shaders in glsl.
+- I do eventually plan to compile Livia's intermediate representation directly into SPIR-V in the future.
+- I will then rewrite all the shaders in this repo using Livia.
+- Why the name Livia? Uhh
 
 ## Notes
 The project is under active development. Current implementation focuses on core functionality and shader kernel implementations. I'd not recommend actually using this library for anything serious right now. Treat it like learning material.
