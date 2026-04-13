@@ -70,7 +70,7 @@ struct SPIRVModule {
         binary.push_back(0x07230203);  // Magic number
         binary.push_back(0x00010000);  // Version 1.0
         binary.push_back(0);           // Generator (0 = unknown)
-        binary.push_back(next_id - 2);     // Bound (highest ID + 1)
+        binary.push_back(next_id);     // Bound (highest ID + 1)
         binary.push_back(0);           // Schema (must be 0)
     }
 

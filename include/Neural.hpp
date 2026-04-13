@@ -1322,7 +1322,7 @@ struct SDGoptim : public Optimiser<T>{
 	uint32_t batch_size;
 	float lr = 1e-03;
 
-	SDGoptim(Allocator* allocator) : optimiser_shader(readShaderBytecode("compiled_shaders/SDG.comp.spv"), allocator, nullptr){}
+	SDGoptim(Allocator* allocator) : optimiser_shader(readShaderBytecode("../compiled_shaders/SDG.comp.spv"), allocator, nullptr){}
 
 	SDGoptim(){}
 
@@ -1392,7 +1392,7 @@ struct AdamW : public Optimiser<T> {
 
     AdamW(Allocator* alloc)
         : allocator(alloc),
-          shader(readShaderBytecode("compiled_shaders/AdamW.comp.spv"),
+          shader(readShaderBytecode("../compiled_shaders/AdamW.comp.spv"),
                  alloc, nullptr) {}
 
     void load_tensors(Module<T>& module) {

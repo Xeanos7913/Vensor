@@ -6,6 +6,7 @@ and a VAE implementation for MNIST handwritten digit data generation.
 #include <iostream>
 #include <fstream>
 //#define DEBUG
+#include "../include/VkCalcium.hpp"
 #include "../include/Tensor.hpp"
 #include "../include/Neural.hpp"
 #include "../include/Dataloader.hpp"
@@ -16,24 +17,24 @@ and a VAE implementation for MNIST handwritten digit data generation.
 
 using vec = std::vector<uint32_t>;
 // Read shader bytecode from a file
-//#ifndef readShaderCode
-//#define readShaderCode
-//std::vector<char> readShaderBytecode(const std::string& filename) {
-//    std::ifstream file(filename, std::ios::ate | std::ios::binary);  // Open file at the end in binary mode
-//
-//    if (!file.is_open()) {
-//        throw std::runtime_error("Failed to open shader file: " + filename);
-//    }
-//
-//    size_t fileSize = file.tellg();  // Get file size
-//    std::vector<char> buffer(fileSize);
-//
-//    file.seekg(0);  // Go back to the beginning
-//    file.read(buffer.data(), fileSize);  // Read file into buffer
-//    file.close();
-//    return buffer;
-//}    
-//#endif // !readShaderCode
+#ifndef readShaderCode
+#define readShaderCode
+std::vector<char> readShaderBytecode(const std::string& filename) {
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);  // Open file at the end in binary mode
+
+    if (!file.is_open()) {
+        throw std::runtime_error("Failed to open shader file: " + filename);
+    }
+
+    size_t fileSize = file.tellg();  // Get file size
+    std::vector<char> buffer(fileSize);
+
+    file.seekg(0);  // Go back to the beginning
+    file.read(buffer.data(), fileSize);  // Read file into buffer
+    file.close();
+    return buffer;
+}    
+#endif // !readShaderCode
 
 //int main(void) {
 // auto vec1 = std::vector<int>{ 3, 5, 1 };
@@ -116,39 +117,39 @@ using vec = std::vector<uint32_t>;
 
 
 // graphics engine test
-// graphics programming is no longer fun. too much work for too little reward.
+/*
+int main(void) {
 
-//int main(void) {
-//
-//	auto engine = Engine(1920, 1080, "compiled_shaders/triangle.vert.spv", "compiled_shaders/triangle.frag.spv");
-//
-//	auto entity = new Entity(glm::vec3(1.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(1.0f), true);
-//	entity->mesh.loadModel("cube.obj");
-//	entity->mesh.material.loadTexture("bricks.jpg");
-//	engine.scene.addEntity(*entity);
-//	delete entity;
-//
-//	auto entity2 = new Entity(glm::vec3(0.0f, -1.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(10.0f, 10.0f, 10.0f), true);
-//	entity2->mesh.loadModel("bunny.obj");
-//	entity2->mesh.material.loadTexture("bricks.jpg");
-//	engine.scene.addEntity(*entity2);
-//	delete entity2;
-//
-//	auto entity3 = new Entity(glm::vec3(-2.0f, 0.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(20.0f), true);
-//	entity3->mesh.loadModel("bunny.obj");
-//	entity3->mesh.material.loadTexture("bricks.jpg");
-//	engine.scene.addEntity(*entity3);
-//	delete entity3;
-//
-//	auto entity4 = new Entity(glm::vec3(2.0f, 0.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(20.0f), true);
-//	entity4->mesh.loadModel("bunny.obj");
-//	entity4->mesh.material.loadTexture("bricks.jpg");
-//	engine.scene.addEntity(*entity4);
-//	delete entity4;
-//
-//	engine.run();
-//	return 0;
-//}
+	auto engine = Engine(1920, 1080, "compiled_shaders/triangle.vert.spv", "compiled_shaders/triangle.frag.spv");
+
+	auto entity = new Entity(glm::vec3(1.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(1.0f), true);
+	entity->mesh.loadModel("cube.obj");
+	entity->mesh.material.loadTexture("bricks.jpg");
+	engine.scene.addEntity(*entity);
+	delete entity;
+
+	auto entity2 = new Entity(glm::vec3(0.0f, -1.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(10.0f, 10.0f, 10.0f), true);
+	entity2->mesh.loadModel("bunny.obj");
+	entity2->mesh.material.loadTexture("white.jpg");
+	engine.scene.addEntity(*entity2);
+	delete entity2;
+
+	auto entity3 = new Entity(glm::vec3(-2.0f, 0.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(20.0f), true);
+	entity3->mesh.loadModel("bunny.obj");
+	entity3->mesh.material.loadTexture("white.jpg");
+	engine.scene.addEntity(*entity3);
+	delete entity3;
+
+	auto entity4 = new Entity(glm::vec3(2.0f, 0.0f, 0.0f), glm::quat(1.0f, 0.0f, 0.0f, 0.0f), glm::vec3(20.0f), true);
+	entity4->mesh.loadModel("bunny.obj");
+	entity4->mesh.material.loadTexture("white.jpg");
+	engine.scene.addEntity(*entity4);
+	delete entity4;
+
+	engine.run();
+	return 0;
+}
+*/
 
 static int off2or3(const std::vector<uint32_t>& strides, int b, int i, int j)
 {
@@ -988,7 +989,7 @@ struct Trainer {
 	}
 
 	void train_epoch(int i){
-		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
+		dataLoader->loadMNIST("../dataset/train.idx3-ubyte", "../dataset/labels.idx1-ubyte");
 
 		Tensor<float>* input;
 		progressbar bar(100, true, std::cout);
@@ -1013,7 +1014,7 @@ struct Trainer {
 	}
 
 	void test_epoch(){
-		testDataLoader->loadMNIST("dataset/test.idx3-ubyte", "dataset/test_labels.idx1-ubyte");
+		testDataLoader->loadMNIST("../dataset/test.idx3-ubyte", "../dataset/test_labels.idx1-ubyte");
 		for (uint32_t k = 0; k < testDataLoader->num_batches; k++){
 			auto* input = testDataLoader->imagesBatchTensors[k];
 			sequence.forward(input);
@@ -1025,20 +1026,19 @@ struct Trainer {
 	}
 
 	void save_model(){
-		auto save_stream = std::ofstream("models/MNIST_model.vnsr", std::ios::binary);
+		auto save_stream = std::ofstream("../models/MNIST_model.vnsr", std::ios::binary);
 		sequence.serializeTrainableTensors(save_stream);
 		save_stream.close();
 	}
 
 	void load_model(){
-		auto load_stream = std::ifstream("models/MNIST_model.vnsr", std::ios::binary);
+		auto load_stream = std::ifstream("../models/MNIST_model.vnsr", std::ios::binary);
 		sequence.loadFromSerializedTensor(load_stream);
 		load_stream.close();
 	}
 
 };
 
-/*
 int main(void){
 	
 	Init init;
@@ -1050,7 +1050,7 @@ int main(void){
 
 		for (int i = 0; i < 4; i++){
 			t.train_epoch(i);
-			//t.test_epoch();
+			t.test_epoch();
 		}
 		t.save_model();
 	}
@@ -1059,7 +1059,6 @@ int main(void){
 
 	return 0;
 }
-*/
 
 /*
 int main(void) {
@@ -1209,8 +1208,8 @@ int main(void) {
 		auto target = &pool.createTensor({3, aten.output->shape[1], aten.output->shape[2]}, "target");
 
 		target->setElement(1.0f, {0, 0, 0});
-		target->setElement(1.0f, {1, 0, 0});
-		target->setElement(1.0f, {2, 0, 0});
+		target->setElement(1.0f, {1, 0, 10});
+		target->setElement(1.0f, {2, 0, 20});
 		//target->setElement(1.0f, {3, 0, 0});
 		//target->setElement(1.0f, {4, 0, 0});
 		//target->setElement(1.0f, {5, 0, 0});
@@ -1226,7 +1225,6 @@ int main(void) {
 	return 0;
 }
 */
-
 // Livia test
 /*
 int main(void) {

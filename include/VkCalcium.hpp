@@ -2069,7 +2069,7 @@ struct Engine {
 
     // main loop
     void run() {  
-        start();
+        if(start) start();
         auto lastTime = std::chrono::high_resolution_clock::now();  
         
         while (!glfwWindowShouldClose(window)) {  

@@ -25,10 +25,12 @@
 #include <glm/glm.hpp>
 #include <numeric>
 
+// Read shader bytecode from a file
+#ifndef readShaderCode
+#define readShaderCode
 std::vector<char> readShaderBytecode(const std::string& filename) {
-    DEBUG_PRINT("Making Shader: " << filename);
     std::ifstream file(filename, std::ios::ate | std::ios::binary);  // Open file at the end in binary mode
-    
+
     if (!file.is_open()) {
         throw std::runtime_error("Failed to open shader file: " + filename);
     }
@@ -40,7 +42,8 @@ std::vector<char> readShaderBytecode(const std::string& filename) {
     file.read(buffer.data(), fileSize);  // Read file into buffer
     file.close();
     return buffer;
-}
+}    
+#endif // !readShaderCode
 
 enum class Operation {
     ADDITION,
@@ -951,95 +954,95 @@ struct TensorPool {
     TensorPool(Allocator* alloc)
             : allocator(alloc),
             inplaceAdditionShader(
-                readShaderBytecode("compiled_shaders/tensor_inplace_addition.comp.spv"), alloc, tile_size),
+                readShaderBytecode("../compiled_shaders/tensor_inplace_addition.comp.spv"), alloc, tile_size),
             inplaceAdditionShaderBackward(
-                readShaderBytecode("compiled_shaders/tensor_inplace_addition_backward.comp.spv"), alloc, tile_size),
+                readShaderBytecode("../compiled_shaders/tensor_inplace_addition_backward.comp.spv"), alloc, tile_size),
             elementwiseMultiplicationShader(
-                readShaderBytecode("compiled_shaders/element_wise_multiply.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/element_wise_multiply.comp.spv"), alloc, nullptr),
             elementwiseMultiplicationShaderBackward(
-                readShaderBytecode("compiled_shaders/element_wise_multiply_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/element_wise_multiply_backward.comp.spv"), alloc, nullptr),
             batchnormShader(
-                readShaderBytecode("compiled_shaders/Batchnorm.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Batchnorm.comp.spv"), alloc, nullptr),
             batchnormShaderBackward(
-                readShaderBytecode("compiled_shaders/Batchnorm_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Batchnorm_backward.comp.spv"), alloc, nullptr),
             batchnorm2dShader(
-                readShaderBytecode("compiled_shaders/Batchnorm2d.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Batchnorm2d.comp.spv"), alloc, nullptr),
             batchnorm2dShaderBackward(
-                readShaderBytecode("compiled_shaders/Batchnorm2d_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Batchnorm2d_backward.comp.spv"), alloc, nullptr),
             layernorm1dShader(
-                readShaderBytecode("compiled_shaders/Layernorm1d.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Layernorm1d.comp.spv"), alloc, nullptr),
             layernorm1dShaderBackward(
-                readShaderBytecode("compiled_shaders/Layernorm1d_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Layernorm1d_backward.comp.spv"), alloc, nullptr),
             linearReLUShader(
-                readShaderBytecode("compiled_shaders/Linear.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Linear.comp.spv"), alloc, nullptr),
             linearReLUShaderBackward(
-                readShaderBytecode("compiled_shaders/Linear_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Linear_backward.comp.spv"), alloc, nullptr),
             linearShader(
-                readShaderBytecode("compiled_shaders/Linear_no_relu.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Linear_no_relu.comp.spv"), alloc, nullptr),
             linearShaderBackward(
-                readShaderBytecode("compiled_shaders/Linear_no_relu_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Linear_no_relu_backward.comp.spv"), alloc, nullptr),
             flashAttention(
-                readShaderBytecode("compiled_shaders/FlashAttention.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/FlashAttention.comp.spv"), alloc, nullptr),
             flashAttentionBackwardPreprocess(
-                readShaderBytecode("compiled_shaders/FlashAttentionBackwardPreprocess.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/FlashAttentionBackwardPreprocess.comp.spv"), alloc, nullptr),
             flashAttentionBackwardQ(
-                readShaderBytecode("compiled_shaders/FlashAttentionBackwardDq.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/FlashAttentionBackwardDq.comp.spv"), alloc, nullptr),
             flashAttentionBackwardDkDv(
-                readShaderBytecode("compiled_shaders/FlashAttentionBackwardDkDv.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/FlashAttentionBackwardDkDv.comp.spv"), alloc, nullptr),
             logvarToStdShader(
-                readShaderBytecode("compiled_shaders/logvar_to_std.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/logvar_to_std.comp.spv"), alloc, nullptr),
             logvarToStdShaderBackward(
-                readShaderBytecode("compiled_shaders/logvar_to_std_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/logvar_to_std_backward.comp.spv"), alloc, nullptr),
             expShader(
-                readShaderBytecode("compiled_shaders/tensor_exp.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/tensor_exp.comp.spv"), alloc, nullptr),
             expShaderBackward(
-                readShaderBytecode("compiled_shaders/tensor_exp_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/tensor_exp_backward.comp.spv"), alloc, nullptr),
             ReLUShader(
-                readShaderBytecode("compiled_shaders/ReLU.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/ReLU.comp.spv"), alloc, nullptr),
             ReLUShaderBackward(
-                readShaderBytecode("compiled_shaders/ReLU_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/ReLU_backward.comp.spv"), alloc, nullptr),
             tanhShader(
-                readShaderBytecode("compiled_shaders/TanH.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/TanH.comp.spv"), alloc, nullptr),
             tanhShaderBackward(
-                readShaderBytecode("compiled_shaders/TanH_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/TanH_backward.comp.spv"), alloc, nullptr),
             fillRandomShader(
-                readShaderBytecode("compiled_shaders/tensor_fill_random.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/tensor_fill_random.comp.spv"), alloc, nullptr),
             crossEntropyShader(
-                readShaderBytecode("compiled_shaders/Fused_Cross_Entropy.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Fused_Cross_Entropy.comp.spv"), alloc, nullptr),
             crossEntropyShaderBackward(
-                readShaderBytecode("compiled_shaders/Fused_Cross_Entropy_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Fused_Cross_Entropy_backward.comp.spv"), alloc, nullptr),
             mseLossShader(
-                readShaderBytecode("compiled_shaders/MSE_loss.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/MSE_loss.comp.spv"), alloc, nullptr),
             kldLossShader(
-                readShaderBytecode("compiled_shaders/KLD_loss.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/KLD_loss.comp.spv"), alloc, nullptr),
             mean_shader(
-                readShaderBytecode("compiled_shaders/find_mean.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/find_mean.comp.spv"), alloc, nullptr),
             sampleShader(
-                readShaderBytecode("compiled_shaders/sample_from_dist.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/sample_from_dist.comp.spv"), alloc, nullptr),
             softmaxShader(
-                readShaderBytecode("compiled_shaders/Softmax.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Softmax.comp.spv"), alloc, nullptr),
             embedLookupShader(
-                readShaderBytecode("compiled_shaders/Embedding_table.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Embedding_table.comp.spv"), alloc, nullptr),
             embedLookupShaderBackward(
-                readShaderBytecode("compiled_shaders/Embedding_table_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Embedding_table_backward.comp.spv"), alloc, nullptr),
             upsampleShader(
-                readShaderBytecode("compiled_shaders/Upsample.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Upsample.comp.spv"), alloc, nullptr),
             upsampleShaderBackward(
-                readShaderBytecode("compiled_shaders/Upsample_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Upsample_backward.comp.spv"), alloc, nullptr),
             conv2dShader(
-                readShaderBytecode("compiled_shaders/Conv2d.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Conv2d.comp.spv"), alloc, nullptr),
             conv2dShaderBackward(
-                readShaderBytecode("compiled_shaders/Conv2d_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Conv2d_backward.comp.spv"), alloc, nullptr),
             transposedConv2dShader(
-                readShaderBytecode("compiled_shaders/Conv2d_Transposed.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Conv2d_Transposed.comp.spv"), alloc, nullptr),
             transposedConv2dShaderBackward(
-                readShaderBytecode("compiled_shaders/Conv2d_Transposed_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/Conv2d_Transposed_backward.comp.spv"), alloc, nullptr),
             maxPoolShader(
-                readShaderBytecode("compiled_shaders/MaxPooling.comp.spv"), alloc, tile_size),
+                readShaderBytecode("../compiled_shaders/MaxPooling.comp.spv"), alloc, tile_size),
             maxPoolShaderBackward(
-                readShaderBytecode("compiled_shaders/MaxPooling_backward.comp.spv"), alloc, nullptr),
+                readShaderBytecode("../compiled_shaders/MaxPooling_backward.comp.spv"), alloc, nullptr),
             cmpShader(
-                readShaderBytecode("compiled_shaders/Is_tensor_equal.comp.spv"), alloc, nullptr)
+                readShaderBytecode("../compiled_shaders/Is_tensor_equal.comp.spv"), alloc, nullptr)
     {
         DEBUG_PRINT("Initialized TensorPool");
     }
