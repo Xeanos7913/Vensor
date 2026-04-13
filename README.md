@@ -44,4 +44,3 @@ A C++ machine learning library utilizing Vulkan for GPU acceleration. Developed 
 
 ## Notes
 The project is under active development. Current implementation focuses on core functionality and shader kernel implementations. I'd not recommend actually using this library for anything serious right now. Treat it like learning material.
-Currently under hiatus: I'm having graduation exams in my school.
