@@ -417,7 +417,8 @@ struct KLDloss : public Module<T> {
 	// forward already handles gradient computation directly
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(logvar_tensor == nullptr || mu_tensor == nullptr) throw std::runtime_error("logvar and mu tensors need to be set for KLDloss to work!");
-		input->downstream.push_back(nullptr);
+		mu_tensor->downstream.push_back(input);
+		logvar_tensor->downstream.push_back(input);
 		tensorPool->kld_loss(mu_tensor->name, logvar_tensor->name, this->output->name);
 		this->output->back.push_back([this](){
 			mu_tensor->backward();
