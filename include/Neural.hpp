@@ -885,7 +885,9 @@ struct Upsample : public Module<T>{
 	uint32_t width_out, width_in;
 	std::string name;
 	Upsample(TensorPool<float>* tensorPool, uint32_t height_in, uint32_t width_in, uint32_t height_out, uint32_t width_out, const std::string& name) 
-	: tensorPool(tensorPool), height_out(height_out), width_out(width_out), height_in(height_in), width_in(width_in), name(name) {}
+	: tensorPool(tensorPool), height_out(height_out), width_out(width_out), height_in(height_in), width_in(width_in), name(name) {
+		this->output = nullptr;
+	}
 	Upsample(){}
 
 	Tensor<T>* forward(Tensor<T>* input) override {
