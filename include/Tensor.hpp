@@ -510,7 +510,7 @@ struct Tensor {
    std::string name;
 
    // gradient branch tracker
-   std::vector<Tensor*> downstream; // what tensors used this tensor as input
+   std::vector<Tensor<T>*> downstream; // what tensors used this tensor as input
 
    std::vector<std::function<void()>> back;
 
@@ -3586,8 +3586,8 @@ Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
     auto &output = pool->createTensor(this->shape,
         name + other.name + "-elementwise_multiply_output", true);
 
-    this->downstream.push_back(output);
-    other.downstream.push_back(output);
+    this->downstream.push_back(&output);
+    other.downstream.push_back(&output);
 
     Tensor<T>* self_ptr = this;
     Tensor<T>* oth_ptr  = &other;
@@ -3641,7 +3641,7 @@ Tensor<T>& operator*(T lhs, Tensor<T>& rhs) {
         std::to_string(lhs) + "_" + rhs.name + "-elementwise_multiply_output", true
     );
 
-    rhs.downstream.push_back(output);
+    rhs.downstream.push_back(&output);
 
     auto &to_mul = rhs.pool->createTensor(
         std::vector<uint32_t>(rhs.shape.size(), 1),
@@ -3673,8 +3673,8 @@ Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
     );
 
     // add the output of the op to the downstream list of the inputs
-    other.downstream.push_back(output);
-    this->downstream.push_back(output);
+    other.downstream.push_back(&output);
+    this->downstream.push_back(&output);
 
     Tensor<T>* self_ptr = this;
     Tensor<T>* oth_ptr  = &other;
@@ -3698,7 +3698,7 @@ Tensor<T>& Tensor<T>::operator+(T other) {
         name + "_" + std::to_string(other) + "-elementwise_addition_output", true);
 
     // add the output of this op to the downstream list of the original(input) tensor
-    this->downstream.push_back(output);
+    this->downstream.push_back(&output);
 
     auto &to_add = pool->createTensor(
         std::vector<uint32_t>(this->shape.size(), 1),
@@ -3728,7 +3728,7 @@ Tensor<T>& operator+(T lhs, Tensor<T>& rhs){
         std::to_string(lhs) + "_" + rhs.name + "-elementwise_addition_output", true
     );
 
-    rhs.downstream.push_back(output);
+    rhs.downstream.push_back(&output);
 
     auto &to_add = rhs.pool->createTensor(
         std::vector<uint32_t>(rhs.shape.size(), 1),
@@ -3808,8 +3808,8 @@ Tensor<T>& Tensor<T>::matmul(Tensor<T>& other){
     auto &output = pool->createTensor(output_shape, name + other.name + "-matmul_output");
 
     // add the output tensor to the downstream list of the inputs
-    this->downstream.push_back(output);
-    other.downstream.push_back(output);
+    this->downstream.push_back(&output);
+    other.downstream.push_back(&output);
 
     pool->tensor_linear(output.name, name, other.name);
 

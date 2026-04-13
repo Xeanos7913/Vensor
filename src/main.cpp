@@ -811,7 +811,7 @@ struct VAE {
 
 		auto epoch_start = clock::now();
 
-		dataLoader->loadMNIST("dataset/train.idx3-ubyte", "dataset/labels.idx1-ubyte");
+		dataLoader->loadMNIST("../dataset/train.idx3-ubyte", "../dataset/labels.idx1-ubyte");
 
 		Tensor<float>* loss  = nullptr;
 		Tensor<float>* recon = nullptr;
@@ -874,7 +874,6 @@ struct VAE {
 	}
 };
 
-/*
 int main(void){
 	
 	Init init;
@@ -892,7 +891,6 @@ int main(void){
 	delete allocator;
 	return 0;
 }
-*/
 
 /*
 int main(void){
@@ -1039,6 +1037,7 @@ struct Trainer {
 
 };
 
+/*
 int main(void){
 	
 	Init init;
@@ -1059,6 +1058,7 @@ int main(void){
 
 	return 0;
 }
+*/
 
 /*
 int main(void) {

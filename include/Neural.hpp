@@ -177,7 +177,7 @@ struct Linear : public Module<T> {
 		}
 		tensorPool->tensor_linear(output_name, input->name, weights_name, bias_name, 0);
 		input->view(o); // return the tensor's original dims
-		this->output->back.push_back([this, input, branch_idx](){
+		this->output->back.push_back([this, input](){
 			this->tensorPool->tensor_linear(this->output_name, input->name, this->weights_name, this->bias_name, 1);
 			// will be skipped internally and the weight tensor will be removed from input's downstream list
 			// will carry on with backward pass if input downstream list only contains this weight tensor
