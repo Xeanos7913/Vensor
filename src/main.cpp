@@ -769,7 +769,7 @@ struct VAE {
 		
 		auto h = enc_conv(input);
 		auto mu = fc_mu(h);
-		auto logvar = fc_logvar(h);
+		auto logvar = fc_logvar(h); // backward called, 
 
 		return {mu, logvar};
 	}

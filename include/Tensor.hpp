@@ -509,6 +509,9 @@ struct Tensor {
 
    std::string name;
 
+   // gradient branch tracker
+   std::vector<Tensor*> downstream; // what tensors used this tensor as input
+
    std::vector<std::function<void()>> back;
 
     bool claimable = false;
@@ -607,10 +610,26 @@ struct Tensor {
        }  
     }  
 
+    // backward is only ever called by downstream tensors
     void backward() {
         for (size_t i = back.size(); i-- > 0; ) {
             DEBUG_PRINT("Calling backward " << i << " for tensor: " << name);
-            back[i]();
+            
+            // only one downstream, so execute backward
+            if(!(downstream.size() > 1)){
+                DEBUG_PRINT("Executing Backward\n");
+                // back lambda contains the actual grad calc function as well as a call to the upstream tensor's backward()
+                // Which will be ignored if downstream.size() > 1
+                back[i]();
+                downstream.clear();
+            // need to stall until downstream.size == 1. keep popping branches as they are resolved.
+            }else {
+                DEBUG_PRINT("Stalling Backward till downstream branches have accumulated gradients\n");
+                // downstream will be completely cleared. This is a safe assumption to make 
+                // as backward() is called by all downstream tensors,
+                // each of them clearing themselves after executing the actual grad calc func
+                downstream.erase(downstream.end());
+            }
         }
     }
 
@@ -3567,6 +3586,9 @@ Tensor<T>& Tensor<T>::operator*(Tensor<T>& other) {
     auto &output = pool->createTensor(this->shape,
         name + other.name + "-elementwise_multiply_output", true);
 
+    this->downstream.push_back(output);
+    other.downstream.push_back(output);
+
     Tensor<T>* self_ptr = this;
     Tensor<T>* oth_ptr  = &other;
     Tensor<T>* out_ptr  = &output;
@@ -3587,6 +3609,8 @@ template<typename T>
 Tensor<T>& Tensor<T>::operator*(T other){
     auto &output = pool->createTensor(this->shape,
         name + "-elementwise_multiply_output_for_" + std::to_string(other), true);
+
+    this->downstream.push_back(output);
 
     auto &to_mul = pool->createTensor(
         std::vector<uint32_t>(this->shape.size(), 1),
@@ -3617,6 +3641,8 @@ Tensor<T>& operator*(T lhs, Tensor<T>& rhs) {
         std::to_string(lhs) + "_" + rhs.name + "-elementwise_multiply_output", true
     );
 
+    rhs.downstream.push_back(output);
+
     auto &to_mul = rhs.pool->createTensor(
         std::vector<uint32_t>(rhs.shape.size(), 1),
         "const_mul_tensor_" + std::to_string(lhs) + "_" + rhs.name, true
@@ -3646,6 +3672,10 @@ Tensor<T>& Tensor<T>::operator+(Tensor<T>& other) {
         name + other.name + "-elementwise_addition_output", true
     );
 
+    // add the output of the op to the downstream list of the inputs
+    other.downstream.push_back(output);
+    this->downstream.push_back(output);
+
     Tensor<T>* self_ptr = this;
     Tensor<T>* oth_ptr  = &other;
     Tensor<T>* out_ptr  = &output;
@@ -3666,6 +3696,9 @@ template<typename T>
 Tensor<T>& Tensor<T>::operator+(T other) {
     auto &output = pool->createTensor(this->shape,
         name + "_" + std::to_string(other) + "-elementwise_addition_output", true);
+
+    // add the output of this op to the downstream list of the original(input) tensor
+    this->downstream.push_back(output);
 
     auto &to_add = pool->createTensor(
         std::vector<uint32_t>(this->shape.size(), 1),
@@ -3694,6 +3727,8 @@ Tensor<T>& operator+(T lhs, Tensor<T>& rhs){
         rhs.shape,
         std::to_string(lhs) + "_" + rhs.name + "-elementwise_addition_output", true
     );
+
+    rhs.downstream.push_back(output);
 
     auto &to_add = rhs.pool->createTensor(
         std::vector<uint32_t>(rhs.shape.size(), 1),
@@ -3771,6 +3806,11 @@ Tensor<T>& Tensor<T>::matmul(Tensor<T>& other){
     output_shape.push_back(N);
 
     auto &output = pool->createTensor(output_shape, name + other.name + "-matmul_output");
+
+    // add the output tensor to the downstream list of the inputs
+    this->downstream.push_back(output);
+    other.downstream.push_back(output);
+
     pool->tensor_linear(output.name, name, other.name);
 
     {

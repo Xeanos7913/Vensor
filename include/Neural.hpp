@@ -171,13 +171,16 @@ struct Linear : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		// insert extra dim to satisfy kernel API
 		auto o = input->shape;
+		input->downstream.push_back(weights);
 		if(input->shape.size() == 2){
 			input->view({input->shape[0], 1, input->shape[1]});
 		}
 		tensorPool->tensor_linear(output_name, input->name, weights_name, bias_name, 0);
 		input->view(o); // return the tensor's original dims
-		this->output->back.push_back([this, input](){
+		this->output->back.push_back([this, input, branch_idx](){
 			this->tensorPool->tensor_linear(this->output_name, input->name, this->weights_name, this->bias_name, 1);
+			// will be skipped internally and the weight tensor will be removed from input's downstream list
+			// will carry on with backward pass if input downstream list only contains this weight tensor
 			input->backward();
 		});
 		return this->output;
@@ -360,6 +363,8 @@ struct MSEloss : public Module<T> {
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(target == nullptr) throw std::runtime_error("Target tensor for MSE loss not set!");
 
+		input->downstream.push_back(nullptr); // doesn't really matter what we push here. There just needs to be an entry, that's it.
+
 		// If shapes differ, allow it only when total element counts are equal (views).
 		if (input->shape != target->shape) {
 			auto prod = [](const std::vector<uint32_t>& s) -> uint64_t {
@@ -412,6 +417,7 @@ struct KLDloss : public Module<T> {
 	// forward already handles gradient computation directly
 	Tensor<T>* forward(Tensor<T>* input) override {
 		if(logvar_tensor == nullptr || mu_tensor == nullptr) throw std::runtime_error("logvar and mu tensors need to be set for KLDloss to work!");
+		input->downstream.push_back(nullptr);
 		tensorPool->kld_loss(mu_tensor->name, logvar_tensor->name, this->output->name);
 		this->output->back.push_back([this](){
 			mu_tensor->backward();
