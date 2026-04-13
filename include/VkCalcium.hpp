@@ -102,7 +102,7 @@ int calcium_device_initialization(Init* init, GLFWwindow* window, VkSurfaceKHR& 
         std::cout << "Physical device selection failed: " << phys_device_ret.error().message() << "\n";
         return -1;
     } else {
-        std::cout << "Physical device selected successfully.\n";
+        std::cout << "Physical device selected successfully. Device: " << phys_device_ret->name << "\n";
     }
 
     vkb::PhysicalDevice physical_device = phys_device_ret.value();  
@@ -533,7 +533,7 @@ struct Pipeline {
         else {
             createRenderPassNoFB();
         }
-        if (images.size() > 0 || imagePool.size() > 0 || imageArrays.size() > 0) {
+        if (images.size() > 0) {
             createDescriptorPool();
             createDescriptorLayouts();
         }
@@ -760,6 +760,14 @@ struct Pipeline {
                 descriptorSetLayouts[i] = imagePool[i]->layout;
             }
         }
+        else if (images.size() == 0 && imageArrays.size() > 0) {
+            descriptorSetLayouts.resize(imageArrays.size());
+            for (size_t i = 0; i < imageArrays.size(); i++){
+                descriptorSetLayouts[i] = imageArrays[i]->descSetLayout;
+            }
+            pipelineLayoutInfo.setLayoutCount = descriptorSetLayouts.size();
+            pipelineLayoutInfo.pSetLayouts = descriptorSetLayouts.data();
+        }
         else {
             pipelineLayoutInfo.setLayoutCount = 0;
             pipelineLayoutInfo.pSetLayouts = nullptr;
@@ -771,23 +779,6 @@ struct Pipeline {
         if (allocator->init->disp.createPipelineLayout(&pipelineLayoutInfo, nullptr, &layout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create pipeline layout!");
         }
-    }
-
-    std::vector<char> readShaderBytecode(const std::string& filename) {
-        std::ifstream file(filename, std::ios::ate | std::ios::binary);  // Open file at the end in binary mode
-
-        if (!file.is_open()) {
-            throw std::runtime_error("Failed to open shader file: " + filename);
-        }
-
-        size_t fileSize = file.tellg();  // Get file size
-        std::vector<char> buffer(fileSize);
-
-        file.seekg(0);  // Go back to the beginning
-        file.read(buffer.data(), fileSize);  // Read file into buffer
-        file.close();
-
-        return buffer;
     }
 
     void addShaderModule(const std::string& path, VkShaderStageFlagBits stage) {
@@ -1015,9 +1006,200 @@ struct DepthPipeline : public Pipeline {
     }
 };
 
+struct HUDPushConst {
+    VkDeviceAddress quadBuffer;
+};
+
+struct HUDQuad {
+    glm::vec4  rect;         // x, y, width, height in NDC (-1..1)
+    glm::vec4  uvRect;       // u0, v0, u1, v1 (ignored for solid color quads)
+    glm::vec4  color;        // RGBA tint / solid color
+    uint  textureIndex; // Index into bindless array; ~0u = solid color
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+};
+
+// A HUD/overlay pipeline that renders 2D UI elements to a framebuffer with alpha blending
+struct HUDPipeline : public Pipeline {
+
+    HUDPipeline(Swapchain* swapchain, Allocator* allocator) : Pipeline(swapchain, allocator) {};
+
+    HUDPipeline(const std::string& vertexPath, const std::string& fragmentPath, Swapchain* swapchain, Allocator* allocator) : Pipeline(swapchain, allocator) {
+        addShaderModule(vertexPath, VK_SHADER_STAGE_VERTEX_BIT);
+        addShaderModule(fragmentPath, VK_SHADER_STAGE_FRAGMENT_BIT);
+        addPushConstant(sizeof(HUDPushConst), 0, VK_SHADER_STAGE_VERTEX_BIT);
+
+        addImageArray(1000);
+
+        initialize();
+    }
+
+    void createRenderPassNoFB() override {
+        VkAttachmentDescription color_attachment = {};
+        color_attachment.format = swapchain->swapchain.image_format;
+        color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color_attachment.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color_attachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+        VkAttachmentReference color_attachment_ref = {};
+        color_attachment_ref.attachment = 0;
+        color_attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass = {};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &color_attachment_ref;
+
+        VkSubpassDependency dependency = {};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        VkRenderPassCreateInfo render_pass_info = {};
+        render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        render_pass_info.attachmentCount = 1;
+        render_pass_info.pAttachments = &color_attachment;
+        render_pass_info.subpassCount = 1;
+        render_pass_info.pSubpasses = &subpass;
+        render_pass_info.dependencyCount = 1;
+        render_pass_info.pDependencies = &dependency;
+
+        if (allocator->init->disp.createRenderPass(&render_pass_info, nullptr, &renderPass) != VK_SUCCESS) {
+            std::cout << "failed to create render pass\n";
+        }
+    }
+
+    void createPipeline() override {
+
+        // No vertex input — driven by push constants / storage buffers like the depth pipeline
+        VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
+        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        vertexInputInfo.vertexBindingDescriptionCount = 0;
+        vertexInputInfo.pVertexBindingDescriptions = nullptr;
+        vertexInputInfo.vertexAttributeDescriptionCount = 0;
+        vertexInputInfo.pVertexAttributeDescriptions = nullptr;
+
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+        VkViewport viewport = {};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = (float)swapchain->width;
+        viewport.height = (float)swapchain->height;
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+
+        VkRect2D scissor = {};
+        scissor.offset = { 0, 0 };
+        scissor.extent = swapchain->swapchain.extent;
+
+        VkPipelineViewportStateCreateInfo viewport_state = {};
+        viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewport_state.viewportCount = 1;
+        viewport_state.pViewports = &viewport;
+        viewport_state.scissorCount = 1;
+        viewport_state.pScissors = &scissor;
+
+        VkPipelineRasterizationStateCreateInfo rasterizer = {};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        rasterizer.depthClampEnable = VK_FALSE;
+        rasterizer.rasterizerDiscardEnable = VK_FALSE;
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        rasterizer.lineWidth = 1.0f;
+        rasterizer.cullMode = VK_CULL_MODE_NONE;        // No culling for 2D HUD quads
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        rasterizer.depthBiasEnable = VK_FALSE;
+
+        VkPipelineMultisampleStateCreateInfo multisampling = {};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.sampleShadingEnable = VK_FALSE;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        // Standard premultiplied alpha blending for HUD transparency
+        VkPipelineColorBlendAttachmentState colorBlendAttachment = {};
+        colorBlendAttachment.colorWriteMask =
+            VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        colorBlendAttachment.blendEnable = VK_TRUE;
+        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+
+        VkPipelineColorBlendStateCreateInfo color_blending = {};
+        color_blending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        color_blending.logicOpEnable = VK_FALSE;
+        color_blending.logicOp = VK_LOGIC_OP_COPY;
+        color_blending.attachmentCount = 1;
+        color_blending.pAttachments = &colorBlendAttachment;
+        color_blending.blendConstants[0] = 0.0f;
+        color_blending.blendConstants[1] = 0.0f;
+        color_blending.blendConstants[2] = 0.0f;
+        color_blending.blendConstants[3] = 0.0f;
+
+        std::vector<VkDynamicState> dynamic_states = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+
+        VkPipelineDynamicStateCreateInfo dynamic_info = {};
+        dynamic_info.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamic_info.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
+        dynamic_info.pDynamicStates = dynamic_states.data();
+
+        // Depth testing disabled — HUD always renders on top
+        VkPipelineDepthStencilStateCreateInfo depthStencil = {};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        depthStencil.depthTestEnable = VK_FALSE;
+        depthStencil.depthWriteEnable = VK_FALSE;
+        depthStencil.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+        depthStencil.depthBoundsTestEnable = VK_FALSE;
+        depthStencil.stencilTestEnable = VK_FALSE;
+        depthStencil.front = {};
+        depthStencil.back = {};
+
+        VkGraphicsPipelineCreateInfo pipeline_info = {};
+        pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        pipeline_info.stageCount = shader_stages.size();
+        pipeline_info.pStages = shader_stages.data();
+        pipeline_info.pVertexInputState = &vertexInputInfo;
+        pipeline_info.pInputAssemblyState = &inputAssembly;
+        pipeline_info.pViewportState = &viewport_state;
+        pipeline_info.pRasterizationState = &rasterizer;
+        pipeline_info.pMultisampleState = &multisampling;
+        pipeline_info.pColorBlendState = &color_blending;
+        pipeline_info.pDynamicState = &dynamic_info;
+        pipeline_info.pDepthStencilState = &depthStencil;
+        pipeline_info.layout = layout;
+        pipeline_info.renderPass = renderPass;
+        pipeline_info.subpass = 0;
+        pipeline_info.basePipelineHandle = VK_NULL_HANDLE;
+
+        if (allocator->init->disp.createGraphicsPipelines(VK_NULL_HANDLE, 1, &pipeline_info, nullptr, &pipeline) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create HUD graphics pipeline");
+        }
+
+        for (auto& shader : shaders) {
+            allocator->init->disp.destroyShaderModule(shader, nullptr);
+        }
+    }
+};
+
 // main graphics pipeline that uses the depth pipeline as a previous pipeline to read depth images from
 // root of the pipeline graph
 struct GraphicsPipeline : public Pipeline {
+
+    std::unique_ptr<HUDPipeline> hudPipeline;
 
     GraphicsPipeline(const std::string& vertexPath, const std::string& fragmentPath, Swapchain* swapchain, Allocator* allocator) :Pipeline(swapchain, allocator) {
 
@@ -1025,10 +1207,16 @@ struct GraphicsPipeline : public Pipeline {
         addShaderModule(fragmentPath, VK_SHADER_STAGE_FRAGMENT_BIT);
         addPushConstant(sizeof(PushConst), 0, VK_SHADER_STAGE_VERTEX_BIT);
 
-        addImageArray(100);
+        addImageArray(1000);
         
         std::unique_ptr<Pipeline> depthPipeline = std::make_unique<DepthPipeline>("compiled_shaders/depth.vert.spv", "compiled_shaders/depth.frag.spv", swapchain, allocator);
         pPreviousPipeline = std::move(depthPipeline);
+
+        hudPipeline = std::make_unique<HUDPipeline>(
+            "compiled_shaders/hud.vert.spv",
+            "compiled_shaders/hud.frag.spv",
+            swapchain, allocator
+        );
 
 		addImage(pPreviousPipeline->framebuffer->attachments[0].attachments[0]->image); // add depth image to this pipeline (in this case, it's set = 0, binding = 0)
 		addImage(pPreviousPipeline->framebuffer->attachments[1].attachments[0]->image); // add depth image number 2 to this pipeline (in this case, it's set = 0, binding = 1)
@@ -1040,6 +1228,48 @@ struct GraphicsPipeline : public Pipeline {
     GraphicsPipeline(Init* init, Swapchain* swapchain, Allocator* allocator) : Pipeline(swapchain, allocator) {}
 
     GraphicsPipeline() {};
+
+    void createRenderPassNoFB() override {
+        VkAttachmentDescription color_attachment = {};
+        color_attachment.format = swapchain->swapchain.image_format;
+        color_attachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        color_attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        color_attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color_attachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color_attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color_attachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        color_attachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkAttachmentReference color_attachment_ref = {};
+        color_attachment_ref.attachment = 0;
+        color_attachment_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        VkSubpassDescription subpass = {};
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &color_attachment_ref;
+
+        VkSubpassDependency dependency = {};
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcAccessMask = 0;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        VkRenderPassCreateInfo render_pass_info = {};
+        render_pass_info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        render_pass_info.attachmentCount = 1;
+        render_pass_info.pAttachments = &color_attachment;
+        render_pass_info.subpassCount = 1;
+        render_pass_info.pSubpasses = &subpass;
+        render_pass_info.dependencyCount = 1;
+        render_pass_info.pDependencies = &dependency;
+
+        if (allocator->init->disp.createRenderPass(&render_pass_info, nullptr, &renderPass) != VK_SUCCESS) {
+            std::cout << "failed to create render pass\n";
+        }
+    }
 
 	void createPipeline() override {
 		VkGraphicsPipelineCreateInfo pipelineInfo = {};
@@ -1178,6 +1408,8 @@ struct Mesh {
     std::vector<glm::vec4> normals;
 	std::vector<PackedIndex> packedIndices;
 
+    std::string filePath;
+
     unsigned int indexCount;
 
     Material material;
@@ -1185,14 +1417,17 @@ struct Mesh {
     bool meshUploaded = false;
 
     Mesh() {};
-
-    void loadModel(const std::string& objFilePath) {
+    void setModelPath(const std::string& objFilePath){
+        filePath = objFilePath;
+    }
+    void loadModel() {
+        if(filePath.empty()) {throw std::runtime_error("Mesh File Path not provided"); return;}
         tinyobj::attrib_t attrib;
         std::vector<tinyobj::shape_t> shapes;
         std::vector<tinyobj::material_t> materials;
         std::string warn, err;
 
-        bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, objFilePath.c_str());
+        bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, filePath.c_str());
 
         if (!warn.empty()) std::cerr << "[WARN] " << warn << std::endl;
         if (!err.empty()) std::cerr << "[ERROR] " << err << std::endl;
@@ -1250,6 +1485,11 @@ enum Camera_Movement {
     RIGHT
 };
 
+struct Ray {
+    glm::vec3 origin;
+    glm::vec3 direction;
+};
+
 class Camera {
     glm::vec3 Up;
     glm::vec3 Right;
@@ -1265,7 +1505,7 @@ public:
     glm::vec3 Front;
     glm::vec3 Position;
     float Zoom;
-    Camera(glm::vec3 position, glm::vec3 up, float yaw, float pitch) : Front(glm::vec3(0.0f, 0.0f, -1.0f)), MovementSpeed(25.5f), MouseSensitivity(0.1f), Zoom(45.0f) {
+    Camera(glm::vec3 position, glm::vec3 up, float yaw, float pitch) : Front(glm::vec3(0.0f, 0.0f, -1.0f)), MovementSpeed(25.5f), MouseSensitivity(0.1f), Zoom(50.0f) {
         Position = position;
         WorldUp = up;
         Yaw = yaw;
@@ -1293,6 +1533,27 @@ public:
         float orthoHeight = FOV;
         float orthoWidth = FOV * aspectRatio;
         return glm::ortho<float>(-120, 120, -120, 120, -500, 500);
+    }
+
+    Ray RayCast(
+        const glm::vec2& screen,
+        float windowWidth,
+        float windowHeight,
+        float fovDegrees)
+    {
+        float ndcX = (2.0f * screen.x) / windowWidth  - 1.0f;
+        float ndcY = 1.0f - (2.0f * screen.y) / windowHeight;
+        float aspect = windowWidth / windowHeight;
+        float tanHalfFov = tan(glm::radians(fovDegrees) * 0.5f);
+
+        glm::vec3 rayDir =
+        glm::normalize(
+            Front +
+            ndcX * aspect * tanHalfFov * Right +
+            ndcY * tanHalfFov * Up
+        );
+
+        return { Position, rayDir };
     }
 
     void ProcessKeyboard(int direction, float deltaTime) {
@@ -1414,8 +1675,20 @@ private:
     
 };
 
+struct HudEntity {
+    std::string texture;
+    HUDQuad quad;
+};  
+
 struct Scene {
     std::vector<Entity> entities;
+    std::vector<std::string> models; // vector of same length as entity, storing mesh paths of each entity
+    // file name -> index of mesh resources in MemPool
+    std::unordered_map<std::string, uint32_t> meshes;
+    // texture_file_name -> index of the texture in bindless descriptor set
+    std::unordered_map<std::string, uint32_t> textures;
+
+    
 	Camera camera;
 
     Allocator* allocator;
@@ -1436,18 +1709,26 @@ struct Scene {
 	std::unique_ptr<MemPool<PackedIndex>> packedIndexPool;
 
     std::unique_ptr<StandaloneBuffer<UniformBuf>> uniforms;
+    
+    
+    // hudTextures map because we don't want to have duplicate textures loaded. hudTextures are stored inside pipeline->hudPipeline->imageArrays[0]
+    std::unique_ptr<StandaloneBuffer<HUDQuad>> HUDquads;
+    std::unordered_map<std::string, uint32_t> hudTextureMap;
 
-    GraphicsPipeline* pipeline;
+    GraphicsPipeline* pipeline; // contains hud elements inside std::unique_ptr<StandaloneBuffer<HUDquads>>s
 
     bool updateUnfiforms = true;
 
+    float FOV = 50;
+
     Scene() {};
 
-    Scene(Allocator* allocator, GraphicsPipeline* pipeline) : allocator(allocator), uniforms(std::make_unique<StandaloneBuffer<UniformBuf>>(1, allocator, VK_SHADER_STAGE_ALL)), pipeline(pipeline),
+    Scene(Allocator* allocator, GraphicsPipeline* pipeline) : allocator(allocator), uniforms(std::make_unique<StandaloneBuffer<UniformBuf>>(1, allocator, VK_SHADER_STAGE_ALL)), pipeline(pipeline), 
+        HUDquads(std::make_unique<StandaloneBuffer<HUDQuad>>(10, allocator, VK_SHADER_STAGE_VERTEX_BIT)),
         positionPool(std::make_unique<MemPool<glm::vec4>>(1000, allocator, VK_SHADER_STAGE_VERTEX_BIT)),
         uvPool(std::make_unique<MemPool<glm::vec2>>(1000, allocator, VK_SHADER_STAGE_VERTEX_BIT)), 
         normalPool(std::make_unique<MemPool<glm::vec4>>(1000, allocator, VK_SHADER_STAGE_VERTEX_BIT)),
-        packedIndexPool(std::make_unique<MemPool<PackedIndex>>(1000, allocator, VK_SHADER_STAGE_VERTEX_BIT)){
+        packedIndexPool(std::make_unique<MemPool<PackedIndex>>(1000, allocator, VK_SHADER_STAGE_VERTEX_BIT)) {
         
         positionPool->descUpdateQueued.addListener(this);
 		uvPool->descUpdateQueued.addListener(this);
@@ -1463,25 +1744,50 @@ struct Scene {
     }
 
 	void addEntity(Entity& entity) {
-		entities.push_back(entity);
-        positionPool->push_back(entity.mesh.positions);
-		uvPool->push_back(entity.mesh.uvs);
-		normalPool->push_back(entity.mesh.normals);
-		packedIndexPool->push_back(entity.mesh.packedIndices);
-		pipeline->imageArrays[0]->push_back(entity.mesh.material.texPath);
-		pipeline->imageArrays[0]->updateDescriptorSets();
+        // encountered new mesh
+        if(meshes.find(entity.mesh.filePath) == meshes.end()){
+            Mesh mesh;
+            mesh.filePath = entity.mesh.filePath;
+            mesh.loadModel();
+            positionPool->push_back(mesh.positions);
+            uvPool->push_back(mesh.uvs);
+            normalPool->push_back(mesh.normals);
+            packedIndexPool->push_back(mesh.packedIndices);
+
+            meshes[entity.mesh.filePath] = meshes.size();
+        }
+        // encountered new texture
+        if(textures.find(entity.mesh.material.texPath) == textures.end()){
+            pipeline->imageArrays[0]->push_back(entity.mesh.material.texPath);
+            pipeline->imageArrays[0]->updateDescriptorSets();
+
+            textures[entity.mesh.material.texPath] = textures.size();
+        }
+        models.push_back(entity.mesh.filePath);
+        entities.push_back(entity);
 	}
 
-    void removeEntity(uint32_t idx, bool instaClean = true) {
-		if (idx >= entities.size()) return;
-		positionPool->erase(idx, instaClean);
-		uvPool->erase(idx, instaClean);
-		normalPool->erase(idx, instaClean);
-		packedIndexPool->erase(idx, instaClean);
-		pipeline->imageArrays[0]->erase(idx);
-		pipeline->imageArrays[0]->updateDescriptorSets();
-		entities.erase(entities.begin() + idx);
+    void addHudQuad(HudEntity& element) {
+        if(!element.texture.empty() && hudTextureMap.find(element.texture) == hudTextureMap.end()){
+            pipeline->hudPipeline->imageArrays[0]->push_back(element.texture);
+            pipeline->hudPipeline->imageArrays[0]->updateDescriptorSets();
+            hudTextureMap[element.texture] = hudTextureMap.size();
+            element.quad.textureIndex = hudTextureMap[element.texture];
+        }
+        if(!element.texture.empty()) {element.quad.textureIndex = hudTextureMap[element.texture];}
+        else {element.quad.textureIndex = 0;}
+        HUDquads->push_back(element.quad);
     }
+
+    void removeHudQuad(uint32_t idx) {
+        if(idx >= HUDquads->size()) {throw std::runtime_error("index out of bounds for deleting hud entity");}
+        HUDquads->erase(idx);
+    }
+
+    //void removeEntity(uint32_t idx, bool instaClean = true) {
+	//	if (idx >= entities.size()) return;
+	//	entities.erase(entities.begin() + idx);
+    //}
 
     void defragment() {
         positionPool->cleanGaps();
@@ -1511,19 +1817,28 @@ struct Scene {
         for (int i = 0; i < entities.size(); i++) {
 			auto& entity = entities[i];
             entity.update();
-            pushConst.model = camera.GetProjectionMatrix(height, width, 50.0f) * camera.GetViewMatrix() * entity.transform.model;
-            pushConst.materialIndex = i;
+            pushConst.model = camera.GetProjectionMatrix(height, width, FOV) * camera.GetViewMatrix() * entity.transform.model;
+            pushConst.materialIndex = textures[entity.mesh.material.texPath]; // index of the material used by the entity;
 
-            // element offsets represent the beginning of the current mesh's data in the shared memPools
-            pushConst.positionOffset = positionPool->buffers[i].elementOffset;
-			pushConst.uvOffset = uvPool->buffers[i].elementOffset;
-			pushConst.normalOffset = normalPool->buffers[i].elementOffset;
-			pushConst.indexOffset = packedIndexPool->buffers[i].elementOffset;
+            uint32_t idx = meshes[models[i]];
+            pushConst.positionOffset = positionPool->buffers[idx].elementOffset;
+			pushConst.uvOffset = uvPool->buffers[idx].elementOffset;
+			pushConst.normalOffset = normalPool->buffers[idx].elementOffset;
+			pushConst.indexOffset = packedIndexPool->buffers[idx].elementOffset;
 
             allocator->init->disp.cmdPushConstants(commandBuffer, pipeline->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(PushConst), &pushConst);
-            allocator->init->disp.cmdDraw(commandBuffer, packedIndexPool->buffers[i].numElements, 1, 0, 0);
+            allocator->init->disp.cmdDraw(commandBuffer, packedIndexPool->buffers[idx].numElements, 1, 0, 0);
         }
     };
+
+    void renderHUD(VkCommandBuffer& commandBuffer){
+        HUDPushConst pushConst = {};
+        pushConst.quadBuffer = HUDquads->getBufferAddress();
+        for (int i = 0; i < HUDquads->size(); i++){
+            allocator->init->disp.cmdPushConstants(commandBuffer, pipeline->hudPipeline->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(HUDPushConst), &pushConst);
+            allocator->init->disp.cmdDraw(commandBuffer, 6, 1, 0, 0);
+        }
+    }
 
     void renderSceneDepth(VkCommandBuffer& commandBuffer, int width, uint32_t height) {
         DepthPushConst pushConst = {};
@@ -1533,12 +1848,13 @@ struct Scene {
         for (int i = 0; i < entities.size(); i++) {
             auto& entity = entities[i];
             entity.update();
-            pushConst.model = camera.GetProjectionMatrixReverse(height, width, 50.0f) * camera.GetViewMatrix() * entity.transform.model;
-            pushConst.indexOffset = packedIndexPool->buffers[i].elementOffset;
-            pushConst.positionOffset = positionPool->buffers[i].elementOffset;
+            pushConst.model = camera.GetProjectionMatrixReverse(height, width, FOV) * camera.GetViewMatrix() * entity.transform.model;
+            uint32_t idx = meshes[models[i]];
+            pushConst.indexOffset = packedIndexPool->buffers[idx].elementOffset;
+            pushConst.positionOffset = positionPool->buffers[idx].elementOffset;
 
 			allocator->init->disp.cmdPushConstants(commandBuffer, pipeline->pPreviousPipeline->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DepthPushConst), &pushConst);
-			allocator->init->disp.cmdDraw(commandBuffer, packedIndexPool->buffers[i].numElements, 1, 0, 0);
+			allocator->init->disp.cmdDraw(commandBuffer, packedIndexPool->buffers[idx].numElements, 1, 0, 0);
         }
     }
 
@@ -1554,13 +1870,33 @@ struct Scene {
             auto& entity = entities[i];
             entity.update();
             pushConst.model = lightProj * lightView * entity.transform.model;
-            pushConst.indexOffset = packedIndexPool->buffers[i].elementOffset;
-            pushConst.positionOffset = positionPool->buffers[i].elementOffset;
+            uint32_t idx = meshes[models[i]];
+            pushConst.indexOffset = packedIndexPool->buffers[idx].elementOffset;
+            pushConst.positionOffset = positionPool->buffers[idx].elementOffset;
             allocator->init->disp.cmdPushConstants(commandBuffer, pipeline->pPreviousPipeline->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(DepthPushConst), &pushConst);
-            allocator->init->disp.cmdDraw(commandBuffer, packedIndexPool->buffers[i].numElements, 1, 0, 0);
+            allocator->init->disp.cmdDraw(commandBuffer, packedIndexPool->buffers[idx].numElements, 1, 0, 0);
         }
     }
 };
+
+bool cursorEnabled = true;
+float xoffset = 0.0f, yoffset = 0.0f;
+
+static void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
+    static float lastX = 400.0f, lastY = 300.0f;
+    static bool firstMouse = true;
+
+    if (firstMouse) {
+        lastX = (float)xpos;
+        lastY = (float)ypos;
+        firstMouse = false;
+    }
+
+    xoffset = (float)(xpos - lastX);
+    yoffset = (float)(lastY - ypos);
+    lastX = (float)xpos;
+    lastY = (float)ypos;
+}
 
 // main engine structure
 struct Engine {
@@ -1587,6 +1923,7 @@ struct Engine {
     std::vector<VkCommandBuffer> commandBuffers;
 	std::vector<VkCommandBuffer> secondaryCmdBufs;
 	std::vector<VkCommandBuffer> secondaryCmdBufsDepth;
+    std::vector<VkCommandBuffer> secondaryCmdBufsHUD;
 
     std::vector<VkSemaphore> availiables;
     std::vector<VkSemaphore> finishes;
@@ -1600,10 +1937,11 @@ struct Engine {
 
     int width, height;
 
-    // only one active scene in all engines.
-    static Scene scene;
+    Scene* scene;
 
-    Engine(int width, int height, const std::string& vertexPath, const std::string& fragmentPath) : height(height), width(width) {  
+    std::string vertexPath, fragmentPath;
+
+    Engine(int width, int height, const std::string& vertexPath, const std::string& fragmentPath) : height(height), width(width), vertexPath(vertexPath), fragmentPath(fragmentPath) {  
         glfwInit();
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);  
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);  
@@ -1629,7 +1967,7 @@ struct Engine {
 
         createGraphicsPipeline(vertexPath, fragmentPath);
         
-        scene = Scene(allocator, pipeline);
+        scene = new Scene(allocator, pipeline);
 
         createFramebuffers();
         createCommandBuffers();
@@ -1637,6 +1975,7 @@ struct Engine {
     };
 
     ~Engine() {
+        delete scene;
         delete pipeline;
         
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
@@ -1685,6 +2024,7 @@ struct Engine {
     }
 
     void createFramebuffers() {
+        framebuffers.clear();
         auto imagesResult = swapchain.swapchain.get_images();
         if (!imagesResult.has_value()) {
             std::cout << "Failed to get swapchain images\n";
@@ -1769,21 +2109,31 @@ struct Engine {
 		if (init.disp.allocateCommandBuffers(&allocInfo3, secondaryCmdBufsDepth.data()) != VK_SUCCESS) {
 			throw std::runtime_error("couldn't allocate secondary cmd bufs");
 		}
+
+        secondaryCmdBufsHUD.resize(framebuffers.size());
+		VkCommandBufferAllocateInfo allocInfo4 = {};
+		allocInfo4.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		allocInfo4.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+		allocInfo4.commandPool = commandPool;
+		allocInfo4.commandBufferCount = (uint32_t)secondaryCmdBufsHUD.size();
+		if (init.disp.allocateCommandBuffers(&allocInfo4, secondaryCmdBufsHUD.data()) != VK_SUCCESS) {
+			throw std::runtime_error("couldn't allocate secondary cmd bufs");
+		}
     }
 
     void recordPrimaryCmds(uint32_t imageIndex) {
+
         VkCommandBufferBeginInfo begin_info = {};
         begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 
         if (init.disp.beginCommandBuffer(commandBuffers[imageIndex], &begin_info) != VK_SUCCESS) {
             throw std::runtime_error("can't begin command buffer recording");
         }
-            
-		// viewport and scissor
+
         VkViewport viewport = {};
         viewport.x = 0.0f;
         viewport.y = 0.0f;
-        viewport.width = (float)swapchain.swapchain.extent.width;
+        viewport.width  = (float)swapchain.swapchain.extent.width;
         viewport.height = (float)swapchain.swapchain.extent.height;
         viewport.minDepth = 0.0f;
         viewport.maxDepth = 1.0f;
@@ -1792,66 +2142,149 @@ struct Engine {
         scissor.offset = { 0, 0 };
         scissor.extent = swapchain.swapchain.extent;
 
-        // Update secondary command buffers every frame for depth render pass  
+        // ----------------------------------------------------------------
+        // Depth secondary
+        // ----------------------------------------------------------------
         VkCommandBufferInheritanceInfo inheritanceInfoDepth = {};
         inheritanceInfoDepth.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
-        inheritanceInfoDepth.renderPass = pipeline->pPreviousPipeline->renderPass;
-        inheritanceInfoDepth.framebuffer = pipeline->pPreviousPipeline->framebuffer->framebuffers[imageIndex];
-        inheritanceInfoDepth.pNext = nullptr;
+        inheritanceInfoDepth.renderPass  = pipeline->pPreviousPipeline->renderPass;
+        inheritanceInfoDepth.framebuffer = pipeline->pPreviousPipeline->framebuffer->framebuffers[imageIndex]; // render to pipeline-owned framebuffer
 
         VkCommandBufferBeginInfo beginInfoDepth = {};
         beginInfoDepth.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfoDepth.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
         beginInfoDepth.pInheritanceInfo = &inheritanceInfoDepth;
 
-        // Issue draw calls  
         init.disp.beginCommandBuffer(secondaryCmdBufsDepth[imageIndex], &beginInfoDepth);
         init.disp.cmdSetViewport(secondaryCmdBufsDepth[imageIndex], 0, 1, &viewport);
         init.disp.cmdSetScissor(secondaryCmdBufsDepth[imageIndex], 0, 1, &scissor);
         init.disp.cmdBindPipeline(secondaryCmdBufsDepth[imageIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pPreviousPipeline->pipeline);
-        scene.renderSceneDepth(secondaryCmdBufsDepth[imageIndex], width, height);
+        scene->renderSceneDepth(secondaryCmdBufsDepth[imageIndex], width, height);
         init.disp.endCommandBuffer(secondaryCmdBufsDepth[imageIndex]);
 
-        // Update secondary command buffers every frame for main render pass  
+        // ----------------------------------------------------------------
+        // Main geometry secondary
+        // ----------------------------------------------------------------
         VkCommandBufferInheritanceInfo inheritanceInfo = {};
         inheritanceInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
-        inheritanceInfo.renderPass = pipeline->renderPass;
-        inheritanceInfo.framebuffer = framebuffers[imageIndex];
+        inheritanceInfo.renderPass  = pipeline->renderPass;
+        inheritanceInfo.framebuffer = framebuffers[imageIndex]; // render main geometry to swapchain-owned framebuffer
 
         VkCommandBufferBeginInfo beginInfo = {};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
         beginInfo.pInheritanceInfo = &inheritanceInfo;
 
-        // Issue draw calls  
         init.disp.beginCommandBuffer(secondaryCmdBufs[imageIndex], &beginInfo);
         init.disp.cmdSetViewport(secondaryCmdBufs[imageIndex], 0, 1, &viewport);
         init.disp.cmdSetScissor(secondaryCmdBufs[imageIndex], 0, 1, &scissor);
         init.disp.cmdBindPipeline(secondaryCmdBufs[imageIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->pipeline);
         pipeline->bindDescSets(secondaryCmdBufs[imageIndex]);
-        scene.renderScene(secondaryCmdBufs[imageIndex], width, height, imageIndex);
+        scene->renderScene(secondaryCmdBufs[imageIndex], width, height, imageIndex);
         init.disp.endCommandBuffer(secondaryCmdBufs[imageIndex]);
 
-        // bind the depth pipeline first
+        // ----------------------------------------------------------------
+        // HUD secondary — writes directly into the swapchain framebuffer
+        // ----------------------------------------------------------------
+        VkCommandBufferInheritanceInfo inheritanceInfoHUD = {};
+        inheritanceInfoHUD.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
+        inheritanceInfoHUD.renderPass  = pipeline->hudPipeline->renderPass;
+        inheritanceInfoHUD.framebuffer = framebuffers[imageIndex]; // same swapchain FB as main pass
+
+        VkCommandBufferBeginInfo beginInfoHUD = {};
+        beginInfoHUD.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfoHUD.flags = VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+        beginInfoHUD.pInheritanceInfo = &inheritanceInfoHUD;
+
+        init.disp.beginCommandBuffer(secondaryCmdBufsHUD[imageIndex], &beginInfoHUD);
+        init.disp.cmdSetViewport(secondaryCmdBufsHUD[imageIndex], 0, 1, &viewport);
+        init.disp.cmdSetScissor(secondaryCmdBufsHUD[imageIndex], 0, 1, &scissor);
+        init.disp.cmdBindPipeline(secondaryCmdBufsHUD[imageIndex], VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline->hudPipeline->pipeline);
+        pipeline->hudPipeline->bindDescSets(secondaryCmdBufsHUD[imageIndex]);
+        scene->renderHUD(secondaryCmdBufsHUD[imageIndex]);
+        init.disp.endCommandBuffer(secondaryCmdBufsHUD[imageIndex]);
+
+        // ----------------------------------------------------------------
+        // Primary — submit passes in order
+        // ----------------------------------------------------------------
+
+        // 1. Depth pre-pass
         VkClearValue clearDepth{ { { 0.0f, 0 } } };
         pipeline->pPreviousPipeline->render(commandBuffers[imageIndex], secondaryCmdBufsDepth[imageIndex], clearDepth, imageIndex);
-            
-		// now bind the main pipeline
+
+        // 2. Main geometry pass
         VkRenderPassBeginInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        info.framebuffer = framebuffers[imageIndex];
+        info.framebuffer     = framebuffers[imageIndex];
         info.clearValueCount = 1;
         VkClearValue clearColor{ { { 0.0f, 0.0f, 0.0f, 1.0f } } };
-        info.pClearValues = &clearColor;
+        info.pClearValues    = &clearColor;
         info.renderArea.offset = { 0, 0 };
         info.renderArea.extent = swapchain.swapchain.extent;
-        info.renderPass = pipeline->renderPass;
-
+        info.renderPass      = pipeline->renderPass;
         pipeline->render(commandBuffers[imageIndex], secondaryCmdBufs[imageIndex], info);
+
+        // 3. HUD pass — no clear, loadOp LOAD preserves the geometry underneath
+        VkRenderPassBeginInfo hudInfo = {};
+        hudInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        hudInfo.framebuffer     = framebuffers[imageIndex]; // same swapchain FB
+        hudInfo.clearValueCount = 0;                        // no clear — LOAD_OP_LOAD
+        hudInfo.pClearValues    = nullptr;
+        hudInfo.renderArea.offset = { 0, 0 };
+        hudInfo.renderArea.extent = swapchain.swapchain.extent;
+        hudInfo.renderPass      = pipeline->hudPipeline->renderPass;
+        pipeline->hudPipeline->render(commandBuffers[imageIndex], secondaryCmdBufsHUD[imageIndex], hudInfo);
 
         if (init.disp.endCommandBuffer(commandBuffers[imageIndex]) != VK_SUCCESS) {
             throw std::runtime_error("couldn't end cmd buf");
         }
+    }
+
+    void cleanupSwapchain() {
+        // Framebuffers
+        for (auto fb : framebuffers)
+            init.disp.destroyFramebuffer(fb, nullptr);
+        framebuffers.clear();
+
+        // Free command buffers (pool is reused, not destroyed)
+        init.disp.freeCommandBuffers(commandPool, (uint32_t)commandBuffers.size(), commandBuffers.data());
+        init.disp.freeCommandBuffers(commandPool, (uint32_t)secondaryCmdBufs.size(), secondaryCmdBufs.data());
+        init.disp.freeCommandBuffers(commandPool, (uint32_t)secondaryCmdBufsDepth.size(), secondaryCmdBufsDepth.data());
+        init.disp.freeCommandBuffers(commandPool, (uint32_t)secondaryCmdBufsHUD.size(), secondaryCmdBufsHUD.data());
+
+        // Pipeline + render passes depend on swapchain format/extent
+        delete pipeline;
+
+        // Image views and swapchain itself
+        swapchain.swapchain.destroy_image_views(swapchainImageViews);
+        vkb::destroy_swapchain(swapchain.swapchain);
+    }
+
+    void recreateSwapchain() {
+        // Pause while minimized
+        int w = 0, h = 0;
+        glfwGetFramebufferSize(window, &w, &h);
+        while (w == 0 || h == 0) {
+            glfwGetFramebufferSize(window, &w, &h);
+            glfwWaitEvents();
+        }
+
+        // Wait for all GPU work to finish before touching any resources
+        init.disp.deviceWaitIdle();
+
+        cleanupSwapchain();
+
+        // Rebuild everything that depends on the swapchain
+        width  = w;
+        height = h;
+        createSwapchain();
+        createGraphicsPipeline(vertexPath, fragmentPath);
+        createFramebuffers();
+        createCommandBuffers();
+        scene->pipeline = pipeline;
+
+        // imagesInFlights must be resized to match the new image count
+        imagesInFlights.assign(swapchain.swapchain.image_count, VK_NULL_HANDLE);
     }
 
     void createSyncObjects() {
@@ -1876,68 +2309,73 @@ struct Engine {
         }
     }
 
-    void drawFrame() {
+    void drawFrame()
+    {
         init.disp.waitForFences(1, &inFlights[currentFrame], VK_TRUE, UINT64_MAX);
 
         uint32_t image_index = 0;
         VkResult result = init.disp.acquireNextImageKHR(
-            swapchain.swapchain, UINT64_MAX, availiables[currentFrame], VK_NULL_HANDLE, &image_index);
+            swapchain.swapchain, UINT64_MAX,
+            availiables[currentFrame], VK_NULL_HANDLE, &image_index);
 
-        //if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-        //    return recreate_swapchain(init, data);
-        //}
-        if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
-            throw std::runtime_error("failed to aquire next swapchain image");
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            recreateSwapchain();
+            return; // skip this frame, present on the next one
+        } else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+            throw std::runtime_error("failed to acquire next swapchain image");
         }
 
-        if (imagesInFlights[image_index] != VK_NULL_HANDLE) {
+        if (imagesInFlights[image_index] != VK_NULL_HANDLE)
             init.disp.waitForFences(1, &imagesInFlights[image_index], VK_TRUE, UINT64_MAX);
-        }
+
         imagesInFlights[image_index] = inFlights[currentFrame];
-
-        VkSubmitInfo submitInfo = {};
-        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-
-        VkSemaphore wait_semaphores[] = { availiables[currentFrame] };
-        VkPipelineStageFlags wait_stages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
-        submitInfo.waitSemaphoreCount = 1;
-        submitInfo.pWaitSemaphores = wait_semaphores;
-        submitInfo.pWaitDstStageMask = wait_stages;
-
-        submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffers[image_index];
-
-        VkSemaphore signal_semaphores[] = { finishes[currentFrame] };
-        submitInfo.signalSemaphoreCount = 1;
-        submitInfo.pSignalSemaphores = signal_semaphores;
-
         init.disp.resetFences(1, &inFlights[currentFrame]);
         
         recordPrimaryCmds(image_index);
 
-        if (init.disp.queueSubmit(graphicsQueue, 1, &submitInfo, inFlights[currentFrame]) != VK_SUCCESS) {
-            throw std::runtime_error("failed to submit frames to queue");
+        VkPipelineStageFlags waitStages[] = {
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        };
+
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = &availiables[currentFrame];
+        submitInfo.pWaitDstStageMask = waitStages;
+
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffers[image_index];
+
+        // Key change: semaphore per swapchain image
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = &finishes[image_index];
+
+        if (init.disp.queueSubmit(
+                graphicsQueue,
+                1,
+                &submitInfo,
+                inFlights[currentFrame]) != VK_SUCCESS)
+        {
+            throw std::runtime_error("failed to submit draw command buffer");
         }
 
-        VkPresentInfoKHR present_info = {};
-        present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        VkPresentInfoKHR presentInfo{};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
 
-        present_info.waitSemaphoreCount = 1;
-        present_info.pWaitSemaphores = signal_semaphores;
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = &finishes[image_index];
 
-        VkSwapchainKHR swapChains[] = { swapchain.swapchain };
-        present_info.swapchainCount = 1;
-        present_info.pSwapchains = swapChains;
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = &swapchain.swapchain.swapchain;
+        presentInfo.pImageIndices = &image_index;
 
-        present_info.pImageIndices = &image_index;
+        result = init.disp.queuePresentKHR(presentQueue, &presentInfo);
 
-        result = init.disp.queuePresentKHR(presentQueue, &present_info);
-        //if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR) {
-        //    return recreate_swapchain(init, data);
-        //}
-        if (result != VK_SUCCESS) {
-            throw std::runtime_error("failed to present to surface");
-        }
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR)
+            recreateSwapchain();
+        else if (result != VK_SUCCESS)
+            throw std::runtime_error("failed to present swapchain image");
 
         currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
     }
@@ -1945,7 +2383,7 @@ struct Engine {
     // Store the previous state of the mouse buttons
     std::unordered_map<int, bool> mouseButtonStates;
 
-    bool isMouseButtonPressed(GLFWwindow* window, int button) {
+    bool isMouseButtonPressed(int button) {
         int currentState = glfwGetMouseButton(window, button);
 
         // Check if the button was not pressed previously and is now pressed
@@ -1963,7 +2401,7 @@ struct Engine {
 
     std::unordered_map<int, bool> releaseMouseButtonStates;
 
-    bool isMouseButtonReleased(GLFWwindow* window, int button) {
+    bool isMouseButtonReleased(int button) {
         int currentState = glfwGetMouseButton(window, button);
 
         // Check if the button was pressed previously and is now released
@@ -1979,12 +2417,12 @@ struct Engine {
         return false;
     }
 
-    bool isMouseButtonPressedDown(GLFWwindow* window, int button) {
+    bool isMouseButtonPressedDown(int button) {
         if (glfwGetMouseButton(window, button)) return true;
         else return false;
     }
 
-    glm::vec2 getCursorPosition(GLFWwindow* window) {
+    glm::vec2 getCursorPosition() {
         double xPos;
         double yPos;
         glfwGetCursorPos(window, &xPos, &yPos);
@@ -1993,7 +2431,7 @@ struct Engine {
 
     std::unordered_map<int, bool> keyStates;
 
-    bool isKeyPressed(GLFWwindow* window, int key) {
+    bool isKeyPressed(int key) {
         int currentState = glfwGetKey(window, key);
 
         // Check if key was not pressed previously and is now pressed
@@ -2009,38 +2447,14 @@ struct Engine {
         return false;
     }
 
-    bool isKeyPressedDown(GLFWwindow* window, int key) {
+    bool isKeyPressedDown(int key) {
         if (glfwGetKey(window, key) == GLFW_PRESS) {
             return true;
         }
         else return false;
     }
 
-    static float xoffset;
-    static float yoffset;
-	static bool cursorEnabled;
-
-    static void mouse_callback(GLFWwindow* window, double xpos, double ypos) {
-        static float lastX = 400, lastY = 300;
-        static bool firstMouse = true;
-        static float movementInterval = 0.005f; // Set interval duration in seconds (50 ms)
-        static float lastMovementTime = 0.0f;  // Store the last time movement was triggered
-
-        if (firstMouse) {
-            lastX = xpos;
-            lastY = ypos;
-            firstMouse = false;
-        }
-
-        xoffset = xpos - lastX;
-        yoffset = lastY - ypos;
-        lastX = xpos;
-        lastY = ypos;
-        if (!cursorEnabled)
-            scene.camera.ProcessMouseMovement(xoffset, -yoffset, true);
-    }
-
-    void toggleCursor(GLFWwindow* window, bool enableCursor) {
+    void toggleCursor(bool enableCursor) {
         if (enableCursor) {
             glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);  // Show and unlock the cursor
             cursorEnabled = true;
@@ -2068,7 +2482,7 @@ struct Engine {
     }
 
     // main loop
-    void run() {  
+    void run(const std::function<void()>& update) {  
         if(start) start();
         auto lastTime = std::chrono::high_resolution_clock::now();  
         
@@ -2077,20 +2491,22 @@ struct Engine {
             deltaTime = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - lastTime).count();
             lastTime = currentTime;
 
-            if (isMouseButtonPressedDown(window, GLFW_MOUSE_BUTTON_2)) {
-                toggleCursor(window, false);
+            if (isMouseButtonPressedDown(GLFW_MOUSE_BUTTON_2)) {
+                toggleCursor(false);
+                // consume the accumulated offsets once per frame to avoid repeated application of stale values
+                float dx = xoffset;
+                float dy = yoffset;
+                scene->camera.ProcessMouseMovement(dx, -dy, true);
+                xoffset = 0.0f;
+                yoffset = 0.0f;
             }
-            else toggleCursor(window, true);
+            else {
+                toggleCursor(true);
+            }
 
-			processInput(scene.camera);
-            
+            if(update) update();
+			processInput(scene->camera);
             drawFrame();
-
-            auto current = scene.entities[1].transform.getPosition();
-		    auto next = current + deltaTime * glm::vec3(1.0f, 0.0f, 0.0f);
-		    scene.entities[1].transform.setPosition(next);
-
-			//std::cout << glm::to_string(scene.camera.Position) << "\n";
 
             glfwPollEvents();
              
@@ -2098,9 +2514,3 @@ struct Engine {
         init.disp.deviceWaitIdle();  
     }
 };
-
-bool Engine::cursorEnabled = true;
-float Engine::xoffset = 0.0f;
-float Engine::yoffset = 0.0f;
-
-Scene Engine::scene{};
